@@ -1,0 +1,18 @@
+# AI 辅助 / 上下文管理文件
+.claude/
+.wolf/
+CLAUDE.md
+
+# 打包产物
+dist/
+# 编译产物与日志
+txqr/bin/
+*.exe
+*.log
+
+# Android / Gradle 构建产物与本机配置
+**/build/
+.gradle/
+.kotlin/
+local.properties
+build_log.txt

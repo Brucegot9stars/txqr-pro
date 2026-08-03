@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>序列化工具</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, sans-serif; background:#101014; color:#eee; margin:0; min-height:100vh; }
+  #controls { max-width:460px; margin:8vh auto; padding:24px; background:#1b1b22; border-radius:12px; }
+  h1 { margin:0 0 4px; font-size:20px; }
+  p.sub { margin:0 0 18px; font-size:13px; opacity:.6; }
+  label { display:block; margin:14px 0 6px; font-size:13px; opacity:.8; }
+  input[type=file] { width:100%; }
+  .row { display:flex; gap:12px; }
+  .row > div { flex:1; }
+  input[type=number] { width:100%; padding:8px; border-radius:6px; border:1px solid #3a3a44; background:#232330; color:#eee; }
+  button { margin-top:22px; width:100%; padding:12px; font-size:16px; border:none; border-radius:8px; background:#2f81f7; color:#fff; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  #status { margin-top:14px; font-size:13px; opacity:.7; min-height:18px; }
+
+  #overlay { display:none; position:fixed; inset:0; background:#000; z-index:10; }
+  #overlay.active { display:block; }
+  #qrwrap { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; }
+  #qr { width:min(92vw, 90vh); image-rendering:pixelated; }
+  #grid { display:grid; gap:6px; width:min(92vw, 90vh); height:min(92vw, 90vh); background:#000; }
+  #grid img { width:100%; height:100%; image-rendering:pixelated; }
+  #stats { position:fixed; top:8px; left:0; right:0; text-align:center; font-size:13px; font-family:Consolas,monospace; opacity:.85; z-index:11; pointer-events:none; text-shadow:0 0 4px #000; }
+  #hint { margin-top:10px; font-size:12px; opacity:.55; }
+  #controls-bar { position:fixed; top:8px; right:12px; z-index:12; display:flex; gap:8px; }
+  #controls-bar button { width:auto; margin:0; padding:6px 14px; font-size:13px; }
+  #pause { background:#2f81f7; }
+  #stop { background:#d9a03c; }
+  #cancel { background:#d33; }
+</style>
+</head>
+<body>
+
+<div id="controls">
+  <h1>序列化工具</h1>
+  <p class="sub">选择文件，将其序列化为可视数据帧并全屏播放。</p>
+
+  <label>文件</label>
+  <input type="file" id="file">
+
+  <div class="row">
+    <div>
+      <label>每帧字节数 split</label>
+      <input type="number" id="split" value="1024" min="10" step="10">
+    </div>
+    <div>
+      <label>帧率 FPS</label>
+      <input type="number" id="fps" value="15" min="1" step="1">
+    </div>
+    <div>
+      <label>网格 (N×N)</label>
+      <input type="number" id="gridSize" value="1" min="1" max="4" step="1">
+    </div>
+  </div>
+
+  <button id="start">序列化</button>
+  <div id="status"></div>
+</div>
+
+<div id="overlay">
+  <div id="stats"></div>
+  <div id="controls-bar">
+    <button id="pause">暂停</button>
+    <button id="stop">停止</button>
+    <button id="cancel">取消</button>
+  </div>
+  <div id="qrwrap">
+    <div id="grid"></div>
+    <div id="hint">暂停/继续：空格 | 停止：S | 取消：C | Esc 返回</div>
+  </div>
+</div>
+
+<script>
+const fileInput = document.getElementById('file');
+const splitInput = document.getElementById('split');
+const fpsInput = document.getElementById('fps');
+const gridInput = document.getElementById('gridSize');
+const startBtn = document.getElementById('start');
+const pauseBtn = document.getElementById('pause');
+const stopBtn = document.getElementById('stop');
+const cancelBtn = document.getElementById('cancel');
+const statusEl = document.getElementById('status');
+const overlay = document.getElementById('overlay');
+const gridEl = document.getElementById('grid');
+const statsEl = document.getElementById('stats');
+
+let session = null;   // current encoded session, null if none
+let running = false;  // overlay active and playing
+let paused = false;
+let base = 0;         // index of the first frame on screen
+let shownBytes = 0;
+let startTime = 0;
+let tiles = [];
+
+function bytesFmt(n) {
+  if (n >= 1048576) return (n / 1048576).toFixed(2) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+
+function buildTiles(cols) {
+  gridEl.innerHTML = '';
+  gridEl.style.gridTemplateColumns = 'repeat(' + cols + ', 1fr)';
+  tiles = [];
+  for (let i = 0; i < cols * cols; i++) {
+    const img = document.createElement('img');
+    img.alt = 'QR';
+    gridEl.appendChild(img);
+    tiles.push(img);
+  }
+}
+
+function showFileInfo() {
+  const file = fileInput.files[0];
+  if (!file) { statusEl.textContent = ''; return; }
+  const ready = session ? '（已编码，可「继续序列化」）' : '';
+  statusEl.textContent = file.name + '  ' + bytesFmt(file.size) + ready;
+}
+
+async function encodeFile() {
+  const file = fileInput.files[0];
+  if (!file) { statusEl.textContent = '请先选择文件'; return null; }
+  const split = parseInt(splitInput.value, 10) || 100;
+  const fps = parseFloat(fpsInput.value) || 10;
+  const cols = parseInt(gridInput.value, 10) || 1;
+  startBtn.disabled = true;
+  statusEl.textContent = '编码中...';
+  try {
+    const resp = await fetch('/encode?split=' + split, { method: 'POST', body: await file.arrayBuffer() });
+    if (!resp.ok) throw new Error(await resp.text());
+    const data = await resp.json();
+    return { id: data.id, count: data.count, total: data.total, fps: fps, split: split, cols: cols, file: file.name, size: file.size };
+  } catch (e) {
+    statusEl.textContent = '编码失败: ' + e.message;
+    return null;
+  } finally {
+    startBtn.disabled = false;
+  }
+}
+
+async function start() {
+  // re-encode always, so params/file changes take effect and stale session is dropped
+  if (session) await cancelSession();
+  session = await encodeFile();
+  if (!session) return;
+  base = 0;
+  shownBytes = 0;
+  startTime = performance.now();
+  paused = false;
+  pauseBtn.textContent = '暂停';
+  buildTiles(session.cols);
+  running = true;
+  overlay.classList.add('active');
+  showFrame();
+}
+
+function showFrame() {
+  if (!running || paused) return;
+  const n = session.cols * session.cols;
+  for (let i = 0; i < n; i++) {
+    const frameIdx = (base + i) % session.count;
+    tiles[i].src = '/frame/' + session.id + '/' + frameIdx;
+  }
+  base = (base + n) % session.count;
+  const elapsed = (performance.now() - startTime) / 1000;
+  shownBytes += session.split * n;
+  const rateFile = shownBytes / elapsed;
+  statsEl.textContent =
+    '帧 ' + (base + 1) + '/' + session.count +
+    ' | 网格 ' + session.cols + 'x' + session.cols +
+    ' | 已发送 ' + bytesFmt(shownBytes) +
+    ' | ' + bytesFmt(rateFile) + '/s';
+  setTimeout(showFrame, 1000 / session.fps);
+}
+
+function togglePause() {
+  if (!running) return;
+  paused = !paused;
+  pauseBtn.textContent = paused ? '继续' : '暂停';
+  if (!paused) showFrame();
+}
+
+function stop() {
+  if (!running && !session) return;
+  running = false;
+  paused = false;
+  pauseBtn.textContent = '暂停';
+  overlay.classList.remove('active');
+  gridEl.innerHTML = '';
+  tiles = [];
+  startBtn.textContent = '继续序列化';
+  showFileInfo();
+}
+
+async function cancelSession() {
+  const id = session && session.id;
+  session = null;
+  if (id) {
+    try { await fetch('/cancel/' + id, { method: 'DELETE' }); } catch (e) { /* ignore */ }
+  }
+}
+
+async function cancel() {
+  running = false;
+  paused = false;
+  pauseBtn.textContent = '暂停';
+  overlay.classList.remove('active');
+  gridEl.innerHTML = '';
+  tiles = [];
+  await cancelSession();
+  base = 0;
+  shownBytes = 0;
+  startBtn.textContent = '序列化';
+  showFileInfo();
+}
+
+fileInput.addEventListener('change', function () {
+  // re-selected file: drop the old session so everything is fresh
+  cancel();
+});
+
+startBtn.addEventListener('click', start);
+pauseBtn.addEventListener('click', togglePause);
+stopBtn.addEventListener('click', stop);
+cancelBtn.addEventListener('click', cancel);
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape') stop();
+  else if (e.key === ' ') { e.preventDefault(); togglePause(); }
+  else if (e.key === 's' || e.key === 'S') stop();
+  else if (e.key === 'c' || e.key === 'C') cancel();
+});
+</script>
+
+</body>
+</html>
