@@ -33,8 +33,7 @@
 
 基于 Go 的 `txqr`，新增/改造：
 
-- **网页发送端 `txqr-web`**：全屏循环播放二维码，支持 N×N 网格（1–4）、暂停/继续/停止/取消、重选文件自动取消旧会话。
-- **界面伪装**：页面标题为「序列化工具」，/发送按钮为「序列化」，不暴露 TXQR 字样。
+- **网页发送端 `txqr-web`**：全屏循环播放二维码，支持 N×N 网格（1–4）、暂停/继续/停止/取消、重选文件自动取消旧会话，浏览器直接操作。
 - 默认参数：每帧字节数 `1024`、帧率 `15`、网格 `1`（可在页面调整）。
 - **去掉 base64**：payload 直接为文件原始字节，消除其.de编码开销。
 - **Portable 打包**：静态单文件 exe（`index.html` 已内嵌，无运行时依赖），可在隔离（未联网）Win10 上双击运行，用浏览器打开 `localhost:9000` 即可发送。
@@ -46,7 +45,7 @@
 cd txqr/cmd/txqr-web
 go build -ldflags "-s -w" -o txqr-web.exe .     # 或使用 bin/ / dist/ 内已编译产物
 ./txqr-web.exe                                   # 默认监听 :9000
-# 打开 http://localhost:9000，选文件，点「序列化」，手机端对屏扫描
+# 打开 http://localhost:9000，选文件，点击发送，手机端对屏扫描
 ```
 
 默认端口 `:9000`，可用 `-addr :18888` 指定其他端口。
@@ -76,5 +75,13 @@ gradlew.bat :app:assembleDebug --no-daemon
 ## 使用流程
 
 1. 接收端手机安装 APK。
-2. 隔离机器上双击运行 portable 发送端 → 浏览器打开 `localhost:9000` → 选择文件 → 点「序列化」。
+2. 隔离机器上双击运行 portable 发送端 → 浏览器打开 `localhost:9000` → 选择文件 → 开始发送。
 3. 手机端 App 对准屏幕持续扫描，完成进度后文件自动保存到 Downloads。
+
+## 版本
+
+当前版本：`v1.0.0`（见 Git tag）。
+
+## License
+
+[MIT](./LICENSE)（与上游 divan/txqr、divan/txqr-reader 一致）。
