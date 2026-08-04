@@ -14,7 +14,7 @@ import (
 func AnimatedGif(data []byte, imgSize int, setup *testSetup) ([]byte, error) {
 	str := base64.StdEncoding.EncodeToString(data)
 	fmt.Printf("Generating Animated QR Gif for %d bytes\n", len(str))
-	chunks, err := txqr.NewEncoder(setup.size).Encode(str)
+	chunks, err := txqr.NewEncoder(setup.size, txqr.CodecLT).Encode(str)
 	if err != nil {
 		return nil, fmt.Errorf("encode: %v", err)
 	}

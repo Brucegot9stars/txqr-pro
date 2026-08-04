@@ -27,7 +27,7 @@ func TestTXQR(t *testing.T) {
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("%d, %d", test.length, test.chunkSz), func(t *testing.T) {
 			str := newTestData(test.length)
-			enc := NewEncoder(test.chunkSz)
+			enc := NewEncoder(test.chunkSz, CodecLT)
 			chunks, err := enc.Encode(str)
 			if err != nil {
 				t.Fatalf("Encode failed: %v", err)
@@ -79,7 +79,7 @@ func TestTXQRErasures(t *testing.T) {
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("%d, %d", test.length, test.chunkSz), func(t *testing.T) {
 			str := newTestData(test.length)
-			enc := NewEncoder(test.chunkSz)
+			enc := NewEncoder(test.chunkSz, CodecLT)
 			chunks, err := enc.Encode(str)
 			if err != nil {
 				t.Fatalf("Encode failed: %v", err)
@@ -160,7 +160,7 @@ func BenchmarkTXQREncode(b *testing.B) {
 	for _, test := range tests {
 		b.Run(fmt.Sprintf("%d, %d", test.length, test.chunkSz), func(b *testing.B) {
 			str := strings.Repeat("hello, world!", test.length)
-			enc := NewEncoder(test.chunkSz)
+			enc := NewEncoder(test.chunkSz, CodecLT)
 			for i := 0; i < b.N; i++ {
 				_, _ = enc.Encode(str)
 			}
@@ -183,7 +183,7 @@ func BenchmarkTXQRDecode(b *testing.B) {
 	for _, test := range tests {
 		b.Run(fmt.Sprintf("%d, %d", test.length, test.chunkSz), func(b *testing.B) {
 			str := strings.Repeat("hello, world!", test.length)
-			enc := NewEncoder(test.chunkSz)
+			enc := NewEncoder(test.chunkSz, CodecLT)
 			chunks, err := enc.Encode(str)
 			if err != nil {
 				b.Fatalf("Encode failed: %v", err)
@@ -216,7 +216,7 @@ func BenchmarkTXQRErasures(b *testing.B) {
 	for _, test := range tests {
 		b.Run(fmt.Sprintf("%d, %d", test.length, test.chunkSz), func(b *testing.B) {
 			str := strings.Repeat("hello, world!", test.length)
-			enc := NewEncoder(test.chunkSz)
+			enc := NewEncoder(test.chunkSz, CodecLT)
 			chunks, err := enc.Encode(str)
 			if err != nil {
 				b.Fatalf("Encode failed: %v", err)

@@ -97,7 +97,10 @@ func (d *Decoder) Progress() int {
 
 // updateProgress updates progress and complete state of reading.
 func (d *Decoder) updateProgress() {
-	d.speed = d.Read() * int(time.Second) / int(time.Since(d.start))
+	elapsed := time.Since(d.start)
+	if elapsed > 0 {
+		d.speed = d.Read() * int(time.Second) / int(elapsed)
+	}
 	d.progress = 100 * d.Read() / d.Total()
 }
 

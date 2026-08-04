@@ -15,6 +15,7 @@
   .row { display:flex; gap:12px; }
   .row > div { flex:1; }
   input[type=number] { width:100%; padding:8px; border-radius:6px; border:1px solid #3a3a44; background:#232330; color:#eee; }
+  select { width:100%; padding:8px; border-radius:6px; border:1px solid #3a3a44; background:#232330; color:#eee; }
   button { margin-top:22px; width:100%; padding:12px; font-size:16px; border:none; border-radius:8px; background:#2f81f7; color:#fff; cursor:pointer; }
   button:disabled { opacity:.5; cursor:default; }
   #status { margin-top:14px; font-size:13px; opacity:.7; min-height:18px; }
@@ -58,6 +59,32 @@
     </div>
   </div>
 
+  <div class="row">
+    <div>
+      <label>编码方案</label>
+      <select id="codec" style="width:100%; padding:8px; border-radius:6px; border:1px solid #3a3a44; background:#232330; color:#eee;">
+        <option value="lt">LT (经典)</option>
+        <option value="binary">Binary</option>
+        <option value="raptor">Raptor (RFC 5053)</option>
+        <option value="raptorq">RaptorQ (RFC 6330)</option>
+        <option value="online">Online</option>
+      </select>
+    </div>
+  </div>
+
+  <div id="onlineParams" style="display:none;">
+    <div class="row">
+      <div>
+        <label>epsilon (效率)</label>
+        <input type="number" id="epsilon" value="0.01" min="0.001" step="0.01">
+      </div>
+      <div>
+        <label>quality (质量)</label>
+        <input type="number" id="quality" value="3" min="1" step="1">
+      </div>
+    </div>
+  </div>
+
   <button id="start">序列化</button>
   <div id="status"></div>
 </div>
@@ -80,6 +107,10 @@ const fileInput = document.getElementById('file');
 const splitInput = document.getElementById('split');
 const fpsInput = document.getElementById('fps');
 const gridInput = document.getElementById('gridSize');
+const codecInput = document.getElementById('codec');
+const epsilonInput = document.getElementById('epsilon');
+const qualityInput = document.getElementById('quality');
+const onlineParams = document.getElementById('onlineParams');
 const startBtn = document.getElementById('start');
 const pauseBtn = document.getElementById('pause');
 const stopBtn = document.getElementById('stop');
@@ -88,6 +119,10 @@ const statusEl = document.getElementById('status');
 const overlay = document.getElementById('overlay');
 const gridEl = document.getElementById('grid');
 const statsEl = document.getElementById('stats');
+
+codecInput.addEventListener('change', () => {
+  onlineParams.style.display = codecInput.value === 'online' ? 'block' : 'none';
+});
 
 let session = null;   // current encoded session, null if none
 let running = false;  // overlay active and playing
@@ -125,13 +160,20 @@ function showFileInfo() {
 async function encodeFile() {
   const file = fileInput.files[0];
   if (!file) { statusEl.textContent = '请先选择文件'; return null; }
-  const split = parseInt(splitInput.value, 10) || 100;
-  const fps = parseFloat(fpsInput.value) || 10;
+  const split = parseInt(splitInput.value, 10) || 1024;
+  const fps = parseFloat(fpsInput.value) || 15;
   const cols = parseInt(gridInput.value, 10) || 1;
+  const codec = codecInput.value;
+  const epsilon = parseFloat(epsilonInput.value) || 0.01;
+  const quality = parseInt(qualityInput.value, 10) || 3;
   startBtn.disabled = true;
   statusEl.textContent = '编码中...';
   try {
-    const resp = await fetch('/encode?split=' + split, { method: 'POST', body: await file.arrayBuffer() });
+    let url = '/encode?split=' + split + '&codec=' + codec;
+    if (codec === 'online') {
+      url += '&epsilon=' + epsilon + '&quality=' + quality;
+    }
+    const resp = await fetch(url, { method: 'POST', body: await file.arrayBuffer() });
     if (!resp.ok) throw new Error(await resp.text());
     const data = await resp.json();
     return { id: data.id, count: data.count, total: data.total, fps: fps, split: split, cols: cols, file: file.name, size: file.size };

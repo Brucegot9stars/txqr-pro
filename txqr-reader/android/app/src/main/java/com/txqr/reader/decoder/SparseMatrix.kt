@@ -91,6 +91,11 @@ class SparseMatrix(val size: Int) {
         }
     }
 
+    fun reconstruct(totalLength: Int, numSourceBlocks: Int): ByteArray {
+        val pr = partition(totalLength, numSourceBlocks)
+        return reconstruct(totalLength, pr)
+    }
+
     fun reconstruct(totalLength: Int, partitionResult: PartitionResult): ByteArray {
         val (lenLong, lenShort, numLong, numShort) = partitionResult
         val out = mutableListOf<Byte>()

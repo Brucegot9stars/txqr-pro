@@ -2,10 +2,10 @@ package txqr
 
 import (
 	"fmt"
-	"math/rand"
 	"strings"
 
 	fountain "github.com/google/gofountain"
+	raptorq "github.com/xssnick/raptorq"
 )
 
 // Decoder represents protocol decode.
@@ -16,6 +16,11 @@ type Decoder struct {
 	completed bool
 	total     int
 	cache     map[string]struct{}
+
+	// RaptorQ state
+	codecType   CodecType
+	raptorQ     *raptorq.RaptorQ
+	raptorQDec  *raptorq.Decoder
 }
 
 // NewDecoder creates and inits a new decoder.
@@ -26,55 +31,102 @@ func NewDecoder() *Decoder {
 }
 
 // NewDecoderSize creates and inits a new decoder for the known size.
-func NewDecoderSize(size, chunkLen int) *Decoder {
-	numChunks := numberOfChunks(size, chunkLen)
-	codec := fountain.NewLubyCodec(numChunks, rand.New(fountain.NewMersenneTwister(200)), solitonDistribution(numChunks))
-	return &Decoder{
-		codec:    codec,
-		fd:       codec.NewDecoder(size),
-		total:    size,
-		chunkLen: chunkLen,
-		cache:    make(map[string]struct{}),
+func NewDecoderSize(size, chunkLen int, ct CodecType) *Decoder {
+	d := &Decoder{
+		total:     size,
+		chunkLen:  chunkLen,
+		cache:     make(map[string]struct{}),
+		codecType: ct,
 	}
+
+	if ct == CodecRaptorQ {
+		rq := raptorq.NewRaptorQ(uint32(chunkLen))
+		dec, err := rq.CreateDecoder(uint32(size))
+		if err != nil {
+			return nil
+		}
+		d.raptorQ = rq
+		d.raptorQDec = dec
+	} else {
+		numChunks := numberOfChunks(size, chunkLen)
+		d.codec = gofountainCodec(numChunks, ct)
+		d.fd = d.codec.NewDecoder(size)
+	}
+	return d
 }
 
 // Decode takes a single chunk of data and decodes it.
-// Chunk expected to be validated (see Validate) before.
 func (d *Decoder) Decode(chunk string) error {
-	idx := strings.IndexByte(chunk, '|') // expected to be validated before
+	idx := strings.IndexByte(chunk, '|')
 	if idx == -1 {
 		return fmt.Errorf("invalid frame: \"%s\"", chunk)
 	}
 
 	header := chunk[:idx]
-	// continuous QR reading often sends the same chunk in a row, skip it
 	if d.isCached(header) {
 		return nil
 	}
 
-	var (
-		blockCode       int64
-		chunkLen, total int
-	)
-	_, err := fmt.Sscanf(header, "%d/%d/%d", &blockCode, &chunkLen, &total)
-	if err != nil {
-		return fmt.Errorf("invalid header: %v (%s)", err, header)
-	}
-
 	payload := chunk[idx+1:]
-	lubyBlock := fountain.LTBlock{
-		BlockCode: blockCode,
-		Data:      []byte(payload),
+
+	// Parse header: blockCode/chunkLen/total[/codec]
+	parts := strings.Split(header, "/")
+	if len(parts) < 3 {
+		return fmt.Errorf("invalid header: %s", header)
 	}
 
-	if d.fd == nil {
+	var blockCode int64
+	var chunkLen, total int
+	if _, err := fmt.Sscanf(parts[0], "%d", &blockCode); err != nil {
+		return fmt.Errorf("invalid blockCode: %v", err)
+	}
+	if _, err := fmt.Sscanf(parts[1], "%d", &chunkLen); err != nil {
+		return fmt.Errorf("invalid chunkLen: %v", err)
+	}
+	if _, err := fmt.Sscanf(parts[2], "%d", &total); err != nil {
+		return fmt.Errorf("invalid total: %v", err)
+	}
+
+	// Detect codec from 4th field, default to LT for backward compatibility
+	ct := CodecLT
+	if len(parts) >= 4 {
+		ct = ParseCodec(parts[3])
+	}
+
+	// Lazy initialization
+	if d.fd == nil && d.raptorQDec == nil {
 		d.total = total
 		d.chunkLen = chunkLen
-		numChunks := numberOfChunks(d.total, d.chunkLen)
-		d.codec = fountain.NewLubyCodec(numChunks, rand.New(fountain.NewMersenneTwister(200)), solitonDistribution(numChunks))
-		d.fd = d.codec.NewDecoder(total)
+		d.codecType = ct
+
+		if ct == CodecRaptorQ {
+			rq := raptorq.NewRaptorQ(uint32(chunkLen))
+			dec, err := rq.CreateDecoder(uint32(total))
+			if err != nil {
+				return fmt.Errorf("raptorq create decoder: %w", err)
+			}
+			d.raptorQ = rq
+			d.raptorQDec = dec
+		} else {
+			numChunks := numberOfChunks(total, chunkLen)
+			d.codec = gofountainCodec(numChunks, ct)
+			d.fd = d.codec.NewDecoder(total)
+		}
 	}
-	d.completed = d.fd.AddBlocks([]fountain.LTBlock{lubyBlock})
+
+	// Add block to decoder
+	if ct == CodecRaptorQ {
+		_, err := d.raptorQDec.AddSymbol(uint32(blockCode), []byte(payload))
+		if err != nil {
+			return fmt.Errorf("raptorq add symbol: %w", err)
+		}
+	} else {
+		lubyBlock := fountain.LTBlock{
+			BlockCode: blockCode,
+			Data:      []byte(payload),
+		}
+		d.completed = d.fd.AddBlocks([]fountain.LTBlock{lubyBlock})
+	}
 
 	return nil
 }
@@ -100,10 +152,21 @@ func (d *Decoder) Data() string {
 
 // DataBytes returns decoded data as a byte slice.
 func (d *Decoder) DataBytes() []byte {
+	if d.raptorQDec != nil {
+		if !d.completed {
+			return []byte{}
+		}
+		ok, data, err := d.raptorQDec.Decode()
+		if err != nil || !ok {
+			return []byte{}
+		}
+		d.completed = true
+		return data
+	}
+
 	if d.fd == nil {
 		return []byte{}
 	}
-
 	if !d.completed {
 		return []byte{}
 	}
@@ -111,13 +174,11 @@ func (d *Decoder) DataBytes() []byte {
 }
 
 // Length returns length of the decoded data.
-// TODO: remove
 func (d *Decoder) Length() int {
 	return 0
 }
 
 // Read returns amount of currently read bytes.
-// TODO: remove
 func (d *Decoder) Read() int {
 	return 0
 }
@@ -140,16 +201,15 @@ func (d *Decoder) Reset() {
 	d.total = 0
 	d.cache = map[string]struct{}{}
 	d.codec = nil
+	d.codecType = CodecLT
+	d.raptorQ = nil
+	d.raptorQDec = nil
 }
 
-// isCached takes the header of chunk data and see if it's been cached.
-// If not, it caches it.
 func (d *Decoder) isCached(header string) bool {
 	if _, ok := d.cache[header]; ok {
 		return true
 	}
-
-	// cache it
 	d.cache[header] = struct{}{}
 	return false
 }

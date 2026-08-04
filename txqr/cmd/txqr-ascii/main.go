@@ -16,6 +16,7 @@ import (
 func main() {
 	split := flag.Int("split", 100, "Chunk size for data split per frame")
 	delay := flag.Duration("delay", 100*time.Millisecond, "Delay between frames")
+	codec := flag.String("codec", "", "Codec type: lt (default), binary, raptor, raptorq, online")
 	flag.Parse()
 
 	if len(flag.Args()) != 1 {
@@ -30,7 +31,7 @@ func main() {
 	}
 
 	str := string(data)
-	chunks, err := txqr.NewEncoder(*split).Encode(str)
+	chunks, err := txqr.NewEncoder(*split, txqr.ParseCodec(*codec)).Encode(str)
 	if err != nil {
 		log.Fatalf("Encode failed: %v", err)
 	}

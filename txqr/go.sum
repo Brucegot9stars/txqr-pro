@@ -18,6 +18,8 @@ github.com/pyk/byten v0.0.0-20140925233358-f847a130bf6d h1:/0nqYrqVyPTVDT2jPx9z9
 github.com/pyk/byten v0.0.0-20140925233358-f847a130bf6d/go.mod h1:El8LdwAxb76Ih0mRmpu9uMVq+ajiqGSxmYiUe+nSr+w=
 github.com/skip2/go-qrcode v0.0.0-20171229120447-cf5f9fa2f0d8 h1:5C4yAeYifeRO+7z2/H2kxL8tJZE9ZE9LpxK6YUZPByo=
 github.com/skip2/go-qrcode v0.0.0-20171229120447-cf5f9fa2f0d8/go.mod h1:PLPIyL7ikehBD1OAjmKKiOEhbvWyHGaNDjquXMcYABo=
+github.com/xssnick/raptorq v1.4.0 h1:Bms8lgT7aEPRP8YBRuS+8w7Cic8GP9BbvFT1NrWvi24=
+github.com/xssnick/raptorq v1.4.0/go.mod h1:mo5n6T4yaqZkNVMWonRuMS0tcyD4XQ6PwwTjaY3ZwQY=
 golang.org/x/text v0.3.0 h1:g61tztE5qeGQ89tm6NTjjM9VPIm088od1l6aSorWRWg=
 golang.org/x/text v0.3.0/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
 rsc.io/qr v0.2.0 h1:6vBLea5/NRMVTz8V66gipeLycZMl/+UlFmk8DvqQ6WY=

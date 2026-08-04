@@ -98,10 +98,24 @@ func handleEncode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	split := 100
+	split := 1024
 	if v := r.URL.Query().Get("split"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			split = n
+		}
+	}
+
+	codec := txqr.ParseCodec(r.URL.Query().Get("codec"))
+	onlineEpsilon := 0.01
+	if v := r.URL.Query().Get("epsilon"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			onlineEpsilon = f
+		}
+	}
+	onlineQuality := 3
+	if v := r.URL.Query().Get("quality"); v != "" {
+		if q, err := strconv.Atoi(v); err == nil && q > 0 {
+			onlineQuality = q
 		}
 	}
 
@@ -112,7 +126,11 @@ func handleEncode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	str := string(body)
-	frames, err := txqr.NewEncoder(split).Encode(str)
+	encoder := txqr.NewEncoder(split, codec)
+	if codec == txqr.CodecOnline {
+		encoder.SetOnlineParams(onlineEpsilon, onlineQuality)
+	}
+	frames, err := encoder.Encode(str)
 	if err != nil {
 		http.Error(w, "encode: "+err.Error(), http.StatusInternalServerError)
 		return

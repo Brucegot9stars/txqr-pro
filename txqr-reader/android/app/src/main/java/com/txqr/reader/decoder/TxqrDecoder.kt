@@ -3,8 +3,13 @@ package com.txqr.reader.decoder
 import java.nio.charset.StandardCharsets
 
 class TxqrDecoder {
-    private var codec: LubyCodec? = null
-    private var fd: LubyDecoder? = null
+    private var activeCodec: CodecType = CodecType.LT
+    private var lubyCodec: LubyCodec? = null
+    private var lubyDecoder: LubyDecoder? = null
+    private var binaryDecoder: BinaryDecoder? = null
+    private var raptorDecoder: RaptorDecoder? = null
+    private var raptorQDecoder: RaptorQDecoder? = null
+    private var onlineDecoder: OnlineDecoder? = null
     private var completed = false
     private var totalSize = 0
     private var chunkLen = 0
@@ -46,11 +51,12 @@ class TxqrDecoder {
         if (isCached(header)) return
 
         val parts = header.split("/")
-        if (parts.size != 3) return
+        if (parts.size < 3) return
 
         val blockCode = parts[0].toLongOrNull() ?: return
         val chunkLen = parts[1].toIntOrNull() ?: return
         val total = parts[2].toIntOrNull() ?: return
+        val codecType = if (parts.size >= 4) CodecType.fromString(parts[3]) else CodecType.LT
 
         if (startTime == 0L) {
             startTime = System.currentTimeMillis()
@@ -60,20 +66,43 @@ class TxqrDecoder {
         }
         lastChunkTime = System.currentTimeMillis()
 
-        if (fd == null) {
+        if (lubyDecoder == null && binaryDecoder == null && raptorDecoder == null && raptorQDecoder == null && onlineDecoder == null) {
             this.totalSize = total
             this.chunkLen = chunkLen
-
+            this.activeCodec = codecType
             val numChunks = numberOfChunks(total, chunkLen)
-            codec = LubyCodec(numChunks)
-            fd = codec!!.newDecoder(total)
+
+            when (codecType) {
+                CodecType.LT -> {
+                    lubyCodec = LubyCodec(numChunks)
+                    lubyDecoder = lubyCodec!!.newDecoder(total)
+                }
+                CodecType.BINARY -> {
+                    binaryDecoder = BinaryCodec(numChunks).newDecoder(total)
+                }
+                CodecType.RAPTOR -> {
+                    raptorDecoder = RaptorCodec(numChunks, 4).newDecoder(total)
+                }
+                CodecType.RAPTORQ -> {
+                    raptorQDecoder = RaptorQCodec(chunkLen, total).newDecoder()
+                }
+                CodecType.ONLINE -> {
+                    onlineDecoder = OnlineCodec(numChunks, 0.01, 3, 42).newDecoder(total)
+                }
+            }
         }
 
         bytesRead += payload.size
         recordSpeedSample()
 
-        val lubyBlock = LTBlock(blockCode = blockCode, data = payload)
-        completed = fd!!.addBlocks(listOf(lubyBlock))
+        val ltBlock = LTBlock(blockCode = blockCode, data = payload)
+        when (activeCodec) {
+            CodecType.LT -> completed = lubyDecoder!!.addBlocks(listOf(ltBlock))
+            CodecType.BINARY -> completed = binaryDecoder!!.addBlocks(listOf(ltBlock))
+            CodecType.RAPTOR -> completed = raptorDecoder!!.addBlocks(listOf(ltBlock))
+            CodecType.RAPTORQ -> completed = raptorQDecoder!!.addBlocks(listOf(ltBlock))
+            CodecType.ONLINE -> completed = onlineDecoder!!.addBlocks(listOf(ltBlock))
+        }
     }
 
     private fun recordSpeedSample() {
@@ -107,7 +136,17 @@ class TxqrDecoder {
 
     val data: String get() = dataBytes?.decodeToString() ?: ""
 
-    val dataBytes: ByteArray? get() = if (completed) fd?.decode() else null
+    val dataBytes: ByteArray?
+        get() {
+            if (!completed) return null
+            return when (activeCodec) {
+                CodecType.LT -> lubyDecoder?.decode()
+                CodecType.BINARY -> binaryDecoder?.decode()
+                CodecType.RAPTOR -> raptorDecoder?.decode()
+                CodecType.RAPTORQ -> raptorQDecoder?.decode()
+                CodecType.ONLINE -> onlineDecoder?.decode()
+            }
+        }
 
     val progress: Int
         get() {
@@ -129,8 +168,13 @@ class TxqrDecoder {
     val readIntervalMs: Long get() = readInterval
 
     fun reset() {
-        codec = null
-        fd = null
+        activeCodec = CodecType.LT
+        lubyCodec = null
+        lubyDecoder = null
+        binaryDecoder = null
+        raptorDecoder = null
+        raptorQDecoder = null
+        onlineDecoder = null
         completed = false
         totalSize = 0
         chunkLen = 0
