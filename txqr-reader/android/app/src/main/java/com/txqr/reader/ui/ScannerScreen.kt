@@ -175,7 +175,9 @@ private fun ScannerOverlay(
                 CompletedPanel(
                     totalSize = uiState.totalSize,
                     totalTime = uiState.totalTime,
-                    speed = uiState.speed,
+                    avgSpeed = uiState.avgSpeed,
+                    peakSpeed = uiState.peakSpeed,
+                    suggestedFileName = uiState.suggestedFileName,
                     onSave = { fileName -> onSaveRequest(fileName) },
                     onRescan = onRestart
                 )
@@ -267,11 +269,13 @@ private fun ProgressPanel(
 private fun CompletedPanel(
     totalSize: String,
     totalTime: String,
-    speed: String,
+    avgSpeed: String,
+    peakSpeed: String,
+    suggestedFileName: String,
     onSave: (String) -> Unit,
     onRescan: () -> Unit
 ) {
-    var fileName by remember { mutableStateOf("received_data") }
+    var fileName by remember(suggestedFileName) { mutableStateOf(suggestedFileName) }
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -289,7 +293,14 @@ private fun CompletedPanel(
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "Size: $totalSize  Time: $totalTime  Speed: $speed",
+                text = "Size: $totalSize  Time: $totalTime",
+                color = Color.White,
+                fontSize = 14.sp,
+                fontFamily = FontFamily.Monospace
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "Average Speed: $avgSpeed  Peak Speed: $peakSpeed",
                 color = Color.White,
                 fontSize = 14.sp,
                 fontFamily = FontFamily.Monospace

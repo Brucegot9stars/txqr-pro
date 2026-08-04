@@ -80,7 +80,8 @@ fun ResultScreen(
                 Column(modifier = Modifier.padding(16.dp)) {
                     InfoRow("Size", scanResult.totalSize)
                     InfoRow("Time", scanResult.totalTime)
-                    InfoRow("Speed", scanResult.speed)
+                    InfoRow("Average Speed", scanResult.avgSpeed)
+                    InfoRow("Peak Speed", scanResult.peakSpeed)
                 }
             }
 

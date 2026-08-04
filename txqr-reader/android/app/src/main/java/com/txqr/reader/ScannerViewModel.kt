@@ -16,6 +16,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 enum class ScanState {
     SCANNING,
@@ -29,6 +33,8 @@ data class ScanResult(
     val fileName: String = "",
     val totalSize: String = "",
     val totalTime: String = "",
+    val avgSpeed: String = "",
+    val peakSpeed: String = "",
     val speed: String = ""
 )
 
@@ -39,7 +45,10 @@ data class ScannerUiState(
     val readInterval: Long = 0,
     val totalSize: String = "",
     val totalTime: String = "",
+    val avgSpeed: String = "",
+    val peakSpeed: String = "",
     val fileName: String = "",
+    val suggestedFileName: String = "",
     val error: String? = null,
     val scanResult: ScanResult? = null
 )
@@ -78,6 +87,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         _uiState.value = current.copy(
             progress = decoder.progress,
             speed = decoder.speedStr,
+            avgSpeed = decoder.avgSpeedStr,
+            peakSpeed = decoder.peakSpeedStr,
             readInterval = decoder.readIntervalMs,
             totalSize = decoder.totalSizeStr,
             totalTime = decoder.totalTime
@@ -116,6 +127,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     _uiState.value = state.copy(
                         progress = decoder.progress,
                         speed = decoder.speedStr,
+                        avgSpeed = decoder.avgSpeedStr,
+                        peakSpeed = decoder.peakSpeedStr,
                         readInterval = decoder.readIntervalMs,
                         totalSize = decoder.totalSizeStr,
                         totalTime = decoder.totalTime
@@ -125,7 +138,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                         val dataBytes = decoder.dataBytes ?: continue
                         scanResultData = dataBytes
                         _uiState.value = _uiState.value.copy(
-                            scanState = ScanState.COMPLETED
+                            scanState = ScanState.COMPLETED,
+                            suggestedFileName = generateFileName(dataBytes)
                         )
                     }
                 }
@@ -153,10 +167,27 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     fileName = fileName,
                     totalSize = _uiState.value.totalSize,
                     totalTime = _uiState.value.totalTime,
+                    avgSpeed = _uiState.value.avgSpeed,
+                    peakSpeed = _uiState.value.peakSpeed,
                     speed = _uiState.value.speed
                 )
             )
         }
+    }
+
+    private fun generateFileName(data: ByteArray): String {
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val hash = sha1Hex(data)
+        return "received_${ts}_${hash}.bin"
+    }
+
+    private fun sha1Hex(data: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-1").digest(data)
+        val sb = StringBuilder()
+        for (i in 0 until 8) {
+            sb.append("%02x".format(digest[i].toInt() and 0xFF))
+        }
+        return sb.toString()
     }
 
     override fun onCleared() {
