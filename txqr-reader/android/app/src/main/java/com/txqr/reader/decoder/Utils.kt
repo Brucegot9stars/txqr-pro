@@ -63,13 +63,14 @@ data class Block(
     val isEmpty: Boolean get() = length == 0
 
     fun xor(other: Block): Block {
-        var newData = data
-        if (newData.size < other.data.size) {
-            val inc = other.data.size - newData.size
-            newData = newData + ByteArray(inc)
-        }
-        for (i in other.data.indices) {
-            newData[i] = (newData[i].toInt() xor other.data[i].toInt()).toByte()
+        val self = data
+        val o = other.data
+        val n = maxOf(self.size, o.size)
+        val newData = ByteArray(n)
+        for (i in 0 until n) {
+            val a = if (i < self.size) self[i] else 0.toByte()
+            val b = if (i < o.size) o[i] else 0.toByte()
+            newData[i] = (a.toInt() xor b.toInt()).toByte()
         }
         return Block(newData)
     }

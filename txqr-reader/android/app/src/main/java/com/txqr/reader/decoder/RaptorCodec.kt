@@ -66,29 +66,24 @@ object RaptorConstants {
             denominator[idx] = idx + 1
             idx++
         }
-        if (denominator.isNotEmpty()) {
-            val lastDenom = denominator[denominator.size - 1]
-            var z = 0
-            while (z < numerator.size && numerator[z] < lastDenom) z++
-            if (z > 0) {
-                val newNum = IntArray(numerator.size - z)
-                val newDen = IntArray(denominator.size - z)
-                for (i in z until numerator.size) newNum[i - z] = numerator[i]
-                for (i in 0 until denominator.size - z) newDen[i] = denominator[i]
-                for (j in newDen.size - 1 downTo 1) {
-                    if (newDen[j] == 1) continue
-                    for (i in newNum.size - 1 downTo 0) {
-                        if (newNum[i] % newDen[j] == 0) {
-                            newNum[i] /= newDen[j]
-                            newDen[j] = 1
-                            break
-                        }
+        var z = 0
+        while (z < numerator.size && numerator[z] < denominator[denominator.size - 1]) z++
+        if (z > 0) {
+            val newNum = numerator.copyOfRange(z + 1, numerator.size)
+            val newDen = denominator.copyOfRange(0, denominator.size - z - 1)
+            for (j in newDen.size - 1 downTo 1) {
+                if (newDen[j] == 1) continue
+                for (i in newNum.size - 1 downTo 0) {
+                    if (newNum[i] % newDen[j] == 0) {
+                        newNum[i] /= newDen[j]
+                        newDen[j] = 1
+                        break
                     }
                 }
-                var f = 1
-                for (v in newNum) f *= v
-                return f
             }
+            var f = 1
+            for (v in newNum) f *= v
+            return f
         }
         for (j in denominator.size - 1 downTo 1) {
             if (denominator[j] == 1) continue
@@ -179,10 +174,11 @@ class RaptorCodec(val sourceBlocks: Int, val alignmentSize: Int = 1) {
 }
 
 class RaptorDecoder(private val codec: RaptorCodec, private val messageLength: Int) {
-    val matrix = SparseMatrix(codec.sourceBlocks)
+    private val l = RaptorConstants.intermediateSymbols(codec.sourceBlocks).first
+    val matrix = SparseMatrix(l)
 
     init {
-        val (l, s, h) = RaptorConstants.intermediateSymbols(codec.sourceBlocks)
+        val (lTotal, s, h) = RaptorConstants.intermediateSymbols(codec.sourceBlocks)
         val k = codec.sourceBlocks
 
         // LDPC equations (S blocks)
