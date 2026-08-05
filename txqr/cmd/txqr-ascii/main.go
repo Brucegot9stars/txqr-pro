@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/divan/txqr"
@@ -31,7 +32,9 @@ func main() {
 	}
 
 	str := string(data)
-	chunks, err := txqr.NewEncoder(*split, txqr.ParseCodec(*codec)).Encode(str)
+	encoder := txqr.NewEncoder(*split, txqr.ParseCodec(*codec))
+	encoder.SetFileName(filepath.Base(filename))
+	chunks, err := encoder.Encode(str)
 	if err != nil {
 		log.Fatalf("Encode failed: %v", err)
 	}

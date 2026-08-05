@@ -24,6 +24,7 @@ class TxqrDecoder {
     private var lastChunkTime = 0L
     private var readInterval = 0L
     private var peakSpeedBps = 0L
+    private var storedFileName = ""
     private val speedWindow = ArrayDeque<LongArray>()
     private val lock = Any()
 
@@ -59,6 +60,11 @@ class TxqrDecoder {
 
             val parts = header.split("/")
             if (parts.size < 3) return
+
+            if (parts.size >= 5 && parts[0] == "-1" && parts[4] == "name") {
+                storedFileName = String(payload, StandardCharsets.UTF_8)
+                return
+            }
 
             val blockCode = parts[0].toLongOrNull() ?: return
             val chunkLen = parts[1].toIntOrNull() ?: return
@@ -203,6 +209,8 @@ class TxqrDecoder {
 
     val readIntervalMs: Long get() = synchronized(lock) { readInterval }
 
+    val receivedFileName: String get() = synchronized(lock) { storedFileName }
+
     fun reset() {
         synchronized(lock) {
             activeCodec = CodecType.LT
@@ -225,6 +233,7 @@ class TxqrDecoder {
             lastChunkTime = 0L
             readInterval = 0L
             peakSpeedBps = 0L
+            storedFileName = ""
             speedWindow.clear()
         }
     }

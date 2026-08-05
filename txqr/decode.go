@@ -75,6 +75,11 @@ func (d *Decoder) Decode(chunk string) error {
 		return fmt.Errorf("invalid header: %s", header)
 	}
 
+	// Metadata frame (original file name): -1/{chunkLen}/{total}/{codec}/name|{name}
+	if len(parts) >= 5 && parts[0] == "-1" && parts[4] == "name" {
+		return nil
+	}
+
 	var blockCode int64
 	var chunkLen, total int
 	if _, err := fmt.Sscanf(parts[0], "%d", &blockCode); err != nil {
@@ -116,9 +121,12 @@ func (d *Decoder) Decode(chunk string) error {
 
 	// Add block to decoder
 	if ct == CodecRaptorQ {
-		_, err := d.raptorQDec.AddSymbol(uint32(blockCode), []byte(payload))
+		ready, err := d.raptorQDec.AddSymbol(uint32(blockCode), []byte(payload))
 		if err != nil {
 			return fmt.Errorf("raptorq add symbol: %w", err)
+		}
+		if ready {
+			d.completed = true
 		}
 	} else {
 		lubyBlock := fountain.LTBlock{

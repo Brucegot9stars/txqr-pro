@@ -137,9 +137,10 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     if (decoder.isCompleted) {
                         val dataBytes = decoder.dataBytes ?: continue
                         scanResultData = dataBytes
+                        val originalName = decoder.receivedFileName
                         _uiState.value = _uiState.value.copy(
                             scanState = ScanState.COMPLETED,
-                            suggestedFileName = generateFileName(dataBytes)
+                            suggestedFileName = if (originalName.isNotBlank()) originalName else generateFileName(dataBytes)
                         )
                     }
                 }
