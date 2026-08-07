@@ -82,6 +82,7 @@ fun ResultScreen(
                     InfoRow("Time", scanResult.totalTime)
                     InfoRow("Average Speed", scanResult.avgSpeed)
                     InfoRow("Peak Speed", scanResult.peakSpeed)
+                    InfoRow("MD5", scanResult.md5)
                 }
             }
 

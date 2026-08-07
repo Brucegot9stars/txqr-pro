@@ -177,6 +177,7 @@ private fun ScannerOverlay(
                     totalTime = uiState.totalTime,
                     avgSpeed = uiState.avgSpeed,
                     peakSpeed = uiState.peakSpeed,
+                    md5 = uiState.md5,
                     suggestedFileName = uiState.suggestedFileName,
                     onSave = { fileName -> onSaveRequest(fileName) },
                     onRescan = onRestart
@@ -204,7 +205,7 @@ private fun TopBar(onRestart: () -> Unit) {
     ) {
         Box(modifier = Modifier.fillMaxWidth()) {
             Text(
-                text = "TXQR Reader",
+                text = "QRT Pro Reader",
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(16.dp),
@@ -271,6 +272,7 @@ private fun CompletedPanel(
     totalTime: String,
     avgSpeed: String,
     peakSpeed: String,
+    md5: String,
     suggestedFileName: String,
     onSave: (String) -> Unit,
     onRescan: () -> Unit
@@ -303,6 +305,13 @@ private fun CompletedPanel(
                 text = "Average Speed: $avgSpeed  Peak Speed: $peakSpeed",
                 color = Color.White,
                 fontSize = 14.sp,
+                fontFamily = FontFamily.Monospace
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "MD5: $md5",
+                color = Color.White,
+                fontSize = 13.sp,
                 fontFamily = FontFamily.Monospace
             )
 

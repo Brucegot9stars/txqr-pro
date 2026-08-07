@@ -127,6 +127,8 @@ codecInput.addEventListener('change', () => {
 let session = null;   // current encoded session, null if none
 let running = false;  // overlay active and playing
 let paused = false;
+let encoding = false; // a serialization request is in flight
+let encodeAbort = null; // AbortController for the in-flight serialization
 let base = 0;         // index of the first frame on screen
 let shownBytes = 0;
 let startTime = 0;
@@ -154,7 +156,8 @@ function showFileInfo() {
   const file = fileInput.files[0];
   if (!file) { statusEl.textContent = ''; return; }
   const ready = session ? '（已编码，可「继续序列化」）' : '';
-  statusEl.textContent = file.name + '  ' + bytesFmt(file.size) + ready;
+  const md5 = session && session.md5 ? '  MD5: ' + session.md5 : '';
+  statusEl.textContent = file.name + '  ' + bytesFmt(file.size) + ready + md5;
 }
 
 async function encodeFile() {
@@ -166,22 +169,33 @@ async function encodeFile() {
   const codec = codecInput.value;
   const epsilon = parseFloat(epsilonInput.value) || 0.01;
   const quality = parseInt(qualityInput.value, 10) || 3;
-  startBtn.disabled = true;
-  statusEl.textContent = '编码中...';
+  startBtn.disabled = false;
+  startBtn.textContent = '取消序列化';
+  encoding = true;
+  encodeAbort = new AbortController();
+  statusEl.textContent = '编码中...（点击「取消序列化」可中止）';
   try {
     let url = '/encode?split=' + split + '&codec=' + codec;
     if (codec === 'online') {
       url += '&epsilon=' + epsilon + '&quality=' + quality;
     }
-    const resp = await fetch(url, { method: 'POST', body: await file.arrayBuffer() });
+    const resp = await fetch(url, { method: 'POST', body: await file.arrayBuffer(), signal: encodeAbort.signal });
     if (!resp.ok) throw new Error(await resp.text());
     const data = await resp.json();
-    return { id: data.id, count: data.count, total: data.total, fps: fps, split: split, cols: cols, file: file.name, size: file.size };
+    statusEl.textContent = '编码完成：' + bytesFmt(file.size) + ' · MD5: ' + (data.md5 || '');
+    return { id: data.id, count: data.count, total: data.total, fps: fps, split: split, cols: cols, file: file.name, size: file.size, md5: data.md5 };
   } catch (e) {
+    if (e && e.name === 'AbortError') {
+      statusEl.textContent = '已取消序列化';
+      return null;
+    }
     statusEl.textContent = '编码失败: ' + e.message;
     return null;
   } finally {
+    encoding = false;
+    encodeAbort = null;
     startBtn.disabled = false;
+    startBtn.textContent = '序列化';
   }
 }
 
@@ -248,6 +262,7 @@ async function cancelSession() {
 }
 
 async function cancel() {
+  if (encodeAbort) encodeAbort.abort(); // abort any in-flight serialization
   running = false;
   paused = false;
   pauseBtn.textContent = '暂停';
@@ -266,7 +281,10 @@ fileInput.addEventListener('change', function () {
   cancel();
 });
 
-startBtn.addEventListener('click', start);
+startBtn.addEventListener('click', function () {
+  if (encoding && encodeAbort) { encodeAbort.abort(); }
+  else { start(); }
+});
 pauseBtn.addEventListener('click', togglePause);
 stopBtn.addEventListener('click', stop);
 cancelBtn.addEventListener('click', cancel);

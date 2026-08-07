@@ -10,6 +10,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/md5"
 	"crypto/rand"
 	_ "embed"
 	"encoding/hex"
@@ -21,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -126,6 +129,7 @@ func handleEncode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	str := string(body)
+	sum := md5.Sum(body)
 	encoder := txqr.NewEncoder(split, codec)
 	if codec == txqr.CodecOnline {
 		encoder.SetOnlineParams(onlineEpsilon, onlineQuality)
@@ -146,6 +150,20 @@ func handleEncode(w http.ResponseWriter, r *http.Request) {
 		s.frames[i] = []byte(f)
 	}
 
+	// Render all QR frames up front in parallel using every available core,
+	// so the encode step itself is multi-core and the play loop serves
+	// pre-rendered PNGs instantly. The loop honors the client request
+	// context so a cancelled upload aborts rendering early.
+	renderFrames(s, r.Context())
+
+	if renderFailed(s) {
+		http.Error(w, "encode: QR render failed", http.StatusInternalServerError)
+		return
+	}
+	if r.Context().Err() != nil {
+		return // client aborted/cancelled; drop the partial session
+	}
+
 	id := newID()
 	mu.Lock()
 	sessions[id] = s
@@ -155,6 +173,7 @@ func handleEncode(w http.ResponseWriter, r *http.Request) {
 		"id":    id,
 		"count": len(frames),
 		"total": len(str),
+		"md5":   hex.EncodeToString(sum[:]),
 	})
 }
 
@@ -219,6 +238,57 @@ func renderPNG(frame []byte) []byte {
 		return nil
 	}
 	return buf.Bytes()
+}
+
+// renderFrames pre-renders every frame's PNG using a worker pool sized to the
+// number of available CPUs. It stops scheduling new work as soon as the
+// request context is cancelled so a client abort still clears the pool.
+func renderFrames(s *session, ctx context.Context) {
+	n := len(s.frames)
+	if n == 0 {
+		return
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > n {
+		workers = n
+	}
+	jobs := make(chan int, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				s.pngs[i] = renderPNG(s.frames[i])
+			}
+		}()
+	}
+send:
+	for i := 0; i < n; i++ {
+		select {
+		case jobs <- i:
+		case <-ctx.Done():
+			break send
+		}
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+// renderFailed reports whether any frame failed to render to a PNG.
+func renderFailed(s *session) bool {
+	for _, p := range s.pngs {
+		if p == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func newID() string {

@@ -35,7 +35,8 @@ data class ScanResult(
     val totalTime: String = "",
     val avgSpeed: String = "",
     val peakSpeed: String = "",
-    val speed: String = ""
+    val speed: String = "",
+    val md5: String = ""
 )
 
 data class ScannerUiState(
@@ -49,6 +50,7 @@ data class ScannerUiState(
     val peakSpeed: String = "",
     val fileName: String = "",
     val suggestedFileName: String = "",
+    val md5: String = "",
     val error: String? = null,
     val scanResult: ScanResult? = null
 )
@@ -140,6 +142,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                         val originalName = decoder.receivedFileName
                         _uiState.value = _uiState.value.copy(
                             scanState = ScanState.COMPLETED,
+                            md5 = computeMd5(dataBytes),
                             suggestedFileName = if (originalName.isNotBlank()) originalName else generateFileName(dataBytes)
                         )
                     }
@@ -170,7 +173,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     totalTime = _uiState.value.totalTime,
                     avgSpeed = _uiState.value.avgSpeed,
                     peakSpeed = _uiState.value.peakSpeed,
-                    speed = _uiState.value.speed
+                    speed = _uiState.value.speed,
+                    md5 = _uiState.value.md5
                 )
             )
         }
@@ -180,6 +184,11 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val hash = sha1Hex(data)
         return "received_${ts}_${hash}.bin"
+    }
+
+    private fun computeMd5(data: ByteArray): String {
+        val digest = MessageDigest.getInstance("MD5").digest(data)
+        return digest.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
     }
 
     private fun sha1Hex(data: ByteArray): String {
