@@ -1,4 +1,4 @@
-package com.txqr.reader
+package com.qrtpro.reader
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -9,8 +9,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.txqr.reader.ui.ResultScreen
-import com.txqr.reader.ui.ScannerScreen
+import com.qrtpro.reader.ui.ResultScreen
+import com.qrtpro.reader.ui.ScannerScreen
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {

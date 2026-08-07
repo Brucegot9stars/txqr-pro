@@ -1,4 +1,4 @@
-package com.txqr.reader.decoder
+package com.qrtpro.reader.decoder
 
 class LubyCodec(val sourceBlocks: Int) {
     private val random = MersenneTwister()

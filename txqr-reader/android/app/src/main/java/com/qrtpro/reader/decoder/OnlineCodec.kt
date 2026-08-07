@@ -1,4 +1,4 @@
-package com.txqr.reader.decoder
+package com.qrtpro.reader.decoder
 
 import kotlin.math.ceil
 import kotlin.math.ln

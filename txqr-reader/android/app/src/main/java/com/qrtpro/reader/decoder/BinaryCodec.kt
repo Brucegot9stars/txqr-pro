@@ -1,4 +1,4 @@
-package com.txqr.reader.decoder
+package com.qrtpro.reader.decoder
 
 class BinaryCodec(val sourceBlocks: Int) {
     fun pickIndices(codeBlockIndex: Long): IntArray {

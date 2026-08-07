@@ -1,4 +1,4 @@
-﻿package com.txqr.reader.decoder
+package com.qrtpro.reader.decoder
 
 internal val smallPrimes = intArrayOf(
     2, 3, 5, 7, 11, 13, 17, 19, 23, 29,

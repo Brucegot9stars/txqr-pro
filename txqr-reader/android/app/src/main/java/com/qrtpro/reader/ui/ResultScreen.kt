@@ -1,4 +1,4 @@
-package com.txqr.reader.ui
+package com.qrtpro.reader.ui
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -15,7 +15,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.txqr.reader.ScanResult
+import com.qrtpro.reader.ScanResult
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

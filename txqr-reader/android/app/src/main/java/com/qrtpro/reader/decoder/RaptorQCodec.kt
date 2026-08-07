@@ -1,4 +1,4 @@
-package com.txqr.reader.decoder
+package com.qrtpro.reader.decoder
 
 internal fun rqRandom(y: Long, i: Long, m: Long): Long {
     val x0 = ((y + i) % 256).toInt()

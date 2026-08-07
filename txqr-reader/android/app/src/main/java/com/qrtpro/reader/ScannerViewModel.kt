@@ -1,4 +1,4 @@
-package com.txqr.reader
+package com.qrtpro.reader
 
 import android.app.Application
 import android.graphics.Bitmap
@@ -9,7 +9,7 @@ import androidx.lifecycle.viewModelScope
 import com.google.mlkit.vision.barcode.BarcodeScanner
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.common.InputImage
-import com.txqr.reader.decoder.TxqrDecoder
+import com.qrtpro.reader.decoder.TxqrDecoder
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow

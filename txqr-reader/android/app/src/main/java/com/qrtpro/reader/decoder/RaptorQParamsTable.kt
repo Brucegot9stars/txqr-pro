@@ -1,4 +1,4 @@
-package com.txqr.reader.decoder
+package com.qrtpro.reader.decoder
 
 internal val ParamsTable = arrayOf(
     intArrayOf(10, 254, 7, 10, 17),

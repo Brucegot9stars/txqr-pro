@@ -1,4 +1,4 @@
-package com.txqr.reader.decoder
+package com.qrtpro.reader.decoder
 
 class SparseMatrix(val size: Int) {
     val coeff = Array<MutableList<Int>?>(size) { null }

@@ -1,4 +1,4 @@
-package com.txqr.reader
+package com.qrtpro.reader
 
 import android.content.ContentValues
 import android.content.Context

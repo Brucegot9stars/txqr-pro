@@ -1,4 +1,4 @@
-package com.txqr.reader.decoder
+package com.qrtpro.reader.decoder
 
 internal val randV0 = longArrayOf(
     251291136L, 3952231631L, 3370958628L, 4070167936L, 123631495L, 3351110283L, 3218676425L, 2011642291L,

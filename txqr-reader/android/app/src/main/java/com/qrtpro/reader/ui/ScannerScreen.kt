@@ -1,4 +1,4 @@
-package com.txqr.reader.ui
+package com.qrtpro.reader.ui
 
 import android.Manifest
 import android.content.pm.PackageManager
@@ -27,9 +27,9 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import com.txqr.reader.ScannerUiState
-import com.txqr.reader.ScannerViewModel
-import com.txqr.reader.ScanState
+import com.qrtpro.reader.ScannerUiState
+import com.qrtpro.reader.ScannerViewModel
+import com.qrtpro.reader.ScanState
 import java.util.concurrent.Executors
 
 @Composable

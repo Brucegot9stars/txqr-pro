@@ -1,4 +1,4 @@
-﻿package com.txqr.reader.decoder
+package com.qrtpro.reader.decoder
 
 internal val systematicIndextable = intArrayOf(
     0, 0, 0, 0, 18, 14, 61, 46, 14, 22, 20, 40, 48, 1, 29, 

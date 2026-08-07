@@ -1,4 +1,4 @@
-package com.txqr.reader.decoder
+package com.qrtpro.reader.decoder
 
 internal val v0table = longArrayOf(
     251291136, 3952231631, 3370958628, 4070167936, 123631495, 3351110283,

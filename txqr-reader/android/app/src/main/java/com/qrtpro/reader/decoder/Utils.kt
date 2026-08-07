@@ -1,4 +1,4 @@
-package com.txqr.reader.decoder
+package com.qrtpro.reader.decoder
 
 fun numberOfChunks(length: Int, chunkLen: Int): Int {
     var n = length / chunkLen
