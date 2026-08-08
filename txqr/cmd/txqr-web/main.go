@@ -63,6 +63,7 @@ func main() {
 
 	http.HandleFunc("/", serveIndex)
 	http.HandleFunc("/encode", handleEncode)
+	http.HandleFunc("/md5", handleMD5)
 	http.HandleFunc("/frame/", handleFrame)
 	http.HandleFunc("/cancel/", handleCancel)
 
@@ -174,6 +175,25 @@ func handleEncode(w http.ResponseWriter, r *http.Request) {
 		"count": len(frames),
 		"total": len(str),
 		"md5":   hex.EncodeToString(sum[:]),
+	})
+}
+
+// handleMD5 computes and returns the MD5 of an uploaded file body without
+// encoding anything, so the UI can show the checksum as soon as a file is
+// selected (matching the md5 the Android receiver displays on completion).
+func handleMD5(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	sum := md5.Sum(body)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"md5": hex.EncodeToString(sum[:]),
 	})
 }
 

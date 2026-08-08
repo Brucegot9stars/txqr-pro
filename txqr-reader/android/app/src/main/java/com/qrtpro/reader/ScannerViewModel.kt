@@ -45,6 +45,7 @@ data class ScannerUiState(
     val speed: String = "",
     val readInterval: Long = 0,
     val totalSize: String = "",
+    val bytesDetail: String = "",
     val totalTime: String = "",
     val avgSpeed: String = "",
     val peakSpeed: String = "",
@@ -93,6 +94,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             peakSpeed = decoder.peakSpeedStr,
             readInterval = decoder.readIntervalMs,
             totalSize = decoder.totalSizeStr,
+            bytesDetail = decoder.bytesDetailStr,
             totalTime = decoder.totalTime
         )
     }
@@ -133,6 +135,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                         peakSpeed = decoder.peakSpeedStr,
                         readInterval = decoder.readIntervalMs,
                         totalSize = decoder.totalSizeStr,
+                        bytesDetail = decoder.bytesDetailStr,
                         totalTime = decoder.totalTime
                     )
 

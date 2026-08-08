@@ -1,6 +1,7 @@
 package txqr
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -77,17 +78,66 @@ func (e *Encoder) Encode(str string) ([]string, error) {
 	}
 
 	numChunks := numberOfChunks(total, e.chunkLen)
-	codec := e.createGofountainCodec(numChunks)
+
+	// gofountain's Raptor (R10/RFC 5053) codec only supports K in
+	// [4, 8192]. Messages with fewer than 4 source blocks can't use the
+	// Raptor pre-code (it panics for K < 4), and RFC 5052 decoders -
+	// including the Android receiver - also require K >= 4. Fall back to
+	// plain LT for such tiny messages so the sender never emits invalid
+	// Raptor frames. The fallback frame has no codec tag, so the receiver
+	// initializes an LT decoder and decodes it transparently.
+	effective := e.codec
+	if e.codec == CodecRaptor && numChunks < 4 {
+		effective = CodecLT
+	}
+
+	codec := e.createGofountainCodec(numChunks, effective)
 
 	var msg = make([]byte, total)
 	copy(msg, data)
 	idsToEncode := ids(int(float64(numChunks) * e.redundancyFactor))
 	lubyBlocks := fountain.EncodeLTBlocks(msg, idsToEncode, codec)
 
+	// gofountain's Raptor (RFC 5053) decode path cannot reliably reconstruct
+	// data whose length is not an exact multiple of the chunk size (it
+	// returns completed=true but garbled bytes for most real-world sizes).
+	// Verify the round trip locally and silently degrade to LT when Raptor
+	// can't decode its own encoding, so the sender never emits frames that
+	// the receiver would decode as corrupt data.
+	if effective == CodecRaptor && !raptorRoundTrip(codec, data, lubyBlocks) {
+		effective = CodecLT
+		codec = e.createGofountainCodec(numChunks, CodecLT)
+		msg = make([]byte, total)
+		copy(msg, data)
+		lubyBlocks = fountain.EncodeLTBlocks(msg, idsToEncode, codec)
+	}
+
 	for _, block := range lubyBlocks {
-		ret = append(ret, e.frame(block.BlockCode, total, block.Data, string(e.codec)))
+		ret = append(ret, e.frame(block.BlockCode, total, block.Data, codecName(effective)))
 	}
 	return ret, nil
+}
+
+// raptorRoundTrip verifies gofountain's Raptor codec can reproduce original
+// data from the freshly encoded blocks. gofountain's Raptor decode path
+// returns completed+true but garbled bytes for many real-world sizes (length
+// not an exact multiple of the chunk size), so the sender falls back to LT
+// when it can't round-trip. blocks are the freshly encoded Raptor blocks;
+// they hold slices from EncodeLTBlocks' destructive input buffer, so the
+// decoder gets defensive copies.
+func raptorRoundTrip(codec fountain.Codec, data []byte, blocks []fountain.LTBlock) bool {
+	d := codec.NewDecoder(len(data))
+	cp := make([]fountain.LTBlock, len(blocks))
+	for i, b := range blocks {
+		buf := make([]byte, len(b.Data))
+		copy(buf, b.Data)
+		cp[i] = fountain.LTBlock{BlockCode: b.BlockCode, Data: buf}
+	}
+	if !d.AddBlocks(cp) {
+		return false
+	}
+	out := d.Decode()
+	return out != nil && bytes.Equal(out, data)
 }
 
 // nameFrame builds the metadata frame carrying the original file name.
@@ -97,8 +147,8 @@ func (e *Encoder) nameFrame(total int) string {
 	return fmt.Sprintf("-1/%d/%d/%s/name|%s", e.chunkLen, total, string(e.codec), name)
 }
 
-func (e *Encoder) createGofountainCodec(numChunks int) fountain.Codec {
-	switch e.codec {
+func (e *Encoder) createGofountainCodec(numChunks int, ct CodecType) fountain.Codec {
+	switch ct {
 	case CodecBinary:
 		return fountain.NewBinaryCodec(numChunks)
 	case CodecRaptor:
@@ -110,6 +160,15 @@ func (e *Encoder) createGofountainCodec(numChunks int) fountain.Codec {
 			rand.New(fountain.NewMersenneTwister(200)),
 			solitonDistribution(numChunks))
 	}
+}
+
+// codecName returns the on-the-wire codec tag for a frame, or "" for the
+// implicit LT default (which produces the shorter 3-part header).
+func codecName(ct CodecType) string {
+	if ct == CodecLT {
+		return ""
+	}
+	return string(ct)
 }
 
 func (e *Encoder) frame(blockCode int64, total int, data []byte, codec string) string {

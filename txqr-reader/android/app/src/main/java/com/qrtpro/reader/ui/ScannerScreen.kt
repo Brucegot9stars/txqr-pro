@@ -168,7 +168,8 @@ private fun ScannerOverlay(
                     progress = uiState.progress,
                     speed = uiState.speed,
                     readInterval = uiState.readInterval,
-                    totalSize = uiState.totalSize
+                    totalSize = uiState.totalSize,
+                    bytesDetail = uiState.bytesDetail
                 )
             }
             ScanState.COMPLETED -> {
@@ -230,7 +231,8 @@ private fun ProgressPanel(
     progress: Int,
     speed: String,
     readInterval: Long,
-    totalSize: String
+    totalSize: String,
+    bytesDetail: String
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -260,6 +262,13 @@ private fun ProgressPanel(
                 text = "$progress% | $speed | ${totalSize}total",
                 color = Color.White,
                 fontSize = 14.sp,
+                fontFamily = FontFamily.Monospace
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = bytesDetail,
+                color = Color.White,
+                fontSize = 12.sp,
                 fontFamily = FontFamily.Monospace
             )
         }

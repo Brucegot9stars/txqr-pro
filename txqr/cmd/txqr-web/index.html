@@ -129,6 +129,7 @@ let running = false;  // overlay active and playing
 let paused = false;
 let encoding = false; // a serialization request is in flight
 let encodeAbort = null; // AbortController for the in-flight serialization
+let fileMD5 = '';     // MD5 of the currently selected file
 let base = 0;         // index of the first frame on screen
 let shownBytes = 0;
 let startTime = 0;
@@ -156,8 +157,26 @@ function showFileInfo() {
   const file = fileInput.files[0];
   if (!file) { statusEl.textContent = ''; return; }
   const ready = session ? '（已编码，可「继续序列化」）' : '';
-  const md5 = session && session.md5 ? '  MD5: ' + session.md5 : '';
+  const md5 = fileMD5 ? '  MD5: ' + fileMD5 : '';
   statusEl.textContent = file.name + '  ' + bytesFmt(file.size) + ready + md5;
+}
+
+// Compute the file's MD5 locally via the server so it can be shown the
+// moment a file is picked, long before any serialization starts.
+async function updateFileMD5() {
+  const file = fileInput.files[0];
+  fileMD5 = '';
+  showFileInfo();
+  if (!file) return;
+  try {
+    const resp = await fetch('/md5', { method: 'POST', body: await file.arrayBuffer() });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (fileInput.files[0] === file) {
+      fileMD5 = data.md5 || '';
+      showFileInfo();
+    }
+  } catch (e) { /* network hiccup: leave MD5 empty */ }
 }
 
 async function encodeFile() {
@@ -279,6 +298,7 @@ async function cancel() {
 fileInput.addEventListener('change', function () {
   // re-selected file: drop the old session so everything is fresh
   cancel();
+  updateFileMD5();
 });
 
 startBtn.addEventListener('click', function () {

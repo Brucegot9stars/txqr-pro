@@ -18,7 +18,7 @@ class TxqrDecoder {
     private val cache = mutableSetOf<String>()
     private val seenBlockCodes = HashSet<Long>()
 
-    private var bytesRead = 0L
+    private var sourceBytesRead = 0L
     private var startTime = 0L
     private var endTime = 0L
     private var lastChunkTime = 0L
@@ -111,7 +111,9 @@ class TxqrDecoder {
                 }
             }
 
-            bytesRead += payload.size
+            if (blockCode < numChunks) {
+                sourceBytesRead += payload.size
+            }
             seenBlockCodes.add(blockCode)
             recordSpeedSample(now)
 
@@ -130,7 +132,7 @@ class TxqrDecoder {
     }
 
     private fun recordSpeedSample(now: Long) {
-        speedWindow.addLast(longArrayOf(now, bytesRead))
+        speedWindow.addLast(longArrayOf(now, sourceBytesRead))
         while (speedWindow.size > 1 && now - speedWindow.first()[0] > SPEED_WINDOW_MS) {
             speedWindow.removeFirst()
         }
@@ -211,6 +213,22 @@ class TxqrDecoder {
 
     val receivedFileName: String get() = synchronized(lock) { storedFileName }
 
+    // Valid source bytes received (only blockCode < numChunks payloads count,
+// matching the real-time and average speed metrics below).
+    val sourceBytesCount: Long get() = synchronized(lock) { sourceBytesRead }
+    val totalBytesCount: Long get() = synchronized(lock) { totalSize.toLong() }
+    val sourceBytesStr: String
+        get() = synchronized(lock) {
+            formatSize(sourceBytesRead) + "/" + formatSize(totalSize.toLong())
+        }
+
+    // Valid source bytes detail for fine-grained judgement while scanning.
+    val bytesDetailStr: String
+        get() = synchronized(lock) {
+            val total = totalSize.toLong()
+            "已接收有效Bytes ${sourceBytesRead}/${total}"
+        }
+
     fun reset() {
         synchronized(lock) {
             activeCodec = CodecType.LT
@@ -227,7 +245,7 @@ class TxqrDecoder {
             neededBlocks = 0
             cache.clear()
             seenBlockCodes.clear()
-            bytesRead = 0L
+            sourceBytesRead = 0L
             startTime = 0L
             endTime = 0L
             lastChunkTime = 0L
