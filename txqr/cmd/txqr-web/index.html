@@ -59,6 +59,8 @@
     </div>
   </div>
 
+  <label style="margin-top:14px; display:inline-flex; align-items:center; gap:8px;"><input type="checkbox" id="colorMode" style="width:auto;"> Color Matrix 模式（2 位/模块）</label>
+
   <div class="row">
     <div>
       <label>编码方案</label>
@@ -110,6 +112,7 @@ const gridInput = document.getElementById('gridSize');
 const codecInput = document.getElementById('codec');
 const epsilonInput = document.getElementById('epsilon');
 const qualityInput = document.getElementById('quality');
+const colorModeInput = document.getElementById('colorMode');
 const onlineParams = document.getElementById('onlineParams');
 const startBtn = document.getElementById('start');
 const pauseBtn = document.getElementById('pause');
@@ -195,6 +198,7 @@ async function encodeFile() {
   statusEl.textContent = '编码中...（点击「取消序列化」可中止）';
   try {
     let url = '/encode?split=' + split + '&codec=' + codec;
+    if (colorModeInput.checked) url += '&mode=color';
     if (codec === 'online') {
       url += '&epsilon=' + epsilon + '&quality=' + quality;
     }

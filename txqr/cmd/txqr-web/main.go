@@ -40,6 +40,7 @@ type session struct {
 	frames    [][]byte
 	pngs      [][]byte
 	total     int
+	mode      string // "qr" or "color"
 	createdAt time.Time
 }
 
@@ -109,6 +110,11 @@ func handleEncode(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	mode := "qr"
+	if v := r.URL.Query().Get("mode"); v == "color" {
+		mode = "color"
+	}
+
 	codec := txqr.ParseCodec(r.URL.Query().Get("codec"))
 	onlineEpsilon := 0.01
 	if v := r.URL.Query().Get("epsilon"); v != "" {
@@ -145,6 +151,7 @@ func handleEncode(w http.ResponseWriter, r *http.Request) {
 		frames:    make([][]byte, len(frames)),
 		pngs:      make([][]byte, len(frames)),
 		total:     len(str),
+		mode:      mode,
 		createdAt: time.Now(),
 	}
 	for i, f := range frames {
@@ -213,7 +220,11 @@ func handleFrame(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	s, ok := sessions[id]
 	if ok && idx >= 0 && idx < len(s.frames) && s.pngs[idx] == nil {
-		s.pngs[idx] = renderPNG(s.frames[idx])
+		if s.mode == "color" {
+			s.pngs[idx] = renderColorPNG(s.frames[idx])
+		} else {
+			s.pngs[idx] = renderPNG(s.frames[idx])
+		}
 	}
 	var png []byte
 	if ok {
@@ -260,6 +271,21 @@ func renderPNG(frame []byte) []byte {
 	return buf.Bytes()
 }
 
+// renderColorPNG renders a frame as a 4-color matrix (2 bit/module).
+func renderColorPNG(frame []byte) []byte {
+	img, err := qr.ColorMatrixEncode(frame, 512)
+	if err != nil {
+		log.Printf("color encode error: %v", err)
+		return nil
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		log.Printf("PNG encode error: %v", err)
+		return nil
+	}
+	return buf.Bytes()
+}
+
 // renderFrames pre-renders every frame's PNG using a worker pool sized to the
 // number of available CPUs. It stops scheduling new work as soon as the
 // request context is cancelled so a client abort still clears the pool.
@@ -285,7 +311,11 @@ func renderFrames(s *session, ctx context.Context) {
 				if ctx.Err() != nil {
 					return
 				}
-				s.pngs[i] = renderPNG(s.frames[i])
+				if s.mode == "color" {
+					s.pngs[i] = renderColorPNG(s.frames[i])
+				} else {
+					s.pngs[i] = renderPNG(s.frames[i])
+				}
 			}
 		}()
 	}

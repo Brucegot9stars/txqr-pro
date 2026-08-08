@@ -10,6 +10,8 @@ import com.google.mlkit.vision.barcode.BarcodeScanner
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.common.InputImage
 import com.qrtpro.reader.decoder.TxqrDecoder
+import com.qrtpro.reader.decoder.ColorMatrixDecoder
+import com.qrtpro.reader.decoder.ColorMatrixDecodeException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -63,6 +65,9 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     private val _uiState = MutableStateFlow(ScannerUiState())
     val uiState: StateFlow<ScannerUiState> = _uiState.asStateFlow()
 
+    private val _colorMode = MutableStateFlow(false)
+    val colorMode: StateFlow<Boolean> = _colorMode.asStateFlow()
+
     private var uiTicker: Job? = null
 
     var scanResultData: ByteArray? = null
@@ -102,6 +107,11 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     fun onQrCodeScanned(imageProxy: ImageProxy) {
         if (_uiState.value.scanState != ScanState.SCANNING) {
             imageProxy.close()
+            return
+        }
+
+        if (_colorMode.value) {
+            decodeColorMatrix(imageProxy)
             return
         }
 
@@ -154,6 +164,52 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             .addOnCompleteListener {
                 imageProxy.close()
             }
+    }
+
+    fun setColorMode(enabled: Boolean) {
+        _colorMode.value = enabled
+    }
+
+    private fun decodeColorMatrix(imageProxy: ImageProxy) {
+        try {
+            val planes = imageProxy.planes
+            if (planes.isEmpty()) { imageProxy.close(); return }
+            val yPlane = planes[0]
+            val yBuf = yPlane.buffer
+            val pStride = yPlane.pixelStride
+            val rStride = yPlane.rowStride
+
+            val w = imageProxy.width
+            val h = imageProxy.height
+            val side = minOf(w, h)
+            val ox = (w - side) / 2
+            val oy = (h - side) / 2
+            if (side < ColorMatrixDecoder.MATRIX_SIZE) { imageProxy.close(); return }
+
+            val sampler: (Int, Int) -> Int = { x, y ->
+                val yi = y + oy
+                val xi = x + ox
+                val idx = yi * rStride + xi * pStride
+                val yVal = yBuf.get(idx).toInt() and 0xFF
+                (yVal shl 16) or (yVal shl 8) or yVal
+            }
+
+            val frameBytes = ColorMatrixDecoder.decode(sampler, side, side)
+            decoder.decodeFrame(frameBytes)
+
+            if (decoder.isCompleted) {
+                val dataBytes = decoder.dataBytes ?: return
+                scanResultData = dataBytes
+                _uiState.value = _uiState.value.copy(
+                    scanState = ScanState.COMPLETED,
+                    md5 = computeMd5(dataBytes),
+                    suggestedFileName = decoder.receivedFileName.ifBlank { generateFileName(dataBytes) }
+                )
+            }
+        } catch (_: ColorMatrixDecodeException) {
+        } finally {
+            imageProxy.close()
+        }
     }
 
     fun startScan() {

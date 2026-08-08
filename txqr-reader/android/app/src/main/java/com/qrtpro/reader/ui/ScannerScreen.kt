@@ -69,8 +69,12 @@ fun ScannerScreen(
                 modifier = Modifier.fillMaxSize()
             )
 
+            val colorMode by viewModel.colorMode.collectAsState()
+
             ScannerOverlay(
                 uiState = uiState,
+                colorMode = colorMode,
+                onColorModeChange = { viewModel.setColorMode(it) },
                 onSaveRequest = onSaveRequest,
                 onRestart = { viewModel.startScan() }
             )
@@ -151,6 +155,8 @@ private fun CameraPreview(
 @Composable
 private fun ScannerOverlay(
     uiState: ScannerUiState,
+    colorMode: Boolean,
+    onColorModeChange: (Boolean) -> Unit,
     onSaveRequest: (String) -> Unit,
     onRestart: () -> Unit
 ) {
@@ -160,7 +166,11 @@ private fun ScannerOverlay(
             .padding(16.dp),
         verticalArrangement = Arrangement.SpaceBetween
     ) {
-        TopBar(onRestart = onRestart)
+        TopBar(
+            colorMode = colorMode,
+            onColorModeChange = onColorModeChange,
+            onRestart = onRestart
+        )
 
         when (uiState.scanState) {
             ScanState.SCANNING -> {
@@ -198,27 +208,41 @@ private fun ScannerOverlay(
 }
 
 @Composable
-private fun TopBar(onRestart: () -> Unit) {
+private fun TopBar(
+    colorMode: Boolean,
+    onColorModeChange: (Boolean) -> Unit,
+    onRestart: () -> Unit
+) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         color = Color.Black.copy(alpha = 0.6f),
         shape = RoundedCornerShape(12.dp)
     ) {
-        Box(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Text(
                 text = "QRT Pro Reader",
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp),
+                modifier = Modifier.weight(1f),
                 textAlign = TextAlign.Center,
                 color = Color.White,
                 fontSize = 20.sp
             )
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Color", color = Color.White, fontSize = 10.sp)
+                Switch(
+                    checked = colorMode,
+                    onCheckedChange = onColorModeChange,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Color.Green,
+                        checkedTrackColor = Color.Green.copy(alpha = 0.3f)
+                    )
+                )
+            }
+            Spacer(modifier = Modifier.width(8.dp))
             TextButton(
-                onClick = onRestart,
-                modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .padding(end = 4.dp)
+                onClick = onRestart
             ) {
                 Text("重选", color = Color.White)
             }
