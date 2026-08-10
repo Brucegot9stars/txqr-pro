@@ -1,0 +1,584 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"runtime"
+	"sync"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+)
+
+const (
+	wmAppRefresh = 0x0400 + 1
+	wmAppDone    = 0x0400 + 2
+)
+
+const (
+	wmPaint       = 0x000F
+	wmEraseBkgnd  = 0x0014
+	wmDestroy     = 0x0002
+	wmClose       = 0x0010
+	wmLButtonDown = 0x0201
+	wmLButtonUp   = 0x0202
+	wmMouseMove   = 0x0200
+	wmKeyDown     = 0x0100
+
+	vkEscape = 0x1B
+	swShow   = 5
+
+	wsOverlappedWindow = 0x00CF0000
+	wsPopup            = 0x80000000
+	wsVisible          = 0x10000000
+	wsExTopmost        = 0x00000008
+	wsExToolwindow     = 0x00000080
+
+	hwndTopmost = uintptr(0xffffffff)
+
+	swpShowWindow = 0x0040
+
+	idcCross = 32515
+
+	smXVirtualScreen = 76
+	smYVirtualScreen = 77
+	smCxVirtualScreen = 78
+	smCyVirtualScreen = 79
+
+	ofnOverwritePrompt = 0x0002
+	ofnPathMustExist   = 0x00000800
+
+	blackBrush = 4
+)
+
+func rgb(r, g, b uint8) uint32 {
+	return uint32(r) | uint32(g)<<8 | uint32(b)<<16
+}
+
+type app struct {
+	hwnd    uintptr
+	hinst   uintptr
+	btns    [4]rect
+	btnText [4]string
+
+	region   rect // screen (virtual) coordinates of the selected area
+	scanning bool
+	serial   int // bumped on every start/stop; stale capture loops exit
+
+	mu       sync.Mutex
+	latest   []byte // BGRA preview of the captured region
+	latestW  int
+	latestH  int
+	preview  bitmapInfo
+
+	st decodeState
+
+	overlayHwnd uintptr
+	selecting   bool
+	selBuf      []byte
+	selW        int
+	selH        int
+	selInfo     bitmapInfo
+	selStart    point
+	selCur      point
+	dragging    bool
+}
+
+func main() {
+	runtime.LockOSThread()
+	procSetProcessDPIAware.Call()
+
+	inst := getModuleHandle(nil)
+	if inst == 0 {
+		messageBox(0, "GetModuleHandle failed", "txqr-desktop", 0)
+		return
+	}
+	a := &app{hinst: inst, btnText: [4]string{"框选区域", "开始", "停止", "保存"}}
+
+	// main window class
+	wc := wndclassex{
+		cbSize:        uint32(unsafe.Sizeof(wndclassex{})),
+		style:         0,
+		lpfnWndProc:   syscall.NewCallback(a.wndProc),
+		hInstance:     inst,
+		hCursor:       procCall(procLoadCursorW, 0, idcCross),
+		hbrBackground: blackBrush,
+		lpszClassName: utf16("QRTDesktopMain"),
+	}
+	if procCall(procRegisterClassExW, uintptr(unsafe.Pointer(&wc))) == 0 {
+		messageBox(0, "RegisterClassEx failed", "txqr-desktop", 0)
+		return
+	}
+	// overlay window class
+	wc2 := wndclassex{
+		cbSize:        uint32(unsafe.Sizeof(wndclassex{})),
+		style:         0,
+		lpfnWndProc:   syscall.NewCallback(a.overlayProc),
+		hInstance:     inst,
+		hCursor:       procCall(procLoadCursorW, 0, idcCross),
+		hbrBackground: blackBrush,
+		lpszClassName: utf16("QRTDesktopSelect"),
+	}
+	if procCall(procRegisterClassExW, uintptr(unsafe.Pointer(&wc2))) == 0 {
+		messageBox(0, "RegisterClassEx failed", "txqr-desktop", 0)
+		return
+	}
+
+	hwnd := procCall(procCreateWindowExW, 0, uintptr(unsafe.Pointer(utf16("QRTDesktopMain"))),
+		uintptr(unsafe.Pointer(utf16("QRT 桌面接收器"))),
+		wsOverlappedWindow|wsVisible, 120, 90, 820, 640, 0, 0, inst, 0)
+	if hwnd == 0 {
+		messageBox(0, "CreateWindowEx failed", "txqr-desktop", 0)
+		return
+	}
+	a.hwnd = hwnd
+	procShowWindow.Call(hwnd, swShow)
+	procUpdateWindow.Call(hwnd)
+
+	var m msg
+	for {
+		r := procCall(procGetMessageW, uintptr(unsafe.Pointer(&m)), 0, 0, 0)
+		if r == 0 || r == ^uintptr(0) {
+			break
+		}
+		procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
+		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
+	}
+}
+
+func (a *app) wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
+	switch msg {
+	case wmPaint:
+		if h := getDC(hwnd); h != 0 {
+			a.paintMain(h)
+		}
+		return 0
+	case wmEraseBkgnd:
+		return 1
+	case wmLButtonDown:
+		p := pointFromLParam(lParam)
+		if idx := a.hitButton(p); idx >= 0 {
+			a.onButton(idx)
+			return 0
+		}
+	case wmAppRefresh:
+		procInvalidateRect.Call(hwnd, 0, 0)
+		return 0
+	case wmAppDone:
+		a.saveDialog()
+		return 0
+	case wmClose:
+		procDestroyWindow.Call(hwnd)
+		return 0
+	case wmDestroy:
+		a.stopScan()
+		procPostQuitMessage.Call(0)
+		return 0
+	}
+	return procCall(procDefWindowProcW, hwnd, msg, wParam, lParam)
+}
+
+func pointFromLParam(lParam uintptr) point {
+	return point{x: int32(int16(lParam & 0xFFFF)), y: int32(int16(lParam >> 16))}
+}
+
+func (a *app) onButton(idx int) {
+	switch idx {
+	case 0: // 框选区域
+		a.startSelect()
+	case 1: // 开始
+		if a.region.right > a.region.left && a.region.bottom > a.region.top {
+			a.startScan()
+		} else {
+			messageBox(a.hwnd, "请先框选二维码区域", "提示", 0)
+		}
+	case 2: // 停止
+		a.stopScan()
+	case 3: // 保存
+		a.saveDialog()
+	}
+}
+
+func (a *app) hitButton(p point) int {
+	for i, r := range a.btns {
+		if int(p.x) >= int(r.left) && int(p.x) < int(r.right) && int(p.y) >= int(r.top) && int(p.y) < int(r.bottom) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (a *app) paintMain(hdc uintptr) {
+	if hdc == 0 {
+		return
+	}
+	defer releaseDC(a.hwnd, hdc)
+
+	var rc rect
+	procGetClientRect.Call(a.hwnd, uintptr(unsafe.Pointer(&rc)))
+	cx := int(rc.right)
+	cy := int(rc.bottom)
+
+	// black backdrop
+	brBg := createSolidBrush(rgb(16, 16, 20))
+	defer deleteObject(brBg)
+	fillRect(hdc, &rect{0, 0, int32(cx), int32(cy)}, brBg)
+
+	// buttons
+	brBtn := createSolidBrush(rgb(47, 61, 92))
+	brBtnOn := createSolidBrush(rgb(38, 130, 60))
+	brFrame := createSolidBrush(rgb(120, 140, 180))
+	defer deleteObject(brBtn)
+	defer deleteObject(brBtnOn)
+	defer deleteObject(brFrame)
+
+	setBkMode(hdc, transparent)
+	setTextColor(hdc, rgb(235, 238, 245))
+	x := 12
+	for i, label := range a.btnText {
+		r := rect{int32(x), 10, int32(x + 96), 44}
+		a.btns[i] = r
+		if i == 1 && a.scanning {
+			fillRect(hdc, &r, brBtnOn)
+		} else {
+			fillRect(hdc, &r, brBtn)
+		}
+		frameRect(hdc, &r, brFrame)
+		t := utf16(label)
+		tw, th := textExtent(hdc, t, len(label))
+		textOutW(hdc, x+(96-int(tw))/2, 10+(34-int(th))/2, t, len(label))
+		x += 108
+	}
+
+	// status + progress
+	p, status, _ := a.st.snapshot()
+	ts := utf16(status)
+	textOutW(hdc, 12, 56, ts, len(status))
+	pr := rect{12, 82, int32(cx - 12), 96}
+	brTrack := createSolidBrush(rgb(40, 40, 48))
+	brFill := createSolidBrush(rgb(47, 129, 247))
+	defer deleteObject(brTrack)
+	defer deleteObject(brFill)
+	fillRect(hdc, &pr, brTrack)
+	if p > 0 {
+		fw := int32(int(pr.right-pr.left) * p / 100)
+		if fw >= 1 {
+			fillRect(hdc, &rect{pr.left, pr.top, pr.left + fw, pr.bottom}, brFill)
+		}
+	}
+
+	// region hint
+	hint := "未选择区域 — 点击「框选区域」并框住屏幕上的二维码"
+	if a.region.right > a.region.left {
+		hint = fmt.Sprintf("区域 %d,%d %dx%d", a.region.left, a.region.top,
+			a.region.right-a.region.left, a.region.bottom-a.region.top)
+	}
+	hs := utf16(hint)
+	textOutW(hdc, 12, 104, hs, len(hint))
+
+	// preview area
+	pv := rect{12, 128, int32(cx - 12), int32(cy - 12)}
+	brPV := createSolidBrush(rgb(0, 0, 0))
+	fillRect(hdc, &pv, brPV)
+	a.mu.Lock()
+	lw, lh, lbuf := a.latestW, a.latestH, a.latest
+	info := a.preview
+	a.mu.Unlock()
+	if lbuf != nil && lw > 0 && lh > 0 {
+		// fit into pv preserving aspect
+		dw, dh := int(pv.right-pv.left), int(pv.bottom-pv.top)
+		scale := 1
+		if lw > 0 && lh > 0 {
+			s1, s2 := dw*100/lw, dh*100/lh
+			if s2 < s1 {
+				s1 = s2
+			}
+			scale = s1
+			if scale < 1 {
+				scale = 1
+			}
+		}
+		ndw, ndh := lw*scale/100, lh*scale/100
+		ox := int(pv.left) + (dw-ndw)/2
+		oy := int(pv.top) + (dh-ndh)/2
+		stretchDIBits(hdc, ox, oy, ndw, ndh, 0, 0, lw, lh, uintptr(unsafe.Pointer(&lbuf[0])), &info)
+	}
+	deleteObject(brPV)
+}
+
+// ------------------------------------------------------------ capture loop
+
+func (a *app) startScan() {
+	if a.scanning {
+		return
+	}
+	a.st.reset()
+	a.scanning = true
+	a.serial++
+	gen := a.serial
+	go a.runCapture(gen)
+	procInvalidateRect.Call(a.hwnd, 0, 0)
+}
+
+func (a *app) stopScan() {
+	if !a.scanning {
+		return
+	}
+	a.scanning = false
+	a.serial++
+	procInvalidateRect.Call(a.hwnd, 0, 0)
+}
+
+func (a *app) runCapture(gen int) {
+	for {
+		if !a.scanning || gen != a.serial {
+			return
+		}
+		r := a.region
+		if r.right <= r.left || r.bottom <= r.top {
+			return
+		}
+		start := time.Now()
+		rgba, bgra, err := captureRegion(int(r.left), int(r.top), int(r.right-r.left), int(r.bottom-r.top))
+		if err == nil {
+			w, h := int(r.right-r.left), int(r.bottom-r.top)
+			a.mu.Lock()
+			a.latest = bgra
+			a.latestW = w
+			a.latestH = h
+			a.preview = bitmapInfo{bmiHeader: bitmapInfoHeader{
+				biSize:     uint32(unsafe.Sizeof(bitmapInfoHeader{})),
+				biWidth:    int32(w),
+				biHeight:   -int32(h),
+				biPlanes:   1,
+				biBitCount: 32,
+			}}
+			a.mu.Unlock()
+			done := a.st.feed(rgba)
+			procPostMessageW.Call(a.hwnd, wmAppRefresh, 0, 0)
+			if done {
+				a.stopScan()
+				procPostMessageW.Call(a.hwnd, wmAppDone, 0, 0)
+				return
+			}
+		}
+		elapsed := time.Since(start)
+		if elapsed < 30*time.Millisecond {
+			time.Sleep(30*time.Millisecond - elapsed)
+		}
+	}
+}
+
+// ------------------------------------------------------------ selection overlay
+
+func virtualScreen() (int, int, int, int) {
+	x := int(procCall(procGetSystemMetrics, smXVirtualScreen))
+	y := int(procCall(procGetSystemMetrics, smYVirtualScreen))
+	w := int(procCall(procGetSystemMetrics, smCxVirtualScreen))
+	h := int(procCall(procGetSystemMetrics, smCyVirtualScreen))
+	return x, y, w, h
+}
+
+func (a *app) startSelect() {
+	a.stopScan()
+	vx, vy, vw, vh := virtualScreen()
+	_, buf, err := captureRegion(vx, vy, vw, vh)
+	if err != nil {
+		messageBox(a.hwnd, "屏幕捕获失败: "+err.Error(), "错误", 0)
+		return
+	}
+	a.selBuf = buf
+	a.selW, a.selH = vw, vh
+	a.selInfo = bitmapInfo{bmiHeader: bitmapInfoHeader{
+		biSize:     uint32(unsafe.Sizeof(bitmapInfoHeader{})),
+		biWidth:    int32(vw),
+		biHeight:   -int32(vh),
+		biPlanes:   1,
+		biBitCount: 32,
+	}}
+	a.selecting = true
+	a.dragging = false
+
+	hwnd := procCall(procCreateWindowExW, wsExTopmost|wsExToolwindow,
+		uintptr(unsafe.Pointer(utf16("QRTDesktopSelect"))),
+		uintptr(unsafe.Pointer(utf16("框选二维码区域"))),
+		wsPopup|wsVisible, uintptr(vx), uintptr(vy), uintptr(vw), uintptr(vh), 0, 0, a.hinst, 0)
+	if hwnd == 0 {
+		messageBox(a.hwnd, "创建选框失败", "错误", 0)
+		a.selecting = false
+		return
+	}
+	a.overlayHwnd = hwnd
+	procShowWindow.Call(hwnd, swShow)
+	procUpdateWindow.Call(hwnd)
+}
+
+func (a *app) overlayProc(hwnd, msg, wParam, lParam uintptr) uintptr {
+	switch msg {
+	case wmPaint:
+		a.paintOverlay(getDC(hwnd))
+		releaseDC(hwnd, getDC(hwnd))
+		return 0
+	case wmEraseBkgnd:
+		return 1
+	case wmLButtonDown:
+		a.dragging = true
+		a.selStart = pointFromLParam(lParam)
+		a.selCur = a.selStart
+		procSetCapture.Call(hwnd)
+		return 0
+	case wmMouseMove:
+		if a.dragging {
+			a.selCur = pointFromLParam(lParam)
+			procInvalidateRect.Call(hwnd, 0, 0)
+		}
+		return 0
+	case wmLButtonUp:
+		if a.dragging {
+			a.dragging = false
+			procReleaseCapture.Call()
+			a.selCur = pointFromLParam(lParam)
+			a.finishSelect()
+		}
+		return 0
+	case wmKeyDown:
+		if wParam == vkEscape {
+			a.cancelSelect()
+		}
+		return 0
+	case wmClose:
+		a.cancelSelect()
+		return 0
+	}
+	return procCall(procDefWindowProcW, hwnd, msg, wParam, lParam)
+}
+
+func (a *app) finishSelect() {
+	vx, vy, _, _ := virtualScreen()
+	x0, y0 := a.selStart.x, a.selStart.y
+	x1, y1 := a.selCur.x, a.selCur.y
+	if x0 > x1 {
+		x0, x1 = x1, x0
+	}
+	if y0 > y1 {
+		y0, y1 = y1, y0
+	}
+	if x1-x0 < 8 || y1-y0 < 8 {
+		a.cancelSelect()
+		return
+	}
+	a.region = rect{
+		int32(x0 + int32(vx)), int32(y0 + int32(vy)), int32(x1 + int32(vx)), int32(y1 + int32(vy)),
+	}
+	procDestroyWindow.Call(a.overlayHwnd)
+	a.overlayHwnd = 0
+	a.selecting = false
+	procInvalidateRect.Call(a.hwnd, 0, 0)
+	a.startScan()
+}
+
+func (a *app) cancelSelect() {
+	if a.overlayHwnd != 0 {
+		procDestroyWindow.Call(a.overlayHwnd)
+		a.overlayHwnd = 0
+	}
+	a.selecting = false
+	a.dragging = false
+}
+
+func (a *app) paintOverlay(hdc uintptr) {
+	if hdc == 0 {
+		return
+	}
+	defer releaseDC(a.overlayHwnd, hdc)
+	if a.selBuf == nil {
+		return
+	}
+	stretchDIBits(hdc, 0, 0, a.selW, a.selH, 0, 0, a.selW, a.selH,
+		uintptr(unsafe.Pointer(&a.selBuf[0])), &a.selInfo)
+
+	brDim := createSolidBrush(rgb(28, 28, 34))
+	brSel := createSolidBrush(rgb(0, 220, 120))
+	defer deleteObject(brDim)
+	defer deleteObject(brSel)
+
+	if !a.dragging {
+		setBkMode(hdc, transparent)
+		setTextColor(hdc, rgb(255, 255, 255))
+		hintText := "拖拽框选二维码区域，Esc 取消"
+		hint := utf16(hintText)
+		textOutW(hdc, 24, 24, hint, len(hintText))
+	}
+
+	var sx0, sy0, sx1, sy1 int32
+	if a.dragging {
+		sx0, sy0 = int32(a.selStart.x), int32(a.selStart.y)
+		sx1, sy1 = int32(a.selCur.x), int32(a.selCur.y)
+		if sx0 > sx1 {
+			sx0, sx1 = sx1, sx0
+		}
+		if sy0 > sy1 {
+			sy0, sy1 = sy1, sy0
+		}
+		// dim outside
+		fillRect(hdc, &rect{0, 0, int32(a.selW), sy0}, brDim)
+		fillRect(hdc, &rect{0, sy1, int32(a.selW), int32(a.selH)}, brDim)
+		fillRect(hdc, &rect{0, sy0, sx0, sy1}, brDim)
+		fillRect(hdc, &rect{sx1, sy0, int32(a.selW), sy1}, brDim)
+		frameRect(hdc, &rect{sx0, sy0, sx1, sy1}, brSel)
+	}
+}
+
+// ------------------------------------------------------------ save
+
+func (a *app) saveDialog() {
+	a.st.mu.Lock()
+	result, name, done := a.st.result, a.st.fileName, a.st.completed
+	a.st.mu.Unlock()
+	if !done || result == nil {
+		return
+	}
+	suggested := name
+	if suggested == "" {
+		suggested = fmt.Sprintf("received_%d.bin", time.Now().Unix())
+	}
+
+	var buf [1024]uint16
+	copy(buf[:], utf16Buf(suggested))
+	ofn := openfilename{
+		lStructSize: uint32(unsafe.Sizeof(openfilename{})),
+		hwndOwner:   a.hwnd,
+		lpstrFilter: fileFilter("所有文件", "*.*"),
+		lpstrFile:   &buf[0],
+		nMaxFile:    1024,
+		lpstrDefExt: utf16("bin"),
+		Flags:       ofnOverwritePrompt | ofnPathMustExist,
+	}
+	if !getSaveFileName(&ofn) {
+		return
+	}
+	path := windows.UTF16ToString(buf[:])
+	if err := os.WriteFile(path, result, 0o644); err != nil {
+		messageBox(a.hwnd, "保存失败: "+err.Error(), "错误", 0)
+		return
+	}
+	messageBox(a.hwnd, "已保存: "+path, "完成", 0)
+}
+
+func utf16Buf(s string) []uint16 {
+	p, _ := syscall.UTF16FromString(s)
+	return p
+}
+
+// fileFilter builds a "name\0pattern\0\0" double-NUL-terminated UTF-16 filter.
+func fileFilter(name, pattern string) *uint16 {
+	var u []uint16
+	for _, part := range []string{name, pattern} {
+		u = append(u, utf16Buf(part)...)
+		u = append(u, 0)
+	}
+	u = append(u, 0)
+	return &u[0]
+}

@@ -1,6 +1,7 @@
 package qr
 
 import (
+	"bytes"
 	"testing"
 	"time"
 )
@@ -19,12 +20,16 @@ func TestV40LCapacity(t *testing.T) {
 	if img == nil {
 		t.Fatal("nil image")
 	}
-	got, err := Decode(img)
+	got, err := DecodeRaw(img)
 	if err != nil {
-		t.Fatalf("Decode: %v", err)
+		t.Fatalf("DecodeRaw: %v", err)
 	}
-	if got != string(data) {
-		t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(data))
+	payload := ExtractFramePayload(got)
+	if payload == nil {
+		t.Fatalf("no byte-mode payload extracted (raw %d bytes)", len(got))
+	}
+	if !bytes.Equal(payload, data) {
+		t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(payload), len(data))
 	}
 }
 

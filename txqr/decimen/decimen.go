@@ -297,6 +297,9 @@ func NewDecoder(h Header) *LTDecoder {
 // IsComplete reports whether every source block is solved.
 func (d *LTDecoder) IsComplete() bool { return d.solvedN >= d.K }
 
+// SolvedCount reports how many source blocks are solved (drives progress UI).
+func (d *LTDecoder) SolvedCount() int { return d.solvedN }
+
 func (d *LTDecoder) xorInto(dst, src []uint32) {
 	for i := range dst {
 		dst[i] ^= src[i]

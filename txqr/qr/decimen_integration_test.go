@@ -47,12 +47,16 @@ func TestDecimenFrameQRRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("encode seq %d: %v", seq, err)
 		}
-		got, err := Decode(img)
+		raw, err := DecodeRaw(img)
 		if err != nil {
 			t.Fatalf("decode seq %d: %v", seq, err)
 		}
-		if got != string(frame) {
-			t.Fatalf("seq %d: QR round-trip byte mismatch", seq)
+		got := ExtractFramePayload(raw)
+		if got == nil {
+			t.Fatalf("seq %d: no byte-mode payload extracted (raw %d bytes)", seq, len(raw))
+		}
+		if !bytes.Equal(got, frame) {
+			t.Fatalf("seq %d: frame mismatch (%d vs %d bytes)", seq, len(got), len(frame))
 		}
 
 		parsed := decimen.ParseFrame([]byte(got))

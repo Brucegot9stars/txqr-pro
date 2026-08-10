@@ -14,6 +14,7 @@ require (
 	github.com/pyk/byten v0.0.0-20140925233358-f847a130bf6d
 	github.com/skip2/go-qrcode v0.0.0-20171229120447-cf5f9fa2f0d8
 	github.com/xssnick/raptorq v1.4.0
+	golang.org/x/sys v0.47.0
 )
 
 replace github.com/skip2/go-qrcode => ./third_party/go-qrcode
