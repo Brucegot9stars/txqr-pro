@@ -95,11 +95,12 @@ type app struct {
 
 func main() {
 	runtime.LockOSThread()
-	// Per-monitor V2 so multi-monitor setups with different scale factors
-	// report physical pixels everywhere; fall back to system DPI awareness.
-	if procCall(procSetProcessDPIAwareC, ^uintptr(3)) == 0 {
-		procSetProcessDPIAware.Call()
-	}
+	// System-level DPI awareness, NOT per-monitor: under per-monitor V2 the
+	// selection overlay's client coords are physical pixels while
+	// GetSystemMetrics' virtual screen is logical, mixing the two shifts the
+	// captured region (you'd scan part of the QR). System DPI keeps screen
+	// coordinates, BitBlt and GetSystemMetrics all in one coordinate space.
+	procSetProcessDPIAware.Call()
 
 	inst := getModuleHandle(nil)
 	if inst == 0 {
@@ -267,12 +268,11 @@ func (a *app) paintMain(hdc uintptr) {
 			fillRect(hdc, &r, brBtn)
 		}
 		frameRect(hdc, &r, brFrame)
-		t := utf16(label)
-		tw, th := textExtent(hdc, t, len(label))
-		textOutW(hdc, x+(96-int(tw))/2, 10+(34-int(th))/2, t, len(label))
+		t, tn := utf16N(label)
+		tw, th := textExtent(hdc, t, tn)
+		textOutW(hdc, x+(96-int(tw))/2, 10+(34-int(th))/2, t, tn)
 		x += 108
 	}
-
 	// per-region status lines + a combined progress bar for the active one
 	brTrack := createSolidBrush(rgb(40, 40, 48))
 	brFill := createSolidBrush(rgb(47, 129, 247))
@@ -292,8 +292,8 @@ func (a *app) paintMain(hdc uintptr) {
 			state = "已停止"
 		}
 		line := fmt.Sprintf("%s · %s · %s", r.label, state, st)
-		ls := utf16(line)
-		textOutW(hdc, 12, lineY, ls, len(line))
+		ls, ln := utf16N(line)
+		textOutW(hdc, 12, lineY, ls, ln)
 		// small progress bar per region
 		pr := rect{12, int32(lineY + 20), int32(cx - 12), int32(lineY + 34)}
 		fillRect(hdc, &pr, brTrack)
@@ -315,8 +315,8 @@ func (a *app) paintMain(hdc uintptr) {
 	if len(a.regions) == 0 {
 		hint = "尚未添加扫描区域 — 点击「添加区域」框住屏幕上的二维码"
 	}
-	hs := utf16(hint)
-	textOutW(hdc, 12, lineY+4, hs, len(hint))
+	hs, hn := utf16N(hint)
+	textOutW(hdc, 12, lineY+4, hs, hn)
 
 	// preview area
 	pv := rect{12, int32(lineY + 28), int32(cx - 12), int32(cy - 12)}
@@ -563,8 +563,8 @@ func (a *app) paintOverlay(hdc uintptr) {
 		setBkMode(hdc, transparent)
 		setTextColor(hdc, rgb(255, 255, 255))
 		hintText := "拖拽框选二维码区域，Esc 取消"
-		hint := utf16(hintText)
-		textOutW(hdc, 24, 24, hint, len(hintText))
+		hint, hn := utf16N(hintText)
+		textOutW(hdc, 24, 24, hint, hn)
 	}
 
 	var sx0, sy0, sx1, sy1 int32

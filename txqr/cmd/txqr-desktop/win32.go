@@ -37,7 +37,6 @@ var (
 	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
 	procInvalidateRect      = user32.NewProc("InvalidateRect")
 	procSetProcessDPIAware  = user32.NewProc("SetProcessDPIAware")
-	procSetProcessDPIAwareC = user32.NewProc("SetProcessDpiAwarenessContext")
 	procDestroyWindow       = user32.NewProc("DestroyWindow")
 	procPostQuitMessage     = user32.NewProc("PostQuitMessage")
 	procMessageBoxW         = user32.NewProc("MessageBoxW")
@@ -154,6 +153,14 @@ type openfilename struct {
 func utf16(s string) *uint16 {
 	p, _ := syscall.UTF16PtrFromString(s)
 	return p
+}
+
+// utf16N returns the UTF-16 pointer and its code-unit count (excluding the
+// trailing NUL) — TextOutW and GetTextExtentPoint32W take the code-unit count,
+// which is NOT the Go string's UTF-8 byte length for non-ASCII text.
+func utf16N(s string) (*uint16, int) {
+	u, _ := syscall.UTF16FromString(s)
+	return &u[0], len(u) - 1
 }
 
 func procCall(p *windows.LazyProc, a ...uintptr) uintptr {
