@@ -26,6 +26,8 @@ var (
 	procDispatchMessageW    = user32.NewProc("DispatchMessageW")
 	procShowWindow          = user32.NewProc("ShowWindow")
 	procUpdateWindow        = user32.NewProc("UpdateWindow")
+	procBeginPaint          = user32.NewProc("BeginPaint")
+	procEndPaint            = user32.NewProc("EndPaint")
 	procPostMessageW        = user32.NewProc("PostMessageW")
 	procSetCapture          = user32.NewProc("SetCapture")
 	procReleaseCapture      = user32.NewProc("ReleaseCapture")
@@ -96,6 +98,16 @@ type msg struct {
 type point struct{ x, y int32 }
 
 type rect struct{ left, top, right, bottom int32 }
+
+// paintstruct mirrors the Win32 PAINTSTRUCT.
+type paintstruct struct {
+	hdc        uintptr
+	fErase     int32
+	rcPaint    rect
+	fRestore   int32
+	fIncUpdate int32
+	rgbReserved [32]byte
+}
 
 type bitmapInfoHeader struct {
 	biSize          uint32
@@ -233,6 +245,41 @@ func getWindowRect(hwnd uintptr) rect {
 	var r rect
 	procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&r)))
 	return r
+}
+
+// paintBuffered runs the WM_PAINT draw callback against a memory DC and blits
+// it to the window in one shot. Combined with BeginPaint/EndPaint (which
+// validates the update region) this eliminates the flicker a GetDC-based
+// paint produces — especially the selection overlay, which repaints on every
+// mouse move.
+func paintBuffered(hwnd uintptr, draw func(hdc uintptr)) {
+	var ps paintstruct
+	hdc := procCall(procBeginPaint, hwnd, uintptr(unsafe.Pointer(&ps)))
+	if hdc == 0 {
+		return
+	}
+	defer procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+
+	w := int(ps.rcPaint.right)
+	h := int(ps.rcPaint.bottom)
+	if w <= 0 || h <= 0 {
+		return
+	}
+	mem := createCompatibleDC(hdc)
+	if mem == 0 {
+		return
+	}
+	defer deleteDC(mem)
+	bmp := createCompatibleBitmap(hdc, w, h)
+	if bmp == 0 {
+		return
+	}
+	defer deleteObject(bmp)
+	old := selectObject(mem, bmp)
+
+	draw(mem)
+	bitBlt(hdc, 0, 0, w, h, mem, 0, 0, srcCopy)
+	selectObject(mem, old)
 }
 
 func getClientRect(hwnd uintptr) rect {

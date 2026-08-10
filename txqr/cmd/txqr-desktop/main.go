@@ -162,9 +162,7 @@ func main() {
 func (a *app) wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case wmPaint:
-		if h := getDC(hwnd); h != 0 {
-			a.paintMain(h)
-		}
+		paintBuffered(hwnd, func(h uintptr) { a.paintMain(h) })
 		return 0
 	case wmEraseBkgnd:
 		return 1
@@ -239,11 +237,6 @@ func (a *app) hitButton(p point) int {
 }
 
 func (a *app) paintMain(hdc uintptr) {
-	if hdc == 0 {
-		return
-	}
-	defer releaseDC(a.hwnd, hdc)
-
 	var rc rect
 	procGetClientRect.Call(a.hwnd, uintptr(unsafe.Pointer(&rc)))
 	cx := int(rc.right)
@@ -475,8 +468,7 @@ func (a *app) startSelect() {
 func (a *app) overlayProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	switch msg {
 	case wmPaint:
-		a.paintOverlay(getDC(hwnd))
-		releaseDC(hwnd, getDC(hwnd))
+		paintBuffered(hwnd, func(h uintptr) { a.paintOverlay(h) })
 		return 0
 	case wmEraseBkgnd:
 		return 1
@@ -556,10 +548,6 @@ func (a *app) cancelSelect() {
 }
 
 func (a *app) paintOverlay(hdc uintptr) {
-	if hdc == 0 {
-		return
-	}
-	defer releaseDC(a.overlayHwnd, hdc)
 	if a.selBuf == nil {
 		return
 	}
