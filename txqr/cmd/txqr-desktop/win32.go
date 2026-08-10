@@ -35,6 +35,7 @@ var (
 	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
 	procInvalidateRect      = user32.NewProc("InvalidateRect")
 	procSetProcessDPIAware  = user32.NewProc("SetProcessDPIAware")
+	procSetProcessDPIAwareC = user32.NewProc("SetProcessDpiAwarenessContext")
 	procDestroyWindow       = user32.NewProc("DestroyWindow")
 	procPostQuitMessage     = user32.NewProc("PostQuitMessage")
 	procMessageBoxW         = user32.NewProc("MessageBoxW")

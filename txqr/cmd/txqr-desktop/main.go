@@ -57,23 +57,30 @@ func rgb(r, g, b uint8) uint32 {
 	return uint32(r) | uint32(g)<<8 | uint32(b)<<16
 }
 
+// scanRegion is one user-selected screen rectangle being scanned
+// independently — the receiver supports several at once, one per monitor.
+type scanRegion struct {
+	rect     rect
+	st       decodeState
+	scanning bool
+	serial   int
+	done     bool
+	label    string
+}
+
 type app struct {
 	hwnd    uintptr
 	hinst   uintptr
-	btns    [4]rect
-	btnText [4]string
+	btns    [5]rect
+	btnText [5]string
 
-	region   rect // screen (virtual) coordinates of the selected area
-	scanning bool
-	serial   int // bumped on every start/stop; stale capture loops exit
+	regions []*scanRegion
 
 	mu       sync.Mutex
-	latest   []byte // BGRA preview of the captured region
+	latest   []byte // BGRA preview of the most recent captured frame
 	latestW  int
 	latestH  int
 	preview  bitmapInfo
-
-	st decodeState
 
 	overlayHwnd uintptr
 	selecting   bool
@@ -88,14 +95,18 @@ type app struct {
 
 func main() {
 	runtime.LockOSThread()
-	procSetProcessDPIAware.Call()
+	// Per-monitor V2 so multi-monitor setups with different scale factors
+	// report physical pixels everywhere; fall back to system DPI awareness.
+	if procCall(procSetProcessDPIAwareC, ^uintptr(3)) == 0 {
+		procSetProcessDPIAware.Call()
+	}
 
 	inst := getModuleHandle(nil)
 	if inst == 0 {
 		messageBox(0, "GetModuleHandle failed", "txqr-desktop", 0)
 		return
 	}
-	a := &app{hinst: inst, btnText: [4]string{"框选区域", "开始", "停止", "保存"}}
+	a := &app{hinst: inst, btnText: [5]string{"添加区域", "开始全部", "停止全部", "清空", "保存"}}
 
 	// main window class
 	wc := wndclassex{
@@ -173,7 +184,9 @@ func (a *app) wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		procDestroyWindow.Call(hwnd)
 		return 0
 	case wmDestroy:
-		a.stopScan()
+		for _, r := range a.regions {
+			a.stopRegion(r)
+		}
 		procPostQuitMessage.Call(0)
 		return 0
 	}
@@ -186,17 +199,32 @@ func pointFromLParam(lParam uintptr) point {
 
 func (a *app) onButton(idx int) {
 	switch idx {
-	case 0: // 框选区域
+	case 0: // 添加区域
 		a.startSelect()
-	case 1: // 开始
-		if a.region.right > a.region.left && a.region.bottom > a.region.top {
-			a.startScan()
-		} else {
-			messageBox(a.hwnd, "请先框选二维码区域", "提示", 0)
+	case 1: // 开始全部
+		if len(a.regions) == 0 {
+			messageBox(a.hwnd, "请先框选至少一个二维码区域", "提示", 0)
+			return
 		}
-	case 2: // 停止
-		a.stopScan()
-	case 3: // 保存
+		for _, r := range a.regions {
+			if !r.scanning && !r.done {
+				a.startRegion(r)
+			}
+		}
+	case 2: // 停止全部
+		for _, r := range a.regions {
+			a.stopRegion(r)
+		}
+	case 3: // 清空
+		for _, r := range a.regions {
+			a.stopRegion(r)
+		}
+		a.regions = nil
+		a.mu.Lock()
+		a.latest = nil
+		a.mu.Unlock()
+		procInvalidateRect.Call(a.hwnd, 0, 0)
+	case 4: // 保存
 		a.saveDialog()
 	}
 }
@@ -240,7 +268,7 @@ func (a *app) paintMain(hdc uintptr) {
 	for i, label := range a.btnText {
 		r := rect{int32(x), 10, int32(x + 96), 44}
 		a.btns[i] = r
-		if i == 1 && a.scanning {
+		if i == 1 && a.anyScanning() {
 			fillRect(hdc, &r, brBtnOn)
 		} else {
 			fillRect(hdc, &r, brBtn)
@@ -252,34 +280,53 @@ func (a *app) paintMain(hdc uintptr) {
 		x += 108
 	}
 
-	// status + progress
-	p, status, _ := a.st.snapshot()
-	ts := utf16(status)
-	textOutW(hdc, 12, 56, ts, len(status))
-	pr := rect{12, 82, int32(cx - 12), 96}
+	// per-region status lines + a combined progress bar for the active one
 	brTrack := createSolidBrush(rgb(40, 40, 48))
 	brFill := createSolidBrush(rgb(47, 129, 247))
+	brFillOn := createSolidBrush(rgb(38, 130, 60))
 	defer deleteObject(brTrack)
 	defer deleteObject(brFill)
-	fillRect(hdc, &pr, brTrack)
-	if p > 0 {
-		fw := int32(int(pr.right-pr.left) * p / 100)
-		if fw >= 1 {
-			fillRect(hdc, &rect{pr.left, pr.top, pr.left + fw, pr.bottom}, brFill)
+	defer deleteObject(brFillOn)
+
+	lineY := 56
+	for _, r := range a.regions {
+		p, st, done := r.st.snapshot()
+		state := "扫描中"
+		switch {
+		case done:
+			state = "完成"
+		case !r.scanning:
+			state = "已停止"
 		}
+		line := fmt.Sprintf("%s · %s · %s", r.label, state, st)
+		ls := utf16(line)
+		textOutW(hdc, 12, lineY, ls, len(line))
+		// small progress bar per region
+		pr := rect{12, int32(lineY + 20), int32(cx - 12), int32(lineY + 34)}
+		fillRect(hdc, &pr, brTrack)
+		if p > 0 {
+			fw := int32(int(pr.right-pr.left) * p / 100)
+			if fw >= 1 {
+				brush := brFill
+				if done {
+					brush = brFillOn
+				}
+				fillRect(hdc, &rect{pr.left, pr.top, pr.left + fw, pr.bottom}, brush)
+			}
+		}
+		lineY += 42
 	}
 
-	// region hint
-	hint := "未选择区域 — 点击「框选区域」并框住屏幕上的二维码"
-	if a.region.right > a.region.left {
-		hint = fmt.Sprintf("区域 %d,%d %dx%d", a.region.left, a.region.top,
-			a.region.right-a.region.left, a.region.bottom-a.region.top)
+	// hint
+	hint := "点击「添加区域」并框住屏幕上的二维码 — 支持多屏，每屏可各扫一路"
+	if len(a.regions) == 0 {
+		hint = "尚未添加扫描区域 — 点击「添加区域」框住屏幕上的二维码"
 	}
 	hs := utf16(hint)
-	textOutW(hdc, 12, 104, hs, len(hint))
+	textOutW(hdc, 12, lineY+4, hs, len(hint))
 
 	// preview area
-	pv := rect{12, 128, int32(cx - 12), int32(cy - 12)}
+	pv := rect{12, int32(lineY + 28), int32(cx - 12), int32(cy - 12)}
 	brPV := createSolidBrush(rgb(0, 0, 0))
 	fillRect(hdc, &pv, brPV)
 	a.mu.Lock()
@@ -308,42 +355,49 @@ func (a *app) paintMain(hdc uintptr) {
 	deleteObject(brPV)
 }
 
+func (a *app) anyScanning() bool {
+	for _, r := range a.regions {
+		if r.scanning {
+			return true
+		}
+	}
+	return false
+}
+
 // ------------------------------------------------------------ capture loop
 
-func (a *app) startScan() {
-	if a.scanning {
+func (a *app) startRegion(r *scanRegion) {
+	if r.scanning || r.done {
 		return
 	}
-	a.st.reset()
-	a.scanning = true
-	a.serial++
-	gen := a.serial
-	go a.runCapture(gen)
-	procInvalidateRect.Call(a.hwnd, 0, 0)
+	r.st.reset()
+	r.scanning = true
+	r.serial++
+	gen := r.serial
+	go a.runCapture(r, gen)
 }
 
-func (a *app) stopScan() {
-	if !a.scanning {
+func (a *app) stopRegion(r *scanRegion) {
+	if !r.scanning {
 		return
 	}
-	a.scanning = false
-	a.serial++
-	procInvalidateRect.Call(a.hwnd, 0, 0)
+	r.scanning = false
+	r.serial++
 }
 
-func (a *app) runCapture(gen int) {
+func (a *app) runCapture(r *scanRegion, gen int) {
 	for {
-		if !a.scanning || gen != a.serial {
+		if !r.scanning || gen != r.serial {
 			return
 		}
-		r := a.region
-		if r.right <= r.left || r.bottom <= r.top {
+		rc := r.rect
+		if rc.right <= rc.left || rc.bottom <= rc.top {
 			return
 		}
 		start := time.Now()
-		rgba, bgra, err := captureRegion(int(r.left), int(r.top), int(r.right-r.left), int(r.bottom-r.top))
+		rgba, bgra, err := captureRegion(int(rc.left), int(rc.top), int(rc.right-rc.left), int(rc.bottom-rc.top))
 		if err == nil {
-			w, h := int(r.right-r.left), int(r.bottom-r.top)
+			w, h := int(rc.right-rc.left), int(rc.bottom-rc.top)
 			a.mu.Lock()
 			a.latest = bgra
 			a.latestW = w
@@ -356,10 +410,11 @@ func (a *app) runCapture(gen int) {
 				biBitCount: 32,
 			}}
 			a.mu.Unlock()
-			done := a.st.feed(rgba)
+			done := r.st.feed(rgba)
 			procPostMessageW.Call(a.hwnd, wmAppRefresh, 0, 0)
 			if done {
-				a.stopScan()
+				r.done = true
+				a.stopRegion(r)
 				procPostMessageW.Call(a.hwnd, wmAppDone, 0, 0)
 				return
 			}
@@ -382,7 +437,9 @@ func virtualScreen() (int, int, int, int) {
 }
 
 func (a *app) startSelect() {
-	a.stopScan()
+	for _, r := range a.regions {
+		a.stopRegion(r)
+	}
 	vx, vy, vw, vh := virtualScreen()
 	_, buf, err := captureRegion(vx, vy, vw, vh)
 	if err != nil {
@@ -469,14 +526,24 @@ func (a *app) finishSelect() {
 		a.cancelSelect()
 		return
 	}
-	a.region = rect{
+	rc := rect{
 		int32(x0 + int32(vx)), int32(y0 + int32(vy)), int32(x1 + int32(vx)), int32(y1 + int32(vy)),
 	}
 	procDestroyWindow.Call(a.overlayHwnd)
 	a.overlayHwnd = 0
 	a.selecting = false
+
+	r := &scanRegion{
+		rect:  rc,
+		label: fmt.Sprintf("区域 %d · %dx%d", len(a.regions)+1, int(rc.right-rc.left), int(rc.bottom-rc.top)),
+	}
+	a.regions = append(a.regions, r)
 	procInvalidateRect.Call(a.hwnd, 0, 0)
-	a.startScan()
+	// selection paused every region (the fullscreen overlay blocks captures);
+	// resume every unfinished one so multi-monitor streams keep flowing.
+	for _, rr := range a.regions {
+		a.startRegion(rr)
+	}
 }
 
 func (a *app) cancelSelect() {
@@ -534,10 +601,20 @@ func (a *app) paintOverlay(hdc uintptr) {
 // ------------------------------------------------------------ save
 
 func (a *app) saveDialog() {
-	a.st.mu.Lock()
-	result, name, done := a.st.result, a.st.fileName, a.st.completed
-	a.st.mu.Unlock()
+	var result []byte
+	var name string
+	done := false
+	for _, r := range a.regions {
+		r.st.mu.Lock()
+		if r.st.completed {
+			result, name, done = r.st.result, r.st.fileName, true
+			r.st.mu.Unlock()
+			break
+		}
+		r.st.mu.Unlock()
+	}
 	if !done || result == nil {
+		messageBox(a.hwnd, "还没有完成的传输", "提示", 0)
 		return
 	}
 	suggested := name
