@@ -61,7 +61,7 @@
 
   <label style="margin-top:14px; display:inline-flex; align-items:center; gap:8px;"><input type="checkbox" id="colorMode" style="width:auto;"> Color Matrix 模式（2 位/模块）</label>
 
-  <label style="margin-top:14px; display:inline-flex; align-items:center; gap:8px;"><input type="checkbox" id="decimenMode" style="width:auto;"> Decimen 模式（DCF2 + 喷泉码，V40-L / mask 4 / ECC L）</label>
+  <label style="margin-top:14px; display:inline-flex; align-items:center; gap:8px;"><input type="checkbox" id="decimenMode" style="width:auto;" checked> Decimen 模式（DCF2 + 喷泉码，V40-L / mask 4 / ECC L）</label>
 
   <div class="row">
     <div>
@@ -134,20 +134,28 @@ codecInput.addEventListener('change', () => {
 // Decimen and Color Matrix are mutually exclusive. Decimen pins its own
 // wire constants (V40-L, mask 4, ECC L, blockLen 2933), so the split/codec
 // knobs that don't apply are disabled rather than silently ignored.
-decimenModeInput.addEventListener('change', () => {
+function applyDecimenMode() {
   if (decimenModeInput.checked) {
     colorModeInput.checked = false;
     splitInput.disabled = true;
     codecInput.disabled = true;
     onlineParams.style.display = 'none';
     colorModeInput.disabled = true;
+    if (!fpsInput.dataset.userTouched) fpsInput.value = 60;
+    if (!gridInput.dataset.userTouched) gridInput.value = 4;
   } else {
     splitInput.disabled = false;
     codecInput.disabled = false;
     colorModeInput.disabled = false;
     codecInput.dispatchEvent(new Event('change'));
   }
-});
+}
+decimenModeInput.addEventListener('change', applyDecimenMode);
+// The knob is on by default: apply its defaults (60 fps, 4-cell grid) as soon
+// as the script loads, while still letting a manual tweak win afterwards.
+fpsInput.addEventListener('input', function () { fpsInput.dataset.userTouched = '1'; });
+gridInput.addEventListener('input', function () { gridInput.dataset.userTouched = '1'; });
+applyDecimenMode();
 colorModeInput.addEventListener('change', () => {
   if (colorModeInput.checked) decimenModeInput.checked = false;
 });

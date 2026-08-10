@@ -3,12 +3,15 @@ package com.qrtpro.reader
 import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.graphics.Rect
 import android.util.Log
 import androidx.camera.core.ImageProxy
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.mlkit.vision.barcode.BarcodeScanner
 import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 import com.qrtpro.reader.decoder.TxqrDecoder
 import com.qrtpro.reader.decoder.DecimenDecoder
@@ -69,6 +72,12 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     // Sniffed from the first frame's magic bytes; a self-describing frame is
     // enough for the receiver to know which pipeline to run.
     private var streamMode = 0
+
+    // Tracked decode state: last-known barcode bounding box (in upright bitmap
+    // coordinates) and an in-flight guard so stale frames are dropped instead
+    // of queued behind an async ML Kit decode.
+    private var trackBox: Rect? = null
+    private var decodeInFlight = false
 
     private val _uiState = MutableStateFlow(ScannerUiState())
     val uiState: StateFlow<ScannerUiState> = _uiState.asStateFlow()
@@ -148,41 +157,124 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             return
         }
 
-        @Suppress("UnsafeOptInUsageError")
-        val mediaImage = imageProxy.image
-        if (mediaImage == null) {
+        // Tracked decode: convert the camera frame to an upright bitmap and
+        // close the ImageProxy right away, then run ML Kit on a crop around
+        // the last known barcode position (a "zoom" that raises the effective
+        // module resolution for dense V40 codes). A fresh or lost lock falls
+        // back to the full frame. Frames are dropped while a decode is in
+        // flight — a stale frame is worth less than the next one.
+        if (decodeInFlight) {
             imageProxy.close()
             return
         }
+        val bitmap = imageProxyToBitmap(imageProxy)
+        imageProxy.close()
+        if (bitmap == null) return
 
-        val inputImage = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-
-        val task = barcodeScanner?.process(inputImage)
-            ?: run {
-                imageProxy.close()
-                return
-            }
-
-        task.addOnSuccessListener { barcodes ->
-                for (barcode in barcodes) {
-                    val frameBytes = barcode.rawBytes ?: barcode.rawValue?.toByteArray()
-                    if (frameBytes == null) continue
-
-                    if (streamMode == 0) {
-                        streamMode = if (decimenDecoder.isDecimenFrame(frameBytes)) 2 else 1
-                        if (streamMode == 2) _decimenMode.value = true
-                    }
-                    if (streamMode == 2) {
-                        handleDecimenFrame(frameBytes)
+        decodeInFlight = true
+        val track = trackBox
+        if (track != null) {
+            val crop = expandRect(track, bitmap.width, bitmap.height)
+            val cropped = Bitmap.createBitmap(bitmap, crop.left, crop.top, crop.width(), crop.height())
+            barcodeScanner?.process(InputImage.fromBitmap(cropped, 0))
+                ?.addOnSuccessListener { barcodes ->
+                    if (barcodes.isNotEmpty()) {
+                        consumeBarcodes(barcodes, crop)
                     } else {
-                        handleTxqrFrame(frameBytes)
+                        // the crop missed this frame; retry on the full frame
+                        barcodeScanner?.process(InputImage.fromBitmap(bitmap, 0))
+                            ?.addOnSuccessListener { full -> consumeBarcodes(full, null) }
                     }
-                    if (_uiState.value.scanState == ScanState.COMPLETED) break
                 }
+                ?.addOnCompleteListener { decodeInFlight = false }
+        } else {
+            barcodeScanner?.process(InputImage.fromBitmap(bitmap, 0))
+                ?.addOnSuccessListener { barcodes -> consumeBarcodes(barcodes, null) }
+                ?.addOnCompleteListener { decodeInFlight = false }
+        }
+    }
+
+    /** Feed decoded barcodes into the pipeline and refresh the tracking box to
+     *  the union of all found codes (so a grid stays covered in one crop). */
+    private fun consumeBarcodes(barcodes: List<Barcode>, crop: Rect?) {
+        if (_uiState.value.scanState != ScanState.SCANNING) return
+        var union: Rect? = null
+        for (b in barcodes) {
+            val bb = b.boundingBox ?: continue
+            val mapped = if (crop != null) {
+                Rect(bb.left + crop.left, bb.top + crop.top, bb.right + crop.left, bb.bottom + crop.top)
+            } else {
+                bb
             }
-            .addOnCompleteListener {
-                imageProxy.close()
+            union = if (union == null) Rect(mapped) else Rect(
+                minOf(union.left, mapped.left), minOf(union.top, mapped.top),
+                maxOf(union.right, mapped.right), maxOf(union.bottom, mapped.bottom)
+            )
+        }
+        if (union != null) trackBox = union
+
+        for (barcode in barcodes) {
+            val frameBytes = barcode.rawBytes ?: barcode.rawValue?.toByteArray()
+            if (frameBytes == null) continue
+
+            if (streamMode == 0) {
+                streamMode = if (decimenDecoder.isDecimenFrame(frameBytes)) 2 else 1
+                if (streamMode == 2) _decimenMode.value = true
             }
+            if (streamMode == 2) {
+                handleDecimenFrame(frameBytes)
+            } else {
+                handleTxqrFrame(frameBytes)
+            }
+            if (_uiState.value.scanState == ScanState.COMPLETED) return
+        }
+    }
+
+    private fun expandRect(r: Rect, w: Int, h: Int): Rect {
+        val dw = (r.width() * 0.5f).toInt().coerceAtLeast(8)
+        val dh = (r.height() * 0.5f).toInt().coerceAtLeast(8)
+        return Rect(
+            (r.left - dw).coerceAtLeast(0),
+            (r.top - dh).coerceAtLeast(0),
+            (r.right + dw).coerceAtMost(w),
+            (r.bottom + dh).coerceAtMost(h)
+        )
+    }
+
+    /** Convert a YUV_420_888 ImageProxy to an upright ARGB_8888 bitmap. */
+    private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
+        val img = imageProxy.image ?: return null
+        val planes = img.planes
+        if (planes.size < 3) return null
+        val yPlane = planes[0]; val uPlane = planes[1]; val vPlane = planes[2]
+        val yBuf = yPlane.buffer; val yRS = yPlane.rowStride; val yPS = yPlane.pixelStride
+        val uBuf = uPlane.buffer; val uRS = uPlane.rowStride; val uPS = uPlane.pixelStride
+        val vBuf = vPlane.buffer; val vRS = vPlane.rowStride; val vPS = vPlane.pixelStride
+        val w = imageProxy.width; val h = imageProxy.height
+        val pixels = IntArray(w * h)
+        for (row in 0 until h) {
+            val yOff = row * yRS
+            val uvRow = row shr 1
+            for (col in 0 until w) {
+                val yi = yBuf.get(yOff + col * yPS).toInt() and 0xFF
+                val uo = uvRow * uRS + (col shr 1) * uPS
+                val vo = uvRow * vRS + (col shr 1) * vPS
+                val ui = (uBuf.get(uo).toInt() and 0xFF) - 128
+                val vi = (vBuf.get(vo).toInt() and 0xFF) - 128
+                val r = (yi + (1.402f * vi).toInt()).coerceIn(0, 255)
+                val g = (yi - (0.344f * ui + 0.714f * vi).toInt()).coerceIn(0, 255)
+                val b = (yi + (1.772f * ui).toInt()).coerceIn(0, 255)
+                pixels[row * w + col] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
+        }
+        var bmp = Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
+        val rot = imageProxy.imageInfo.rotationDegrees
+        if (rot != 0) {
+            val m = Matrix()
+            m.postRotate(rot.toFloat())
+            bmp = Bitmap.createBitmap(bmp, 0, 0, w, h, m, true)
+        }
+        return bmp
     }
 
     private fun handleTxqrFrame(frameBytes: ByteArray) {
@@ -413,6 +505,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         decoder.reset()
         decimenDecoder.reset()
         streamMode = 0
+        trackBox = null
+        decodeInFlight = false
         _decimenMode.value = false
         scanResultData = null
         _uiState.value = ScannerUiState(scanState = ScanState.SCANNING)
