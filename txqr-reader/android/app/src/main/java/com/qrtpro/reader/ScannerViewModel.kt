@@ -179,34 +179,54 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             if (planes.size < 3) { imageProxy.close(); return }
 
             val yPlane = planes[0]; val uPlane = planes[1]; val vPlane = planes[2]
-            val yBuf = yPlane.buffer; val uBuf = uPlane.buffer; val vBuf = vPlane.buffer
-            val yPS = yPlane.pixelStride; val yRS = yPlane.rowStride
-            val uPS = uPlane.pixelStride; val uRS = uPlane.rowStride
-            val vPS = vPlane.pixelStride; val vRS = vPlane.rowStride
+            val yBuf = yPlane.buffer; val yRS = yPlane.rowStride; val yPS = yPlane.pixelStride
+            val uBuf = uPlane.buffer; val uRS = uPlane.rowStride; val uPS = uPlane.pixelStride
+            val vBuf = vPlane.buffer; val vRS = vPlane.rowStride; val vPS = vPlane.pixelStride
 
             val w = imageProxy.width; val h = imageProxy.height
-            var lastErr: String? = null
+            val side = minOf(w, h)
+            val ox0 = (w - side) / 2; val oy0 = (h - side) / 2
 
-            // Try full frame then progressively smaller centre crops.
-            for (frac in listOf(1.0f, 0.75f, 0.5f)) {
-                val side = (minOf(w, h) * frac).toInt()
-                if (side < ColorMatrixDecoder.MATRIX_SIZE) break
-                val ox = (w - side) / 2; val oy = (h - side) / 2
+            // Lum sampler: Y-plane already is luminance.
+            val lumAt: (Int, Int) -> Int = { x, y -> (yBuf.get((y + oy0) * yRS + (x + ox0) * yPS).toInt() and 0xFF) }
 
-                val sampler: (Int, Int) -> Int = { x, y ->
-                    val yi = y + oy; val xi = x + ox
-                    val yv = (yBuf.get(yi * yRS + xi * yPS).toInt() and 0xFF)
-                    val ui = xi / 2; val vi = yi / 2
-                    val uv = (uBuf.get(vi * uRS + ui * uPS).toInt() and 0xFF) - 128
-                    val vv = (vBuf.get(vi * vRS + ui * vPS).toInt() and 0xFF) - 128
-                    val r = (yv + (1.402f * vv).toInt()).coerceIn(0, 255)
-                    val g = (yv - (0.344f * uv + 0.714f * vv).toInt()).coerceIn(0, 255)
-                    val b = (yv + (1.772f * uv).toInt()).coerceIn(0, 255)
-                    (r shl 16) or (g shl 8) or b
+            // Scan for finder centers at a coarse grid. Try a few module-size guesses.
+            for (estModule in listOf(side / 60, side / 80, side / 100)) {
+                if (estModule < 2) continue
+                val centers = locateFinderCenters(lumAt, side, side, estModule)
+                if (centers.size < 3) continue
+
+                // Map finder pixel centers to module positions.
+                val known = listOf(
+                    ColorMatrixDecoder.FINDER_OFF + ColorMatrixDecoder.FINDER_SZ / 2 to
+                            ColorMatrixDecoder.FINDER_OFF + ColorMatrixDecoder.FINDER_SZ / 2,
+                    ColorMatrixDecoder.MATRIX_SIZE - ColorMatrixDecoder.FINDER_OFF - ColorMatrixDecoder.FINDER_SZ / 2 - 1 to
+                            ColorMatrixDecoder.FINDER_OFF + ColorMatrixDecoder.FINDER_SZ / 2,
+                    ColorMatrixDecoder.FINDER_OFF + ColorMatrixDecoder.FINDER_SZ / 2 to
+                            ColorMatrixDecoder.MATRIX_SIZE - ColorMatrixDecoder.FINDER_OFF - ColorMatrixDecoder.FINDER_SZ / 2 - 1
+                )
+                val coeffs = computeAffine(centers, known) ?: continue
+                val axx = coeffs[0]; val axy = coeffs[1]; val atx = coeffs[2]
+                val ayx = coeffs[3]; val ayy = coeffs[4]; val aty = coeffs[5]
+
+                // RGB sampler that maps module (x,y) -> pixel RGB via affine.
+                val sampler: (Int, Int) -> Int = { mx, my ->
+                    val gx = (axx * mx + axy * my + atx).toInt() + ox0
+                    val gy = (ayx * mx + ayy * my + aty).toInt() + oy0
+                    if (gx < 0 || gy < 0 || gx >= w || gy >= h) 0 else {
+                        val yv = (yBuf.get(gy * yRS + gx * yPS).toInt() and 0xFF)
+                        val ui = gx / 2; val vi = gy / 2
+                        val uv = (uBuf.get(vi * uRS + ui * uPS).toInt() and 0xFF) - 128
+                        val vv = (vBuf.get(vi * vRS + ui * vPS).toInt() and 0xFF) - 128
+                        val r = (yv + (1.402f * vv).toInt()).coerceIn(0, 255)
+                        val g = (yv - (0.344f * uv + 0.714f * vv).toInt()).coerceIn(0, 255)
+                        val b = (yv + (1.772f * uv).toInt()).coerceIn(0, 255)
+                        (r shl 16) or (g shl 8) or b
+                    }
                 }
 
                 try {
-                    val frameBytes = ColorMatrixDecoder.decode(sampler, side, side)
+                    val frameBytes = ColorMatrixDecoder.decodeWithAffine(sampler)
                     decoder.decodeFrame(frameBytes)
                     if (decoder.isCompleted) {
                         val dataBytes = decoder.dataBytes ?: return
@@ -216,27 +236,95 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                             md5 = computeMd5(dataBytes),
                             suggestedFileName = decoder.receivedFileName.ifBlank { generateFileName(dataBytes) }
                         )
-                        return  // success — stop trying smaller crops
                     }
-                    break  // decoded successfully (non-complete): stop trying smaller crops
-                } catch (e: ColorMatrixDecodeException) {
-                    lastErr = e.message
-                }
+                    return
+                } catch (_: ColorMatrixDecodeException) {}
             }
-
-            if (lastErr != null) {
-                Log.w("QRT", "Color decode fail: $lastErr")
-                _uiState.value = _uiState.value.copy(bytesDetail = "Color: $lastErr")
-            }
-        } catch (e: ColorMatrixDecodeException) {
-            Log.w("QRT", "Color decode fail: ${e.message}", e)
-            _uiState.value = _uiState.value.copy(bytesDetail = "Color: ${e.message}")
+            _uiState.value = _uiState.value.copy(bytesDetail = "Color: no finders")
         } catch (e: Exception) {
-            Log.e("QRT", "Color unexpected", e)
-            _uiState.value = _uiState.value.copy(bytesDetail = "Color err: ${e.message}")
+            Log.e("QRT", "Color err: ${e.message}", e)
+            _uiState.value = _uiState.value.copy(bytesDetail = "Color: ${e.message}")
         } finally {
             imageProxy.close()
         }
+    }
+
+    private fun locateFinderCenters(
+        lum: (Int, Int) -> Int, w: Int, h: Int, estModule: Int
+    ): List<Pair<Int, Int>> {
+        val step = maxOf(estModule, 1)
+        data class Peak(val x: Int, val y: Int, val score: Int)
+
+        val peaks = mutableListOf<Peak>()
+        for (cy in estModule * 4 until h - estModule * 4 step step) {
+            for (cx in estModule * 4 until w - estModule * 4 step step) {
+                val score = finderScore(lum, cx, cy, estModule)
+                if (score > 30) peaks.add(Peak(cx, cy, score))
+            }
+        }
+        if (peaks.size < 3) return emptyList()
+        peaks.sortByDescending { it.score }
+
+        // Pick top 3 non-overlapping (min dist = 8 * estModule).
+        val minDist = estModule * 8
+        val result = mutableListOf<Pair<Int, Int>>()
+        for (p in peaks) {
+            val overlap = result.any { kotlin.math.hypot((it.first - p.x).toDouble(), (it.second - p.y).toDouble()) < minDist }
+            if (!overlap) {
+                result.add(p.x to p.y)
+                if (result.size >= 3) break
+            }
+        }
+        // Sort TL (top-left), TR (top-right), BL (bottom-left)
+        result.sortWith(compareBy<Pair<Int, Int>> { it.first * it.first + it.second * it.second })
+        if (result.size >= 2 && result[1].second > result[2].second) {
+            val tmp = result[1]; result[1] = result[2]; result[2] = tmp
+        }
+        return result
+    }
+
+    /** Rate how well a 7×7 finder pattern fits at (cx,cy) with given module size. */
+    private fun finderScore(lum: (Int, Int) -> Int, cx: Int, cy: Int, mod: Int): Int {
+        // 7×7 finder template: outer ring dark, inner ring light, centre dark
+        var darkSum = 0; var darkN = 0
+        var lightSum = 0; var lightN = 0
+        for (dr in -3..3) {
+            for (dc in -3..3) {
+                val outer = kotlin.math.abs(dr) == 3 || kotlin.math.abs(dc) == 3
+                val inner = kotlin.math.abs(dr) >= 1 && kotlin.math.abs(dc) >= 1 && kotlin.math.abs(dr) <= 2 && kotlin.math.abs(dc) <= 2
+                val center = kotlin.math.abs(dr) <= 1 && kotlin.math.abs(dc) <= 1
+                val v = lum(cx + dc * mod, cy + dr * mod)
+                if (outer || center) { darkSum += v; darkN++ }
+                else if (inner) { lightSum += v; lightN++ }
+            }
+        }
+        if (darkN == 0 || lightN == 0) return 0
+        val contrast = lightSum / lightN - darkSum / darkN
+        return contrast.coerceAtLeast(0)
+    }
+
+    /** Compute affine transform from 3 point pairs. Returns 6 coefficients or null. */
+    private fun computeAffine(
+        pixelPts: List<Pair<Int, Int>>, modulePts: List<Pair<Int, Int>>
+    ): DoubleArray? {
+        if (pixelPts.size < 3 || modulePts.size < 3) return null
+        val x1 = pixelPts[0].first.toDouble(); val y1 = pixelPts[0].second.toDouble()
+        val x2 = pixelPts[1].first.toDouble(); val y2 = pixelPts[1].second.toDouble()
+        val x3 = pixelPts[2].first.toDouble(); val y3 = pixelPts[2].second.toDouble()
+        val u1 = modulePts[0].first.toDouble(); val v1 = modulePts[0].second.toDouble()
+        val u2 = modulePts[1].first.toDouble(); val v2 = modulePts[1].second.toDouble()
+        val u3 = modulePts[2].first.toDouble(); val v3 = modulePts[2].second.toDouble()
+        val det = (x1 - x3) * (y2 - y3) - (x2 - x3) * (y1 - y3)
+        if (kotlin.math.abs(det) < 1e-6) return null
+        val inv = 1.0 / det
+        return doubleArrayOf(
+            ((u1 - u3) * (y2 - y3) - (u2 - u3) * (y1 - y3)) * inv,  // axx
+            ((u1 - u3) * (x3 - x2) + (u2 - u3) * (x1 - x3)) * inv,  // axy
+            u1 - ((u1 - u3) * (y2 - y3) - (u2 - u3) * (y1 - y3)) * inv * x1 - ((u1 - u3) * (x3 - x2) + (u2 - u3) * (x1 - x3)) * inv * y1,
+            ((v1 - v3) * (y2 - y3) - (v2 - v3) * (y1 - y3)) * inv,  // ayx
+            ((v1 - v3) * (x3 - x2) + (v2 - v3) * (x1 - x3)) * inv,  // ayy
+            v1 - ((v1 - v3) * (y2 - y3) - (v2 - v3) * (y1 - y3)) * inv * x1 - ((v1 - v3) * (x3 - x2) + (v2 - v3) * (x1 - x3)) * inv * y1,
+        )
     }
 
     fun startScan() {

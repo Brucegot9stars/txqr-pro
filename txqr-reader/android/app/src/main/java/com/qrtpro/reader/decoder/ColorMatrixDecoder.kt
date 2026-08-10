@@ -47,6 +47,48 @@ object ColorMatrixDecoder {
         return (hi - lo) / 4
     }
 
+    /** Decode with an externally-computed affine sampler: (moduleX, moduleY) → 0xRRGGBB. */
+    fun decodeWithAffine(sample: (col: Int, row: Int) -> Int): ByteArray {
+        val pick = { r: Int, c: Int ->
+            val v = sample(c, r)
+            intArrayOf((v shr 16) and 0xFF, (v shr 8) and 0xFF, v and 0xFF)
+        }
+
+        val (lo, hi) = payloadCols()
+        val barW = barWidth()
+        val refs = MutableList(4) { i -> NOM[i].copyOf() }
+        for (i in 0 until 4) {
+            val acc = intArrayOf(0, 0, 0); var n = 0
+            for (dy in 1 until CAL_H - 1) {
+                for (dx in 1 until barW - 1) {
+                    val p = pick(CAL_TOP + dy, lo + i * barW + dx)
+                    acc[0] += p[0]; acc[1] += p[1]; acc[2] += p[2]; n++
+                }
+            }
+            if (n > 0) refs[i] = intArrayOf(acc[0] / n, acc[1] / n, acc[2] / n)
+        }
+
+        val head = readHeader(pick)
+        if (head[0] != MAGIC[0] || head[1] != MAGIC[1]) throw ColorMatrixDecodeException("bad magic")
+        val crc = (head[6].toInt() and 0xFF shl 8) or (head[7].toInt() and 0xFF)
+        if (crc16(head.copyOf(6)) != crc) throw ColorMatrixDecodeException("bad crc")
+        val plen = (head[4].toInt() and 0xFF) or (head[5].toInt() and 0xFF shl 8)
+        if (plen <= 0 || plen > MAX_PAYLOAD_BYTES) throw ColorMatrixDecodeException("bad length $plen")
+
+        val out = ByteArray(plen)
+        var bitPos = 0
+        for (r in PAY_TOP until PAY_END) {
+            for (c in lo until hi) {
+                if (bitPos >= plen * 8) return out
+                val idx = nearest(refs, pick(r, c))
+                val byteIdx = bitPos / 8
+                out[byteIdx] = (out[byteIdx].toInt() or (idx shl (8 - 2 - (bitPos % 8)))).toByte()
+                bitPos += 2
+            }
+        }
+        return out
+    }
+
     /** Direct decode: assumes the matrix fills the entire image at the given width. */
     fun decode(rgb: (x: Int, y: Int) -> Int, width: Int, height: Int): ByteArray {
         if (width < MATRIX_SIZE || height < MATRIX_SIZE) {
