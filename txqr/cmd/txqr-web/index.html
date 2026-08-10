@@ -61,6 +61,8 @@
 
   <label style="margin-top:14px; display:inline-flex; align-items:center; gap:8px;"><input type="checkbox" id="colorMode" style="width:auto;"> Color Matrix 模式（2 位/模块）</label>
 
+  <label style="margin-top:14px; display:inline-flex; align-items:center; gap:8px;"><input type="checkbox" id="decimenMode" style="width:auto;"> Decimen 模式（DCF2 + 喷泉码，V40-L / mask 4 / ECC L）</label>
+
   <div class="row">
     <div>
       <label>编码方案</label>
@@ -113,6 +115,7 @@ const codecInput = document.getElementById('codec');
 const epsilonInput = document.getElementById('epsilon');
 const qualityInput = document.getElementById('quality');
 const colorModeInput = document.getElementById('colorMode');
+const decimenModeInput = document.getElementById('decimenMode');
 const onlineParams = document.getElementById('onlineParams');
 const startBtn = document.getElementById('start');
 const pauseBtn = document.getElementById('pause');
@@ -124,7 +127,29 @@ const gridEl = document.getElementById('grid');
 const statsEl = document.getElementById('stats');
 
 codecInput.addEventListener('change', () => {
+  if (decimenModeInput.checked) return;
   onlineParams.style.display = codecInput.value === 'online' ? 'block' : 'none';
+});
+
+// Decimen and Color Matrix are mutually exclusive. Decimen pins its own
+// wire constants (V40-L, mask 4, ECC L, blockLen 2933), so the split/codec
+// knobs that don't apply are disabled rather than silently ignored.
+decimenModeInput.addEventListener('change', () => {
+  if (decimenModeInput.checked) {
+    colorModeInput.checked = false;
+    splitInput.disabled = true;
+    codecInput.disabled = true;
+    onlineParams.style.display = 'none';
+    colorModeInput.disabled = true;
+  } else {
+    splitInput.disabled = false;
+    codecInput.disabled = false;
+    colorModeInput.disabled = false;
+    codecInput.dispatchEvent(new Event('change'));
+  }
+});
+colorModeInput.addEventListener('change', () => {
+  if (colorModeInput.checked) decimenModeInput.checked = false;
 });
 
 let session = null;   // current encoded session, null if none
@@ -137,6 +162,8 @@ let base = 0;         // index of the first frame on screen
 let shownBytes = 0;
 let startTime = 0;
 let tiles = [];
+let seqCursor = 0;    // carousel stream position (one seq per cell flip)
+let cellNextAt = [];  // per-cell next flip time for staggered phases
 
 function bytesFmt(n) {
   if (n >= 1048576) return (n / 1048576).toFixed(2) + ' MB';
@@ -197,16 +224,29 @@ async function encodeFile() {
   encodeAbort = new AbortController();
   statusEl.textContent = '编码中...（点击「取消序列化」可中止）';
   try {
-    let url = '/encode?split=' + split + '&codec=' + codec;
-    if (colorModeInput.checked) url += '&mode=color';
-    if (codec === 'online') {
-      url += '&epsilon=' + epsilon + '&quality=' + quality;
+    const decimen = decimenModeInput.checked;
+    let url;
+    if (decimen) {
+      url = '/encode?mode=decimen'
+        + '&name=' + encodeURIComponent(file.name)
+        + '&type=' + encodeURIComponent(file.type || 'application/octet-stream');
+    } else {
+      url = '/encode?split=' + split + '&codec=' + codec;
+      if (colorModeInput.checked) url += '&mode=color';
+      if (codec === 'online') {
+        url += '&epsilon=' + epsilon + '&quality=' + quality;
+      }
     }
     const resp = await fetch(url, { method: 'POST', body: await file.arrayBuffer(), signal: encodeAbort.signal });
     if (!resp.ok) throw new Error(await resp.text());
     const data = await resp.json();
     statusEl.textContent = '编码完成：' + bytesFmt(file.size) + ' · MD5: ' + (data.md5 || '');
-    return { id: data.id, count: data.count, total: data.total, fps: fps, split: split, cols: cols, file: file.name, size: file.size, md5: data.md5 };
+    return {
+      id: data.id, count: data.count, total: data.total,
+      fps: fps, split: data.split || split, cols: cols,
+      file: file.name, size: file.size, md5: data.md5,
+      carousel: !!data.carousel, k: data.k, sessionId: data.sessionId, blockLen: data.blockLen || data.split || split,
+    };
   } catch (e) {
     if (e && e.name === 'AbortError') {
       statusEl.textContent = '已取消序列化';
@@ -229,13 +269,15 @@ async function start() {
   if (!session) return;
   base = 0;
   shownBytes = 0;
+  seqCursor = 0;
   startTime = performance.now();
   paused = false;
   pauseBtn.textContent = '暂停';
   buildTiles(session.cols);
   running = true;
   overlay.classList.add('active');
-  showFrame();
+  if (session.carousel) startDecimenLoop();
+  else showFrame();
 }
 
 function showFrame() {
@@ -261,7 +303,54 @@ function togglePause() {
   if (!running) return;
   paused = !paused;
   pauseBtn.textContent = paused ? '继续' : '暂停';
-  if (!paused) showFrame();
+  if (!paused) {
+    if (session && session.carousel) startDecimenLoop();
+    else showFrame();
+  }
+}
+
+// Decimen stream loop: an endless carousel over the pre-rendered cycle.
+// Cells flip on staggered phases (cell j flips at j/N of the frame interval)
+// so a camera exposure that straddles a flip catches at most ONE code mid-
+// transition — with simultaneous flips the same exposure would lose them all.
+function startDecimenLoop() {
+  if (!session) return;
+  const n = session.cols * session.cols;
+  const interval = 1000 / session.fps;
+  const sub = interval / n;
+  const now = performance.now();
+  cellNextAt = [];
+  for (let j = 0; j < n; j++) cellNextAt[j] = now + j * sub;
+  requestAnimationFrame(decimenTick);
+}
+
+function decimenTick(now) {
+  if (!running || paused || !session || !session.carousel) return;
+  const n = session.cols * session.cols;
+  const interval = 1000 / session.fps;
+  const sub = interval / n;
+  let flipped = false;
+  for (let j = 0; j < n; j++) {
+    if (now < cellNextAt[j]) continue;
+    const seq = seqCursor++;
+    tiles[j].src = '/frame/' + session.id + '/' + (seq % session.count);
+    cellNextAt[j] += interval;
+    if (cellNextAt[j] <= now) cellNextAt[j] = now + sub; // catch up after a stall
+    flipped = true;
+  }
+  if (flipped) {
+    const elapsed = (performance.now() - startTime) / 1000;
+    shownBytes += session.blockLen * n;
+    const rateFile = shownBytes / elapsed;
+    statsEl.textContent =
+      '帧 ' + seqCursor +
+      ' | 网格 ' + session.cols + 'x' + session.cols +
+      ' | K=' + session.k + ' | ' + session.blockLen + 'B/帧' +
+      ' | 已发送 ' + bytesFmt(shownBytes) +
+      ' | ' + bytesFmt(rateFile) + '/s' +
+      ' | session ' + session.sessionId;
+  }
+  requestAnimationFrame(decimenTick);
 }
 
 function stop() {

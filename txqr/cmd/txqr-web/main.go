@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"image/png"
 	"io"
 	"log"
@@ -30,18 +31,34 @@ import (
 	"time"
 
 	"github.com/divan/txqr"
+	"github.com/divan/txqr/decimen"
 	"github.com/divan/txqr/qr"
 )
 
 //go:embed index.html
 var indexHTML []byte
 
+// decimen wire constants (see txqr/decimen and the reference protocol).
+const (
+	decimenFrameBytes   = 2953   // V40-L byte capacity
+	decimenBlockLen     = 2953 - decimen.HeaderLen
+	decimenQrVersion    = 40
+	decimenQrMask       = 4
+	decimenMaxSourceK   = 0xffff // k is a u16 in the frame header
+)
+
 type session struct {
 	frames    [][]byte
 	pngs      [][]byte
 	total     int
-	mode      string // "qr" or "color"
+	mode      string // "qr", "color" or "decimen"
 	createdAt time.Time
+
+	// decimen mode: fountain stream metadata echoed to the UI
+	carousel  bool
+	k         int
+	sessionId uint16
+	blockLen  int
 }
 
 var (
@@ -111,8 +128,8 @@ func handleEncode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mode := "qr"
-	if v := r.URL.Query().Get("mode"); v == "color" {
-		mode = "color"
+	if v := r.URL.Query().Get("mode"); v == "color" || v == "decimen" {
+		mode = v
 	}
 
 	codec := txqr.ParseCodec(r.URL.Query().Get("codec"))
@@ -135,27 +152,17 @@ func handleEncode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	str := string(body)
 	sum := md5.Sum(body)
-	encoder := txqr.NewEncoder(split, codec)
-	if codec == txqr.CodecOnline {
-		encoder.SetOnlineParams(onlineEpsilon, onlineQuality)
+
+	var s *session
+	if mode == "decimen" {
+		s, err = encodeDecimen(r, body)
+	} else {
+		s, err = encodeClassic(r, body, split, mode, codec, onlineEpsilon, onlineQuality)
 	}
-	frames, err := encoder.Encode(str)
 	if err != nil {
 		http.Error(w, "encode: "+err.Error(), http.StatusInternalServerError)
 		return
-	}
-
-	s := &session{
-		frames:    make([][]byte, len(frames)),
-		pngs:      make([][]byte, len(frames)),
-		total:     len(str),
-		mode:      mode,
-		createdAt: time.Now(),
-	}
-	for i, f := range frames {
-		s.frames[i] = []byte(f)
 	}
 
 	// Render all QR frames up front in parallel using every available core,
@@ -177,12 +184,114 @@ func handleEncode(w http.ResponseWriter, r *http.Request) {
 	sessions[id] = s
 	mu.Unlock()
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	resp := map[string]interface{}{
 		"id":    id,
-		"count": len(frames),
-		"total": len(str),
+		"count": len(s.frames),
+		"total": s.total,
 		"md5":   hex.EncodeToString(sum[:]),
-	})
+	}
+	if mode == "decimen" {
+		resp["carousel"] = true
+		resp["k"] = s.k
+		resp["sessionId"] = s.sessionId
+		resp["blockLen"] = s.blockLen
+		resp["split"] = s.blockLen
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+// encodeClassic is the existing text-based pipeline (QR/color, LT/Raptor/…).
+func encodeClassic(r *http.Request, body []byte, split int, mode string, codec txqr.CodecType,
+	onlineEpsilon float64, onlineQuality int) (*session, error) {
+	str := string(body)
+	encoder := txqr.NewEncoder(split, codec)
+	if codec == txqr.CodecOnline {
+		encoder.SetOnlineParams(onlineEpsilon, onlineQuality)
+	}
+	frames, err := encoder.Encode(str)
+	if err != nil {
+		return nil, err
+	}
+	s := &session{
+		frames:    make([][]byte, len(frames)),
+		pngs:      make([][]byte, len(frames)),
+		total:     len(str),
+		mode:      mode,
+		createdAt: time.Now(),
+	}
+	for i, f := range frames {
+		s.frames[i] = []byte(f)
+	}
+	return s, nil
+}
+
+// encodeDecimen builds the DCF2 container and the systematic-carousel fountain
+// stream: one full carousel cycle (2k frames: a systematic sweep then k repair
+// frames). Pre-rendering the whole cycle means the play loop can run forever
+// over it — the receiver completes from any point once it has collected ~k
+// distinct frames, and repeated frames are counted as dups, never corruption.
+func encodeDecimen(r *http.Request, body []byte) (*session, error) {
+	name := r.URL.Query().Get("name")
+	mediaType := r.URL.Query().Get("type")
+	if mediaType == "" {
+		mediaType = "application/octet-stream"
+	}
+	container, _, err := decimen.PackContainer(name, mediaType, body)
+	if err != nil {
+		return nil, err
+	}
+	if len(container) == 0 {
+		return nil, fmt.Errorf("empty container")
+	}
+
+	k := (len(container) + decimenBlockLen - 1) / decimenBlockLen
+	if k < 1 {
+		k = 1
+	}
+	if k > decimenMaxSourceK {
+		return nil, fmt.Errorf("file needs %d blocks, over the %d-block u16 limit; use a larger frame", k, decimenMaxSourceK)
+	}
+
+	sessionID := uint16(randUint32() & 0xffff)
+	if sessionID == 0 {
+		sessionID = 1
+	}
+	enc := decimen.NewEncoder(container, decimenBlockLen, sessionID)
+	hdr := decimen.Header{
+		SessionId:  sessionID,
+		Seq:        0,
+		K:          uint16(k),
+		BlockLen:   uint16(decimenBlockLen),
+		TotalLen:   uint32(len(container)),
+		PayloadFnv: decimen.Fnv1a(container),
+	}
+
+	cycle := 2 * k
+	s := &session{
+		frames:    make([][]byte, cycle),
+		pngs:      make([][]byte, cycle),
+		total:     len(container),
+		mode:      "decimen",
+		createdAt: time.Now(),
+		carousel:  true,
+		k:         k,
+		sessionId: sessionID,
+		blockLen:  decimenBlockLen,
+	}
+	for seq := 0; seq < cycle; seq++ {
+		h := hdr
+		h.Seq = uint32(seq)
+		s.frames[seq] = decimen.PackFrame(h, enc.Encode(uint32(seq)))
+	}
+	return s, nil
+}
+
+func randUint32() uint32 {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+	}
+	return uint32(time.Now().UnixNano())
 }
 
 // handleMD5 computes and returns the MD5 of an uploaded file body without
@@ -220,9 +329,12 @@ func handleFrame(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	s, ok := sessions[id]
 	if ok && idx >= 0 && idx < len(s.frames) && s.pngs[idx] == nil {
-		if s.mode == "color" {
+		switch s.mode {
+		case "color":
 			s.pngs[idx] = renderColorPNG(s.frames[idx])
-		} else {
+		case "decimen":
+			s.pngs[idx] = renderDecimenPNG(s.frames[idx])
+		default:
 			s.pngs[idx] = renderPNG(s.frames[idx])
 		}
 	}
@@ -261,6 +373,24 @@ func renderPNG(frame []byte) []byte {
 	img, err := qr.Encode(string(frame), 512, qr.Medium)
 	if err != nil {
 		log.Printf("QR encode error: %v", err)
+		return nil
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		log.Printf("PNG encode error: %v", err)
+		return nil
+	}
+	return buf.Bytes()
+}
+
+// renderDecimenPNG renders a decimen frame as a pinned V40-L byte-mode QR.
+// Every frame is the same length at the same ECC with the same mask, so all
+// codes land on identical geometry — required for tiling the grid — and the
+// pinned mask skips the spec's 8-way mask evaluation.
+func renderDecimenPNG(frame []byte) []byte {
+	img, err := qr.EncodeVersioned(string(frame), 512, qr.Low, decimenQrVersion, decimenQrMask)
+	if err != nil {
+		log.Printf("decimen QR encode error: %v", err)
 		return nil
 	}
 	var buf bytes.Buffer
@@ -311,9 +441,12 @@ func renderFrames(s *session, ctx context.Context) {
 				if ctx.Err() != nil {
 					return
 				}
-				if s.mode == "color" {
+				switch s.mode {
+				case "color":
 					s.pngs[i] = renderColorPNG(s.frames[i])
-				} else {
+				case "decimen":
+					s.pngs[i] = renderDecimenPNG(s.frames[i])
+				default:
 					s.pngs[i] = renderPNG(s.frames[i])
 				}
 			}

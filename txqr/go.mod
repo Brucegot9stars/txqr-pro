@@ -16,6 +16,8 @@ require (
 	github.com/xssnick/raptorq v1.4.0
 )
 
+replace github.com/skip2/go-qrcode => ./third_party/go-qrcode
+
 require (
 	golang.org/x/text v0.3.0 // indirect
 	rsc.io/qr v0.2.0 // indirect

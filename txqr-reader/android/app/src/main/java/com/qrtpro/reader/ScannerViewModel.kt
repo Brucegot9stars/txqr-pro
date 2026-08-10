@@ -11,6 +11,7 @@ import com.google.mlkit.vision.barcode.BarcodeScanner
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.common.InputImage
 import com.qrtpro.reader.decoder.TxqrDecoder
+import com.qrtpro.reader.decoder.DecimenDecoder
 import com.qrtpro.reader.decoder.ColorMatrixDecoder
 import com.qrtpro.reader.decoder.ColorMatrixDecodeException
 import kotlinx.coroutines.Job
@@ -61,13 +62,22 @@ data class ScannerUiState(
 
 class ScannerViewModel(application: Application) : AndroidViewModel(application) {
     private val decoder = TxqrDecoder()
+    private val decimenDecoder = DecimenDecoder()
     private var barcodeScanner: BarcodeScanner? = null
+
+    // 0 = undecided, 1 = classic txqr stream, 2 = decimen stream.
+    // Sniffed from the first frame's magic bytes; a self-describing frame is
+    // enough for the receiver to know which pipeline to run.
+    private var streamMode = 0
 
     private val _uiState = MutableStateFlow(ScannerUiState())
     val uiState: StateFlow<ScannerUiState> = _uiState.asStateFlow()
 
     private val _colorMode = MutableStateFlow(false)
     val colorMode: StateFlow<Boolean> = _colorMode.asStateFlow()
+
+    private val _decimenMode = MutableStateFlow(false)
+    val decimenMode: StateFlow<Boolean> = _decimenMode.asStateFlow()
 
     private var uiTicker: Job? = null
 
@@ -94,16 +104,38 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         val current = _uiState.value
         if (current.scanState != ScanState.SCANNING) return
         _uiState.value = current.copy(
-            progress = decoder.progress,
-            speed = decoder.speedStr,
-            avgSpeed = decoder.avgSpeedStr,
-            peakSpeed = decoder.peakSpeedStr,
-            readInterval = decoder.readIntervalMs,
-            totalSize = decoder.totalSizeStr,
-            bytesDetail = decoder.bytesDetailStr,
-            totalTime = decoder.totalTime
+            progress = activeProgress,
+            speed = activeSpeedStr,
+            avgSpeed = activeAvgSpeedStr,
+            peakSpeed = activePeakSpeedStr,
+            readInterval = activeReadInterval,
+            totalSize = activeTotalSizeStr,
+            bytesDetail = activeBytesDetailStr,
+            totalTime = activeTotalTime
         )
     }
+
+    private val activeProgress: Int
+        get() = if (streamMode == 2) decimenDecoder.progress else decoder.progress
+    private val activeSpeedStr: String
+        get() = if (streamMode == 2) DecimenDecoder.formatSize(decimenDecoder.speedBps) + "/s" else decoder.speedStr
+    private val activeAvgSpeedStr: String
+        get() = if (streamMode == 2) DecimenDecoder.formatSize(decimenDecoder.avgSpeedBps) + "/s" else decoder.avgSpeedStr
+    private val activePeakSpeedStr: String
+        get() = if (streamMode == 2) DecimenDecoder.formatSize(decimenDecoder.peakBps) + "/s" else decoder.peakSpeedStr
+    private val activeReadInterval: Long
+        get() = if (streamMode == 2) decimenDecoder.readIntervalMs else decoder.readIntervalMs
+    private val activeTotalSizeStr: String
+        get() = if (streamMode == 2) decimenDecoder.totalSizeStr else decoder.totalSizeStr
+    private val activeBytesDetailStr: String
+        get() = if (streamMode == 2) decimenDecoder.bytesDetailStr else decoder.bytesDetailStr
+    private val activeTotalTime: String
+        get() = if (streamMode == 2) {
+            val ms = decimenDecoder.elapsedMs
+            if (ms > 1000) "%.1fs".format(ms / 1000.0) else "${ms}ms"
+        } else {
+            decoder.totalTime
+        }
 
     fun onQrCodeScanned(imageProxy: ImageProxy) {
         if (_uiState.value.scanState != ScanState.SCANNING) {
@@ -136,35 +168,85 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     val frameBytes = barcode.rawBytes ?: barcode.rawValue?.toByteArray()
                     if (frameBytes == null) continue
 
-                    decoder.decodeFrame(frameBytes)
-
-                    val state = _uiState.value
-                    _uiState.value = state.copy(
-                        progress = decoder.progress,
-                        speed = decoder.speedStr,
-                        avgSpeed = decoder.avgSpeedStr,
-                        peakSpeed = decoder.peakSpeedStr,
-                        readInterval = decoder.readIntervalMs,
-                        totalSize = decoder.totalSizeStr,
-                        bytesDetail = decoder.bytesDetailStr,
-                        totalTime = decoder.totalTime
-                    )
-
-                    if (decoder.isCompleted) {
-                        val dataBytes = decoder.dataBytes ?: continue
-                        scanResultData = dataBytes
-                        val originalName = decoder.receivedFileName
-                        _uiState.value = _uiState.value.copy(
-                            scanState = ScanState.COMPLETED,
-                            md5 = computeMd5(dataBytes),
-                            suggestedFileName = if (originalName.isNotBlank()) originalName else generateFileName(dataBytes)
-                        )
+                    if (streamMode == 0) {
+                        streamMode = if (decimenDecoder.isDecimenFrame(frameBytes)) 2 else 1
+                        if (streamMode == 2) _decimenMode.value = true
                     }
+                    if (streamMode == 2) {
+                        handleDecimenFrame(frameBytes)
+                    } else {
+                        handleTxqrFrame(frameBytes)
+                    }
+                    if (_uiState.value.scanState == ScanState.COMPLETED) break
                 }
             }
             .addOnCompleteListener {
                 imageProxy.close()
             }
+    }
+
+    private fun handleTxqrFrame(frameBytes: ByteArray) {
+        decoder.decodeFrame(frameBytes)
+
+        val state = _uiState.value
+        _uiState.value = state.copy(
+            progress = decoder.progress,
+            speed = decoder.speedStr,
+            avgSpeed = decoder.avgSpeedStr,
+            peakSpeed = decoder.peakSpeedStr,
+            readInterval = decoder.readIntervalMs,
+            totalSize = decoder.totalSizeStr,
+            bytesDetail = decoder.bytesDetailStr,
+            totalTime = decoder.totalTime
+        )
+
+        if (decoder.isCompleted) {
+            val dataBytes = decoder.dataBytes ?: return
+            scanResultData = dataBytes
+            val originalName = decoder.receivedFileName
+            _uiState.value = _uiState.value.copy(
+                scanState = ScanState.COMPLETED,
+                md5 = computeMd5(dataBytes),
+                suggestedFileName = if (originalName.isNotBlank()) originalName else generateFileName(dataBytes)
+            )
+        }
+    }
+
+    private fun handleDecimenFrame(frameBytes: ByteArray) {
+        decimenDecoder.addFrame(frameBytes)
+
+        val state = _uiState.value
+        _uiState.value = state.copy(
+            progress = decimenDecoder.progress,
+            speed = DecimenDecoder.formatSize(decimenDecoder.speedBps) + "/s",
+            avgSpeed = DecimenDecoder.formatSize(decimenDecoder.avgSpeedBps) + "/s",
+            peakSpeed = DecimenDecoder.formatSize(decimenDecoder.peakBps) + "/s",
+            readInterval = decimenDecoder.readIntervalMs,
+            totalSize = decimenDecoder.totalSizeStr,
+            bytesDetail = decimenDecoder.bytesDetailStr,
+            totalTime = activeTotalTime
+        )
+
+        if (decimenDecoder.isComplete) {
+            val container = decimenDecoder.assemble() ?: return
+            val file = try {
+                decimenDecoder.unpackContainer(container)
+            } catch (e: Exception) {
+                Log.e("QRT", "decimen unpack: ${e.message}")
+                _uiState.value = _uiState.value.copy(bytesDetail = "Decimen: ${e.message}")
+                return
+            }
+            if (!decimenDecoder.verifySha256(container, file.bytes)) {
+                _uiState.value = _uiState.value.copy(bytesDetail = "Decimen: SHA-256 mismatch")
+                return
+            }
+            scanResultData = file.bytes
+            _uiState.value = _uiState.value.copy(
+                scanState = ScanState.COMPLETED,
+                md5 = computeMd5(file.bytes),
+                suggestedFileName = file.name.ifBlank { generateFileName(file.bytes) }
+            )
+        }
     }
 
     fun setColorMode(enabled: Boolean) {
@@ -329,6 +411,9 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     fun startScan() {
         decoder.reset()
+        decimenDecoder.reset()
+        streamMode = 0
+        _decimenMode.value = false
         scanResultData = null
         _uiState.value = ScannerUiState(scanState = ScanState.SCANNING)
     }

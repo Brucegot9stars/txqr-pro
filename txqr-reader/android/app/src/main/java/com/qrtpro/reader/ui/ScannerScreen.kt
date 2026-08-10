@@ -70,10 +70,12 @@ fun ScannerScreen(
             )
 
             val colorMode by viewModel.colorMode.collectAsState()
+            val decimenMode by viewModel.decimenMode.collectAsState()
 
             ScannerOverlay(
                 uiState = uiState,
                 colorMode = colorMode,
+                decimenMode = decimenMode,
                 onColorModeChange = { viewModel.setColorMode(it) },
                 onSaveRequest = onSaveRequest,
                 onRestart = { viewModel.startScan() }
@@ -156,6 +158,7 @@ private fun CameraPreview(
 private fun ScannerOverlay(
     uiState: ScannerUiState,
     colorMode: Boolean,
+    decimenMode: Boolean,
     onColorModeChange: (Boolean) -> Unit,
     onSaveRequest: (String) -> Unit,
     onRestart: () -> Unit
@@ -168,6 +171,7 @@ private fun ScannerOverlay(
     ) {
         TopBar(
             colorMode = colorMode,
+            decimenMode = decimenMode,
             onColorModeChange = onColorModeChange,
             onRestart = onRestart
         )
@@ -179,7 +183,8 @@ private fun ScannerOverlay(
                     speed = uiState.speed,
                     readInterval = uiState.readInterval,
                     totalSize = uiState.totalSize,
-                    bytesDetail = uiState.bytesDetail
+                    bytesDetail = uiState.bytesDetail,
+                    decimenMode = decimenMode
                 )
             }
             ScanState.COMPLETED -> {
@@ -210,6 +215,7 @@ private fun ScannerOverlay(
 @Composable
 private fun TopBar(
     colorMode: Boolean,
+    decimenMode: Boolean,
     onColorModeChange: (Boolean) -> Unit,
     onRestart: () -> Unit
 ) {
@@ -241,6 +247,23 @@ private fun TopBar(
                 )
             }
             Spacer(modifier = Modifier.width(8.dp))
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    text = "Decimen",
+                    color = if (decimenMode) Color(0xFF4FC3F7) else Color.White,
+                    fontSize = 10.sp
+                )
+                Switch(
+                    checked = decimenMode,
+                    onCheckedChange = { /* auto-detected from the stream; read-only */ },
+                    enabled = false,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Color(0xFF4FC3F7),
+                        checkedTrackColor = Color(0xFF4FC3F7).copy(alpha = 0.3f)
+                    )
+                )
+            }
+            Spacer(modifier = Modifier.width(8.dp))
             TextButton(
                 onClick = onRestart
             ) {
@@ -256,7 +279,8 @@ private fun ProgressPanel(
     speed: String,
     readInterval: Long,
     totalSize: String,
-    bytesDetail: String
+    bytesDetail: String,
+    decimenMode: Boolean
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -268,7 +292,7 @@ private fun ProgressPanel(
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text(
-                text = "Receiving...",
+                text = if (decimenMode) "Receiving (Decimen fountain)..." else "Receiving...",
                 color = Color.White,
                 fontSize = 18.sp
             )

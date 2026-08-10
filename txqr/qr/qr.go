@@ -35,6 +35,20 @@ func Encode(data string, size int, lvl RecoveryLevel) (image.Image, error) {
 	return qr.Image(size), nil
 }
 
+// EncodeVersioned encodes data into a QR code with a forced version and mask.
+// Pinning the version keeps every code at identical geometry (required for
+// tiling a grid of same-size frames); pinning the mask skips the 8-way mask
+// evaluation, which is what makes high-fps streaming generation affordable.
+// The mask is read from the symbol's format info by any decoder, so a pinned
+// mask never affects the recovered bytes.
+func EncodeVersioned(data string, size int, lvl RecoveryLevel, version, mask int) (image.Image, error) {
+	qr, err := qrcode.NewFixed(data, version, qrcode.RecoveryLevel(lvl), mask)
+	if err != nil {
+		return nil, fmt.Errorf("encode QR V%d mask %d: %v", version, mask, err)
+	}
+	return qr.Image(size), nil
+}
+
 // Decode an image with QR code.
 func Decode(img image.Image) (string, error) {
 	bitmap, err := gozxing.NewBinaryBitmapFromImage(img)
