@@ -1,7 +1,6 @@
 package qr
 
 import (
-	"os"
 	"testing"
 	"time"
 )
@@ -30,22 +29,19 @@ func TestV40LCapacity(t *testing.T) {
 }
 
 func TestPinnedMaskIsFaster(t *testing.T) {
-	bench := func(version, mask int) time.Duration {
-		var total time.Duration
-		n := 8
-		for i := 0; i < n; i++ {
-			data := make([]byte, 2953)
-			for j := range data {
-				data[j] = byte(j*7 + i)
-			}
-			start := time.Now()
-			if _, err := EncodeVersioned(string(data), 512, Low, version, mask); err != nil {
-				t.Fatalf("EncodeVersioned: %v", err)
-			}
-			total += time.Since(start)
-		}
-		return total / time.Duration(n)
+	// Smoke guard: a pinned-mask V40 render must complete in bounded time so
+	// the parallel pre-render of a full 2k-frame carousel stays affordable
+	// (measured ~20ms/frame; 716 frames over GOMAXPROCS workers ≈ seconds).
+	data := make([]byte, 2953)
+	for i := range data {
+		data[i] = byte(i*3 + i>>8)
 	}
-	pinned := bench(40, 4)
-	os.WriteFile("v40_bench.txt", []byte("pinned avg "+pinned.String()+"\n"), 0o644)
+	start := time.Now()
+	if _, err := EncodeVersioned(string(data), 512, Low, 40, 4); err != nil {
+		t.Fatalf("EncodeVersioned: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("pinned-mask V40 render took %s, unexpectedly slow", elapsed)
+	}
 }
