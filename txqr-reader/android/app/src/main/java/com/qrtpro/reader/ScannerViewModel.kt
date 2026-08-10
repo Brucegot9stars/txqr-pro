@@ -3,6 +3,7 @@ package com.qrtpro.reader
 import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.util.Log
 import androidx.camera.core.ImageProxy
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -172,41 +173,67 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     private fun decodeColorMatrix(imageProxy: ImageProxy) {
         try {
-            val planes = imageProxy.planes
-            if (planes.isEmpty()) { imageProxy.close(); return }
-            val yPlane = planes[0]
-            val yBuf = yPlane.buffer
-            val pStride = yPlane.pixelStride
-            val rStride = yPlane.rowStride
+            @Suppress("UnsafeOptInUsageError")
+            val img = imageProxy.image ?: run { imageProxy.close(); return }
+            val planes = img.planes
+            if (planes.size < 3) { imageProxy.close(); return }
 
-            val w = imageProxy.width
-            val h = imageProxy.height
-            val side = minOf(w, h)
-            val ox = (w - side) / 2
-            val oy = (h - side) / 2
-            if (side < ColorMatrixDecoder.MATRIX_SIZE) { imageProxy.close(); return }
+            val yPlane = planes[0]; val uPlane = planes[1]; val vPlane = planes[2]
+            val yBuf = yPlane.buffer; val uBuf = uPlane.buffer; val vBuf = vPlane.buffer
+            val yPS = yPlane.pixelStride; val yRS = yPlane.rowStride
+            val uPS = uPlane.pixelStride; val uRS = uPlane.rowStride
+            val vPS = vPlane.pixelStride; val vRS = vPlane.rowStride
 
-            val sampler: (Int, Int) -> Int = { x, y ->
-                val yi = y + oy
-                val xi = x + ox
-                val idx = yi * rStride + xi * pStride
-                val yVal = yBuf.get(idx).toInt() and 0xFF
-                (yVal shl 16) or (yVal shl 8) or yVal
+            val w = imageProxy.width; val h = imageProxy.height
+            var lastErr: String? = null
+
+            // Try full frame then progressively smaller centre crops.
+            for (frac in listOf(1.0f, 0.75f, 0.5f)) {
+                val side = (minOf(w, h) * frac).toInt()
+                if (side < ColorMatrixDecoder.MATRIX_SIZE) break
+                val ox = (w - side) / 2; val oy = (h - side) / 2
+
+                val sampler: (Int, Int) -> Int = { x, y ->
+                    val yi = y + oy; val xi = x + ox
+                    val yv = (yBuf.get(yi * yRS + xi * yPS).toInt() and 0xFF)
+                    val ui = xi / 2; val vi = yi / 2
+                    val uv = (uBuf.get(vi * uRS + ui * uPS).toInt() and 0xFF) - 128
+                    val vv = (vBuf.get(vi * vRS + ui * vPS).toInt() and 0xFF) - 128
+                    val r = (yv + (1.402f * vv).toInt()).coerceIn(0, 255)
+                    val g = (yv - (0.344f * uv + 0.714f * vv).toInt()).coerceIn(0, 255)
+                    val b = (yv + (1.772f * uv).toInt()).coerceIn(0, 255)
+                    (r shl 16) or (g shl 8) or b
+                }
+
+                try {
+                    val frameBytes = ColorMatrixDecoder.decode(sampler, side, side)
+                    decoder.decodeFrame(frameBytes)
+                    if (decoder.isCompleted) {
+                        val dataBytes = decoder.dataBytes ?: return
+                        scanResultData = dataBytes
+                        _uiState.value = _uiState.value.copy(
+                            scanState = ScanState.COMPLETED,
+                            md5 = computeMd5(dataBytes),
+                            suggestedFileName = decoder.receivedFileName.ifBlank { generateFileName(dataBytes) }
+                        )
+                        return  // success — stop trying smaller crops
+                    }
+                    break  // decoded successfully (non-complete): stop trying smaller crops
+                } catch (e: ColorMatrixDecodeException) {
+                    lastErr = e.message
+                }
             }
 
-            val frameBytes = ColorMatrixDecoder.decode(sampler, side, side)
-            decoder.decodeFrame(frameBytes)
-
-            if (decoder.isCompleted) {
-                val dataBytes = decoder.dataBytes ?: return
-                scanResultData = dataBytes
-                _uiState.value = _uiState.value.copy(
-                    scanState = ScanState.COMPLETED,
-                    md5 = computeMd5(dataBytes),
-                    suggestedFileName = decoder.receivedFileName.ifBlank { generateFileName(dataBytes) }
-                )
+            if (lastErr != null) {
+                Log.w("QRT", "Color decode fail: $lastErr")
+                _uiState.value = _uiState.value.copy(bytesDetail = "Color: $lastErr")
             }
-        } catch (_: ColorMatrixDecodeException) {
+        } catch (e: ColorMatrixDecodeException) {
+            Log.w("QRT", "Color decode fail: ${e.message}", e)
+            _uiState.value = _uiState.value.copy(bytesDetail = "Color: ${e.message}")
+        } catch (e: Exception) {
+            Log.e("QRT", "Color unexpected", e)
+            _uiState.value = _uiState.value.copy(bytesDetail = "Color err: ${e.message}")
         } finally {
             imageProxy.close()
         }
