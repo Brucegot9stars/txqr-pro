@@ -8,6 +8,8 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +43,13 @@ type decodeState struct {
 	SaveFails bool
 
 	speedWnd []speedSample // sliding window of (time, effective bytes)
+
+	// txqr progress bookkeeping (txqr.Decoder.Read() is unimplemented → 0)
+	txqrTotal int
+	txqrChunk int
+	txqrNeed  int
+	txqrGot   int
+	txqrSeen  map[int]struct{}
 }
 
 // speedSample records cumulative effective bytes at a moment; the window's
@@ -78,6 +87,8 @@ func (s *decodeState) reset() {
 	s.frames = 0
 	s.bytes = 0
 	s.speedWnd = nil
+	s.txqrTotal, s.txqrChunk, s.txqrNeed, s.txqrGot = 0, 0, 0, 0
+	s.txqrSeen = nil
 	s.completed = false
 	s.result = nil
 	s.fileName = ""
@@ -173,13 +184,33 @@ func (s *decodeState) feedTxqrLocked(payload []byte) bool {
 	}
 	s.mode = "txqr"
 	s.frames++
-	// Count only genuinely new blocks (the decoder dedups by chunk).
-	before := s.txqrDec.Read()
-	s.txqrDec.Decode(string(payload))
-	if s.txqrDec.Read() > before {
-		s.bytes += int64(len(payload))
-		s.pushSpeedSample()
+	// txqr.Decoder.Read() is a stub returning 0, so track dedup + progress
+	// ourselves from the frame header ("blockCode/chunkLen/total[/codec]|...").
+	chunk := string(payload)
+	if idx := strings.IndexByte(chunk, '|'); idx > 0 {
+		if parts := strings.Split(chunk[:idx], "/"); len(parts) >= 3 {
+			code, err1 := strconv.Atoi(parts[0])
+			cl, err2 := strconv.Atoi(parts[1])
+			total, err3 := strconv.Atoi(parts[2])
+			if err1 == nil && err2 == nil && cl > 0 && err3 == nil && total > 0 {
+				if s.txqrTotal == 0 {
+					s.txqrTotal = total
+					s.txqrChunk = cl
+					s.txqrNeed = (total + cl - 1) / cl
+				}
+				if s.txqrSeen == nil {
+					s.txqrSeen = map[int]struct{}{}
+				}
+				if _, dup := s.txqrSeen[code]; !dup {
+					s.txqrSeen[code] = struct{}{}
+					s.txqrGot++
+					s.bytes += int64(len(payload))
+					s.pushSpeedSample()
+				}
+			}
+		}
 	}
+	s.txqrDec.Decode(chunk)
 	if s.txqrDec.IsCompleted() {
 		s.completed = true
 		s.result = s.txqrDec.DataBytes()
@@ -204,8 +235,9 @@ func shaMatches(container, file []byte) bool {
 	return bytes.Equal(got[:], want)
 }
 
-// snapshot copies the stats the UI needs, under the mutex.
-func (s *decodeState) snapshot() (progress int, status string, done bool) {
+// snapshot copies the stats the UI needs, under the mutex. byBlocks selects
+// the decimen progress flavor: solved blocks vs frames collected.
+func (s *decodeState) snapshot(byBlocks bool) (progress int, status string, done bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.completed {
@@ -213,22 +245,24 @@ func (s *decodeState) snapshot() (progress int, status string, done bool) {
 	}
 	p := 0
 	if s.decimenDec != nil {
-		// Progress by frames COLLECTED (new seqs), not blocks solved: the
-		// peeling cascade back-loads — blocks solved hockey-sticks near the
-		// end (stalls ~50% then jumps), so solved-count progress looks frozen.
-		// The receiver needs about k*1.05 distinct frames to finish.
-		need := int(float64(s.decimenHdr.K) * 1.05)
-		if need < 1 {
-			need = 1
+		if byBlocks {
+			p = s.decimenDec.SolvedCount() * 100 / int(s.decimenHdr.K)
+		} else {
+			// Progress by frames COLLECTED (new seqs), not blocks solved: the
+			// peeling cascade back-loads — solved count stalls ~50% then jumps.
+			// The receiver needs about k*1.05 distinct frames to finish.
+			need := int(float64(s.decimenHdr.K) * 1.05)
+			if need < 1 {
+				need = 1
+			}
+			p = s.decimenDec.FramesNew * 100 / need
 		}
-		p = s.decimenDec.FramesNew * 100 / need
 		if p > 99 {
 			p = 99
 		}
 	} else if s.txqrDec != nil {
-		total := s.txqrDec.Total()
-		if total > 0 {
-			p = s.txqrDec.Read() * 100 / total
+		if s.txqrNeed > 0 {
+			p = s.txqrGot * 100 / s.txqrNeed
 			if p > 99 {
 				p = 99
 			}

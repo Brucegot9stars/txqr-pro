@@ -80,11 +80,12 @@ type decJob struct {
 }
 
 type app struct {
-	hwnd     uintptr
-	hinst    uintptr
-	btns     [6]rect
-	btnText  [6]string
-	saveFails bool // keep undecodable frames to %TEMP%\qrt-debug
+	hwnd       uintptr
+	hinst      uintptr
+	btns       [7]rect
+	btnText    [7]string
+	saveFails  bool // keep undecodable frames to %TEMP%\qrt-debug
+	progressByBlocks bool // decimen progress flavor: solved blocks vs frames collected
 
 	decQueue chan decJob // frames waiting for a decode worker (bounded; drop when full)
 
@@ -121,7 +122,7 @@ func main() {
 		messageBox(0, "GetModuleHandle failed", "txqr-desktop", 0)
 		return
 	}
-	a := &app{hinst: inst, btnText: [6]string{"添加区域", "开始全部", "停止全部", "清空", "保存", "失败帧:关"}}
+	a := &app{hinst: inst, btnText: [7]string{"添加区域", "开始全部", "停止全部", "清空", "保存", "失败帧:关", "进度:帧数"}}
 
 	// main window class
 	wc := wndclassex{
@@ -264,6 +265,13 @@ func (a *app) onButton(idx int) {
 			r.st.SaveFails = a.saveFails
 		}
 		procInvalidateRect.Call(a.hwnd, 0, 0)
+	case 6: // decimen 进度显示方案: 已解块数 / 收集帧数
+		a.progressByBlocks = !a.progressByBlocks
+		a.btnText[6] = "进度:帧数"
+		if a.progressByBlocks {
+			a.btnText[6] = "进度:块数"
+		}
+		procInvalidateRect.Call(a.hwnd, 0, 0)
 	}
 }
 
@@ -322,7 +330,7 @@ func (a *app) paintMain(hdc uintptr) {
 
 	lineY := 56
 	for _, r := range a.regions {
-		p, st, done := r.st.snapshot()
+		p, st, done := r.st.snapshot(a.progressByBlocks)
 		state := "扫描中"
 		switch {
 		case done:
