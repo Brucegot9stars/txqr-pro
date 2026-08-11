@@ -181,45 +181,19 @@ func DecodeRaw(img image.Image) ([]byte, error) {
 	return result.GetRawBytes(), nil
 }
 
-// DecodeRawMultiScale decodes a QR trying several image scales in order,
-// returning the first result that yields a real frame payload. Real screen
-// captures can place the code at any relative size; gozxing's detector works
-// best when the code is neither tiny nor enormous in the frame, so a downscale
-// often turns a "too small relative to the box" miss into a hit.
+// DecodeRawMultiScale decodes a QR trying cheap crops first, then scales.
+// Real screen captures almost always box in the sender's range frame plus
+// wide margins, so the bare image rarely decodes but a small edge-crop at the
+// original resolution succeeds in ~10ms — putting that path first is what
+// makes the desktop receiver fast. Upscales follow for very small codes.
 func DecodeRawMultiScale(img image.Image, scales []float64) ([]byte, error) {
-	var lastErr error
-	for _, s := range scales {
-		w, h := img.Bounds().Dx(), img.Bounds().Dy()
-		nw, nh := int(float64(w)*s), int(float64(h)*s)
-		if nw < 8 || nh < 8 {
-			continue
-		}
-		cand := img
-		if s != 1.0 {
-			cand = scaleBilinear(img, nw, nh)
-		}
-		raw, err := DecodeRaw(cand)
-		lastErr = err
-		if err != nil {
-			continue
-		}
-		if ExtractFramePayload(raw) != nil {
-			return raw, nil
-		}
-	}
-
-	// Fallback: the sender's range frame often gets boxed in with the code —
-	// its border lines make gozxing read the format information wrong
-	// (FormatException). Cropping the outer band then upscaling removes the
-	// interference and raises the module resolution. Several crop ratios cover
-	// tight and loose boxes alike; verified to turn previously-all-fail
-	// captures into decodes.
 	b := img.Bounds()
-	for _, cropPct := range []float64{0.03, 0.06, 0.10} {
+
+	tryCrop := func(cropPct, sc float64) []byte {
 		dx := int(float64(b.Dx()) * cropPct)
 		dy := int(float64(b.Dy()) * cropPct)
 		if b.Dx()-2*dx < 60 || b.Dy()-2*dy < 60 {
-			continue
+			return nil
 		}
 		cropped := image.NewRGBA(image.Rect(0, 0, b.Dx()-2*dx, b.Dy()-2*dy))
 		for y := 0; y < cropped.Bounds().Dy(); y++ {
@@ -227,14 +201,54 @@ func DecodeRawMultiScale(img image.Image, scales []float64) ([]byte, error) {
 				cropped.Set(x, y, img.At(b.Min.X+x+dx, b.Min.Y+y+dy))
 			}
 		}
-		for _, sc := range []float64{2.0, 2.5} {
+		cand := image.Image(cropped)
+		if sc != 1.0 {
 			cw, ch := cropped.Bounds().Dx(), cropped.Bounds().Dy()
-			scaled := scaleBilinear(cropped, int(float64(cw)*sc), int(float64(ch)*sc))
-			raw, err := DecodeRaw(scaled)
-			lastErr = err
-			if err == nil && ExtractFramePayload(raw) != nil {
-				return raw, nil
+			cand = scaleBilinear(cropped, int(float64(cw)*sc), int(float64(ch)*sc))
+		}
+		raw, err := DecodeRaw(cand)
+		if err != nil {
+			return nil
+		}
+		if ExtractFramePayload(raw) != nil {
+			return raw
+		}
+		return nil
+	}
+
+	// 1. cheap original-resolution crops (fast path for boxed-in frames)
+	for _, cropPct := range []float64{0.06, 0.03, 0.10} {
+		if p := tryCrop(cropPct, 1.0); p != nil {
+			return p, nil
+		}
+	}
+	// 2. bare image (tight, border-free boxes)
+	if raw, err := DecodeRaw(img); err == nil && ExtractFramePayload(raw) != nil {
+		return raw, nil
+	}
+	// 3. upscales for small codes
+	for _, cropPct := range []float64{0.06, 0.03} {
+		for _, sc := range []float64{1.5, 2.0} {
+			if p := tryCrop(cropPct, sc); p != nil {
+				return p, nil
 			}
+		}
+	}
+	// 4. coarse scales as a last resort
+	var lastErr error
+	for _, s := range scales {
+		if s == 1.0 {
+			continue
+		}
+		w, h := b.Dx(), b.Dy()
+		nw, nh := int(float64(w)*s), int(float64(h)*s)
+		if nw < 8 || nh < 8 {
+			continue
+		}
+		raw, err := DecodeRaw(scaleBilinear(img, nw, nh))
+		lastErr = err
+		if err == nil && ExtractFramePayload(raw) != nil {
+			return raw, nil
 		}
 	}
 	if lastErr == nil {

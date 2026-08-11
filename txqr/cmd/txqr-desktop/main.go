@@ -69,10 +69,11 @@ type scanRegion struct {
 }
 
 type app struct {
-	hwnd    uintptr
-	hinst   uintptr
-	btns    [5]rect
-	btnText [5]string
+	hwnd     uintptr
+	hinst    uintptr
+	btns     [6]rect
+	btnText  [6]string
+	saveFails bool // keep undecodable frames to %TEMP%\qrt-debug
 
 	regions []*scanRegion
 
@@ -107,7 +108,7 @@ func main() {
 		messageBox(0, "GetModuleHandle failed", "txqr-desktop", 0)
 		return
 	}
-	a := &app{hinst: inst, btnText: [5]string{"添加区域", "开始全部", "停止全部", "清空", "保存"}}
+	a := &app{hinst: inst, btnText: [6]string{"添加区域", "开始全部", "停止全部", "清空", "保存", "失败帧:关"}}
 
 	// main window class
 	wc := wndclassex{
@@ -225,6 +226,16 @@ func (a *app) onButton(idx int) {
 		procInvalidateRect.Call(a.hwnd, 0, 0)
 	case 4: // 保存
 		a.saveDialog()
+	case 5: // 失败帧保存开关
+		a.saveFails = !a.saveFails
+		a.btnText[5] = "失败帧:关"
+		if a.saveFails {
+			a.btnText[5] = "失败帧:开"
+		}
+		for _, r := range a.regions {
+			r.st.SaveFails = a.saveFails
+		}
+		procInvalidateRect.Call(a.hwnd, 0, 0)
 	}
 }
 
@@ -529,6 +540,7 @@ func (a *app) finishSelect() {
 		rect:  rc,
 		label: fmt.Sprintf("区域 %d · %dx%d", len(a.regions)+1, int(rc.right-rc.left), int(rc.bottom-rc.top)),
 	}
+	r.st.SaveFails = a.saveFails
 	a.regions = append(a.regions, r)
 	procInvalidateRect.Call(a.hwnd, 0, 0)
 	// selection paused every region (the fullscreen overlay blocks captures);

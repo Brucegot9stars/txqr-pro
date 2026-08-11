@@ -36,16 +36,13 @@ type decodeState struct {
 	result    []byte
 	fileName  string
 	mode      string // "decimen" or "txqr"
-}
-
-// debugFramesOn is true when undecodable captures are dumped to the temp dir
-// for diagnosis. Always on (capped) so a failing session leaves evidence.
-func debugFramesOn() bool {
-	return true
+	// SaveFails keeps undecodable captures to %TEMP%\qrt-debug when enabled
+	// (a diagnosis aid; writing every failed frame slows the receiver).
+	SaveFails bool
 }
 
 func (s *decodeState) saveDebugFrame(rgba *image.RGBA) {
-	if !debugFramesOn() || s.savedDebug >= 20 {
+	if !s.SaveFails || s.savedDebug >= 20 {
 		return
 	}
 	dir := filepath.Join(os.TempDir(), "qrt-debug")
