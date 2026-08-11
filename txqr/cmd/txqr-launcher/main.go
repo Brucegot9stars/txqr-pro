@@ -67,6 +67,8 @@ var (
 	procTextOutW               = windows.NewLazySystemDLL("gdi32.dll").NewProc("TextOutW")
 	procGetTextExtentPoint32W  = windows.NewLazySystemDLL("gdi32.dll").NewProc("GetTextExtentPoint32W")
 	procGetClientRect          = user32.NewProc("GetClientRect")
+	procRoundRect              = windows.NewLazySystemDLL("gdi32.dll").NewProc("RoundRect")
+	procEllipse                = windows.NewLazySystemDLL("gdi32.dll").NewProc("Ellipse")
 )
 
 const (
@@ -78,13 +80,16 @@ const (
 	srcCopy           = 0x00CC0020
 	blackBrush        = 4
 
-	wmPaint       = 0x000F
-	wmEraseBkgnd  = 0x0014
-	wmDestroy     = 0x0002
-	wmClose       = 0x0010
-	wmLButtonDown = 0x0201
-	wmTimer       = 0x0113
-	timerRefresh  = 1
+	wmPaint         = 0x000F
+	wmEraseBkgnd    = 0x0014
+	wmDestroy       = 0x0002
+	wmClose         = 0x0010
+	wmLButtonDown   = 0x0201
+	wmLButtonUp     = 0x0202
+	wmMouseUp       = 0x0202
+	wmTimer         = 0x0113
+	wmGetMinMaxInfo = 0x0024
+	timerRefresh    = 1
 )
 
 const (
@@ -120,6 +125,16 @@ type msg struct {
 
 type rect struct{ left, top, right, bottom int32 }
 
+type point struct{ x, y int32 }
+
+type minmaxinfo struct {
+	ptReserved    point
+	ptMaxSize     point
+	ptMaxPosition point
+	ptMinTrackSize point
+	ptMaxTrackSize point
+}
+
 type paintstruct struct {
 	hdc        uintptr
 	fErase     int32
@@ -143,14 +158,17 @@ type processEntry32 struct {
 }
 
 type launcher struct {
-	hwnd     uintptr
-	hinst    uintptr
-	dir      string
-	btns     [4]rect
-	sender   bool
-	receiver bool
+	hwnd      uintptr
+	hinst     uintptr
+	dir       string
+	btns      [4]rect
+	sender    bool
+	receiver  bool
 	senderPID   uint32
 	receiverPID uint32
+	senderPorts   []int // cached by refresh(); paint never spawns netstat
+	receiverPorts []int
+	pressed       int // button index currently pressed (for press feedback)
 }
 
 func procCall(p *windows.LazyProc, a ...uintptr) uintptr {
@@ -196,14 +214,14 @@ func main() {
 	hwnd := procCall(procCreateWindowExW, 0,
 		uintptr(unsafe.Pointer(utf16Ptr("QRTLauncher"))),
 		uintptr(unsafe.Pointer(utf16Ptr("QRT 启动器"))),
-		wsOverlapped|wsVisible, 200, 140, 470, 250, 0, 0, inst, 0)
+		wsOverlapped|wsVisible, 200, 140, 480, 300, 0, 0, inst, 0)
 	if hwnd == 0 {
 		return
 	}
 	a.hwnd = hwnd
 	procShowWindow.Call(hwnd, swShow)
 	procUpdateWindow.Call(hwnd)
-	procSetTimer.Call(hwnd, timerRefresh, 1000, 0)
+	procSetTimer.Call(hwnd, timerRefresh, 2000, 0)
 
 	var m msg
 	for {
@@ -221,13 +239,13 @@ func utf16Ptr(s string) *uint16 {
 	return p
 }
 
-func (a *launcher) wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
+func (a *launcher) wndProc(hwnd, msg, wParam uintptr, lParam unsafe.Pointer) uintptr {
 	switch msg {
 	case wmPaint:
 		var ps paintstruct
 		hdc := procCall(procBeginPaint, hwnd, uintptr(unsafe.Pointer(&ps)))
 		if hdc != 0 {
-			a.paint(hdc)
+			a.paintBuffered(hdc)
 			procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 		}
 		return 0
@@ -236,7 +254,19 @@ func (a *launcher) wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	case wmLButtonDown:
 		x, y := pointFromLParam(lParam)
 		if i := a.hit(x, y); i >= 0 {
+			a.pressed = i
+			procInvalidateRect.Call(hwnd, 0, 0)
+		}
+		return 0
+	case wmMouseUp:
+		x, y := pointFromLParam(lParam)
+		i := a.hit(x, y)
+		if a.pressed >= 0 && i == a.pressed {
 			a.onButton(i)
+		}
+		if a.pressed >= 0 {
+			a.pressed = -1
+			procInvalidateRect.Call(hwnd, 0, 0)
 		}
 		return 0
 	case wmTimer:
@@ -244,6 +274,10 @@ func (a *launcher) wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 			a.refresh()
 			procInvalidateRect.Call(hwnd, 0, 0)
 		}
+		return 0
+	case wmGetMinMaxInfo:
+		mm := (*minmaxinfo)(lParam)
+		mm.ptMinTrackSize = point{x: 480, y: 280}
 		return 0
 	case wmClose:
 		procDestroyWindow.Call(hwnd)
@@ -253,11 +287,12 @@ func (a *launcher) wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		procPostQuitMessage.Call(0)
 		return 0
 	}
-	return procCall(procDefWindowProcW, hwnd, msg, wParam, lParam)
+	return procCall(procDefWindowProcW, hwnd, msg, wParam, uintptr(lParam))
 }
 
-func pointFromLParam(l uintptr) (int, int) {
-	return int(int16(l & 0xFFFF)), int(int16(l >> 16))
+func pointFromLParam(l unsafe.Pointer) (int, int) {
+	v := uintptr(l)
+	return int(int16(v & 0xFFFF)), int(int16(v >> 16))
 }
 
 func (a *launcher) hit(x, y int) int {
@@ -290,6 +325,16 @@ func (a *launcher) onButton(i int) {
 func (a *launcher) refresh() {
 	a.sender, a.senderPID = exeRunning("qrt-pro-sender")
 	a.receiver, a.receiverPID = exeRunning("qrt-pro-receiver")
+	if a.sender {
+		a.senderPorts = listenPorts(a.senderPID)
+	} else {
+		a.senderPorts = nil
+	}
+	if a.receiver {
+		a.receiverPorts = listenPorts(a.receiverPID)
+	} else {
+		a.receiverPorts = nil
+	}
 }
 
 // exeRunning reports whether any process's module name starts with prefix, and
@@ -395,99 +440,176 @@ func stopProcess(prefix string) {
 	}
 }
 
-func (a *launcher) paint(hdc uintptr) {
-	brBg := procCall(procCreateSolidBrush, uintptr(rgb(18, 18, 24)))
-	fillRect(hdc, 0, 0, 10000, 10000, brBg)
-	procDeleteObject.Call(brBg)
+func (a *launcher) paintBuffered(hdc uintptr) {
+	var rc rect
+	procGetClientRect.Call(a.hwnd, uintptr(unsafe.Pointer(&rc)))
+	w, h := int(rc.right), int(rc.bottom)
+	if w <= 0 || h <= 0 {
+		return
+	}
+	mem := procCall(procCreateCompatibleDC, hdc)
+	if mem == 0 {
+		return
+	}
+	defer procDeleteDC.Call(mem)
+	bmp := procCall(procCreateCompatibleBitmap, hdc, uintptr(w), uintptr(h))
+	if bmp == 0 {
+		return
+	}
+	defer procDeleteObject.Call(bmp)
+	old := procCall(procSelectObject, mem, bmp)
+	a.paint(mem)
+	procBitBlt.Call(hdc, 0, 0, uintptr(w), uintptr(h), mem, 0, 0, uintptr(srcCopy))
+	procSelectObject.Call(mem, old)
+}
 
-	brBtn := procCall(procCreateSolidBrush, uintptr(rgb(47, 61, 92)))
-	brOn := procCall(procCreateSolidBrush, uintptr(rgb(38, 130, 60)))
-	brOff := procCall(procCreateSolidBrush, uintptr(rgb(90, 46, 46)))
-	brFrame := procCall(procCreateSolidBrush, uintptr(rgb(120, 140, 180)))
-	defer procDeleteObject.Call(brBtn)
-	defer procDeleteObject.Call(brOn)
-	defer procDeleteObject.Call(brOff)
-	defer procDeleteObject.Call(brFrame)
+func (a *launcher) paint(hdc uintptr) {
+	var rc rect
+	procGetClientRect.Call(a.hwnd, uintptr(unsafe.Pointer(&rc)))
+	w, h := int(rc.right), int(rc.bottom)
+
+	// gradient background
+	for y := 0; y < h; y += 4 {
+		t := float64(y) / float64(max(1, h))
+		br := procCall(procCreateSolidBrush, uintptr(lerpColor(rgb(31, 35, 48), rgb(12, 13, 19), t)))
+		fillRect(hdc, 0, y, w, y+4, br)
+		procDeleteObject.Call(br)
+	}
 
 	setBkMode(hdc, 1) // transparent
-	setTextColor(hdc, rgb(235, 238, 245))
 
+	// centered title + separator
 	title, tn := utf16N("QRT 进程启动器")
-	textOutW(hdc, 14, 10, title, tn)
+	tw, _ := textExtent(hdc, title, tn)
+	setTextColor(hdc, rgb(240, 242, 248))
+	textOutW(hdc, (w-int(tw))/2, 18, title, tn)
+	brSep := procCall(procCreateSolidBrush, uintptr(rgb(70, 92, 150)))
+	fillRect(hdc, 24, 50, w-24, 52, brSep)
+	procDeleteObject.Call(brSep)
 
 	rows := []struct {
 		label   string
 		exe     string
 		running bool
 		pid     uint32
-		rowY    int
-		detailY int
+		ports   []int
 	}{
-		{"发送端 (txqr-web)", a.senderExe(), a.sender, a.senderPID, 44, 78},
-		{"桌面接收端 (框选扫描)", a.receiverExe(), a.receiver, a.receiverPID, 104, 138},
+		{"发送端 (txqr-web)", a.senderExe(), a.sender, a.senderPID, a.senderPorts},
+		{"桌面接收端 (框选扫描)", a.receiverExe(), a.receiver, a.receiverPID, a.receiverPorts},
 	}
+	rowY := 66
 	for ri, row := range rows {
-		// label
-		l, ln := utf16N(row.label)
-		textOutW(hdc, 14, row.rowY+6, l, ln)
-
-		// start button
-		bs := rect{int32(230), int32(row.rowY), int32(312), int32(row.rowY + 32)}
-		// stop button
-		bp := rect{int32(322), int32(row.rowY), int32(404), int32(row.rowY + 32)}
-		a.btns[ri*2] = bs
-		a.btns[ri*2+1] = bp
-
-		fillRect(hdc, int(bs.left), int(bs.top), int(bs.right), int(bs.bottom), brBtn)
-		frameRect(hdc, int(bs.left), int(bs.top), int(bs.right), int(bs.bottom), brFrame)
-		sl, sln := utf16N("启动")
-		tw, th := textExtent(hdc, sl, sln)
-		textOutW(hdc, int(bs.left)+(82-int(tw))/2, int(bs.top)+(32-int(th))/2, sl, sln)
-
-		stopBrush := brBtn
-		if row.running {
-			stopBrush = brOn
-		}
-		fillRect(hdc, int(bp.left), int(bp.top), int(bp.right), int(bp.bottom), stopBrush)
-		frameRect(hdc, int(bp.left), int(bp.top), int(bp.right), int(bp.bottom), brFrame)
-		pl, pln := utf16N("停止")
-		tw, th = textExtent(hdc, pl, pln)
-		textOutW(hdc, int(bp.left)+(82-int(tw))/2, int(bp.top)+(32-int(th))/2, pl, pln)
-
-		// status
-		st := "已停止"
-		stColor := rgb(150, 150, 160)
-		if row.running {
-			st = "● 运行中"
-			stColor = rgb(80, 220, 120)
-		}
-		setTextColor(hdc, stColor)
-		sl2, sln2 := utf16N(st)
-		textOutW(hdc, 416, row.rowY+7, sl2, sln2)
-		setTextColor(hdc, rgb(235, 238, 245))
-
-		// detail line: PID · port · version · build time
-		setTextColor(hdc, rgb(160, 170, 190))
-		var detail string
-		if row.running {
-			ver, bt := exeMeta(row.exe)
-			ports := listenPorts(row.pid)
-			portStr := "—"
-			if len(ports) > 0 {
-				portStr = ":" + itoa(ports[0])
-			}
-			detail = fmt.Sprintf("PID %d · %s · %s · 构建 %s", row.pid, portStr, ver, bt)
-		} else {
-			detail = "—"
-		}
-		dl, dln := utf16N(detail)
-		textOutW(hdc, 14, row.detailY, dl, dln)
-		setTextColor(hdc, rgb(235, 238, 245))
+		rowY = a.drawRow(hdc, w, rowY, ri, row.label, row.exe, row.running, row.pid, row.ports)
 	}
 
-	hint, hn := utf16N("提示：停止只匹配本工具的进程；launcher 自身不会被停止。")
-	setTextColor(hdc, rgb(130, 130, 150))
-	textOutW(hdc, 14, 180, hint, hn)
+	// hint, centered near the bottom
+	hint, hn := utf16N("提示：停止只匹配本工具进程；launcher 自身不受影响。")
+	hw, _ := textExtent(hdc, hint, hn)
+	setTextColor(hdc, rgb(130, 140, 160))
+	textOutW(hdc, (w-int(hw))/2, h-28, hint, hn)
+}
+
+// drawRow lays out one process line centered horizontally, returns the next
+// row's y. Every piece (label, buttons, status) has reserved spacing so none
+// of them overlap the others or the detail line below.
+func (a *launcher) drawRow(hdc uintptr, w, y, idx int, label, exe string, running bool, pid uint32, ports []int) int {
+	const btnW, btnH = 88, 32
+	l, ln := utf16N(label)
+	lw, lh := textExtent(hdc, l, ln)
+
+	st := "已停止"
+	if running {
+		st = "运行中"
+	}
+	ss, sn := utf16N(st)
+	sw, _ := textExtent(hdc, ss, sn)
+
+	groupW := int(lw) + 22 + btnW + 10 + btnW + 22 + 14 + int(sw)
+	x0 := (w - groupW) / 2
+	if x0 < 16 {
+		x0 = 16
+	}
+
+	setTextColor(hdc, rgb(210, 218, 230))
+	textOutW(hdc, x0, y+int(lh/2)-8, l, ln)
+
+	startX := x0 + int(lw) + 22
+	stopX := startX + btnW + 10
+	a.btns[idx*2] = rect{int32(startX), int32(y), int32(startX + btnW), int32(y + btnH)}
+	a.btns[idx*2+1] = rect{int32(stopX), int32(y), int32(stopX + btnW), int32(y + btnH)}
+	a.drawButton(hdc, a.btns[idx*2], "启动", idx*2, rgb(52, 80, 150))
+	stopColor := uint32(rgb(70, 72, 88))
+	if running {
+		stopColor = rgb(42, 128, 74)
+	}
+	a.drawButton(hdc, a.btns[idx*2+1], "停止", idx*2+1, stopColor)
+
+	// status: colored dot + text, vertically centered on the buttons
+	dotX := stopX + btnW + 22
+	dotColor := uint32(rgb(150, 150, 160))
+	if running {
+		dotColor = rgb(80, 220, 120)
+	}
+	brDot := procCall(procCreateSolidBrush, uintptr(dotColor))
+	procEllipse.Call(hdc, uintptr(dotX), uintptr(y+btnH/2-4), uintptr(dotX+8), uintptr(y+btnH/2+4))
+	procDeleteObject.Call(brDot)
+	setTextColor(hdc, dotColor)
+	textOutW(hdc, dotX+14, y+btnH/2-8, ss, sn)
+
+	// detail line, centered, on its own reserved row so nothing overlaps
+	var detail string
+	if running {
+		ver, bt := exeMeta(exe)
+		portStr := "—"
+		if len(ports) > 0 {
+			portStr = ":" + itoa(ports[0])
+		}
+		detail = fmt.Sprintf("PID %d · %s · %s · 构建 %s", pid, portStr, ver, bt)
+	} else {
+		detail = "—"
+	}
+	ds, dn := utf16N(detail)
+	dw, _ := textExtent(hdc, ds, dn)
+	setTextColor(hdc, rgb(150, 160, 182))
+	textOutW(hdc, (w-int(dw))/2, y+btnH+8, ds, dn)
+
+	return y + btnH + 34
+}
+
+func (a *launcher) drawButton(hdc uintptr, r rect, label string, idx int, base uint32) {
+	if a.pressed == idx {
+		base = lighten(base, 0.18)
+	}
+	br := procCall(procCreateSolidBrush, uintptr(base))
+	procRoundRect.Call(hdc, uintptr(r.left), uintptr(r.top), uintptr(r.right), uintptr(r.bottom), 8, 8)
+	procDeleteObject.Call(br)
+	brB := procCall(procCreateSolidBrush, uintptr(lighten(base, 0.35)))
+	frameRect(hdc, int(r.left), int(r.top), int(r.right), int(r.bottom), brB)
+	procDeleteObject.Call(brB)
+	s, n := utf16N(label)
+	sw, sh := textExtent(hdc, s, n)
+	setTextColor(hdc, rgb(240, 244, 250))
+	textOutW(hdc, int(r.left)+(int(r.right-r.left)-int(sw))/2, int(r.top)+(int(r.bottom-r.top)-int(sh))/2, s, n)
+}
+
+func lerpColor(c1, c2 uint32, t float64) uint32 {
+	r1, g1, b1 := int(c1&0xFF), int((c1>>8)&0xFF), int((c1>>16)&0xFF)
+	r2, g2, b2 := int(c2&0xFF), int((c2>>8)&0xFF), int((c2>>16)&0xFF)
+	blend := func(a, b int) int { return a + int(float64(b-a)*t) }
+	return uint32(blend(r1, r2)) | uint32(blend(g1, g2))<<8 | uint32(blend(b1, b2))<<16
+}
+
+func lighten(c uint32, f float64) uint32 {
+	clamp := func(v int) int {
+		if v > 255 {
+			return 255
+		}
+		return v
+	}
+	r := int(c&0xFF) + int(255*f)
+	g := int((c>>8)&0xFF) + int(255*f)
+	b := int((c>>16)&0xFF) + int(255*f)
+	return uint32(clamp(r)) | uint32(clamp(g))<<8 | uint32(clamp(b))<<16
 }
 
 func itoa(n int) string {
