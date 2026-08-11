@@ -211,12 +211,16 @@ func DecodeRawMultiScale(img image.Image, scales []float64) ([]byte, error) {
 	// Fallback: the sender's range frame often gets boxed in with the code —
 	// its border lines make gozxing read the format information wrong
 	// (FormatException). Cropping the outer band then upscaling removes the
-	// interference and raises the module resolution. Verified to turn the
-	// previously-all-fail captures into decodes.
+	// interference and raises the module resolution. Several crop ratios cover
+	// tight and loose boxes alike; verified to turn previously-all-fail
+	// captures into decodes.
 	b := img.Bounds()
-	dx := int(float64(b.Dx()) * 0.06)
-	dy := int(float64(b.Dy()) * 0.06)
-	if b.Dx()-2*dx > 60 && b.Dy()-2*dy > 60 {
+	for _, cropPct := range []float64{0.03, 0.06, 0.10} {
+		dx := int(float64(b.Dx()) * cropPct)
+		dy := int(float64(b.Dy()) * cropPct)
+		if b.Dx()-2*dx < 60 || b.Dy()-2*dy < 60 {
+			continue
+		}
 		cropped := image.NewRGBA(image.Rect(0, 0, b.Dx()-2*dx, b.Dy()-2*dy))
 		for y := 0; y < cropped.Bounds().Dy(); y++ {
 			for x := 0; x < cropped.Bounds().Dx(); x++ {
