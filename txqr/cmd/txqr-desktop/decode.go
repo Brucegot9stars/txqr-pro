@@ -5,6 +5,9 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"image"
+	"image/png"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -26,12 +29,37 @@ type decodeState struct {
 	lastTime  time.Time
 	frames    int
 	bytes     int64
-	captured  int // QR decode attempts
-	decodeFail int // attempts that yielded no payload
+	captured  int     // QR decode attempts
+	decodeFail int    // attempts that yielded no payload
+	savedDebug int    // debug frames written
 	completed bool
 	result    []byte
 	fileName  string
 	mode      string // "decimen" or "txqr"
+}
+
+// debugFramesOn enables saving undecodable captures to the temp dir when the
+// environment variable is set — a field-diagnosis aid for "nothing decodes".
+func debugFramesOn() bool {
+	return os.Getenv("QRT_DEBUG_FRAMES") == "1"
+}
+
+func (s *decodeState) saveDebugFrame(rgba *image.RGBA) {
+	if !debugFramesOn() || s.savedDebug >= 10 {
+		return
+	}
+	dir := filepath.Join(os.TempDir(), "qrt-debug")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	name := filepath.Join(dir, fmt.Sprintf("fail_%d_%dx%d.png", s.savedDebug, rgba.Bounds().Dx(), rgba.Bounds().Dy()))
+	f, err := os.Create(name)
+	if err != nil {
+		return
+	}
+	png.Encode(f, rgba)
+	f.Close()
+	s.savedDebug++
 }
 
 func (s *decodeState) reset() {
@@ -60,6 +88,7 @@ func (s *decodeState) feed(rgba *image.RGBA) bool {
 	s.captured++
 	if err != nil || payload == nil {
 		s.decodeFail++
+		s.saveDebugFrame(rgba)
 		return false
 	}
 	if s.completed {

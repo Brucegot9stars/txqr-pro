@@ -75,10 +75,83 @@ func decodeOnce(img image.Image, pure bool) (*gozxing.Result, error) {
 		hints[gozxing.DecodeHintType_PURE_BARCODE] = true
 	} else {
 		// The full detector asserts this hint unconditionally; an absent key
-		// panics gozxing, so a no-op callback keeps it quiet.
+		// panics gozxing, so a no-op callback keeps it quiet. TRY_HARDER makes
+		// the detector search harder — the difference between a synthetic
+		// render and a blurred/scaled real screen capture.
 		hints[gozxing.DecodeHintType_NEED_RESULT_POINT_CALLBACK] = gozxing.ResultPointCallback(func(gozxing.ResultPoint) {})
+		hints[gozxing.DecodeHintType_TRY_HARDER] = true
 	}
 	return zqrcode.NewQRCodeReader().Decode(bitmap, hints)
+}
+
+// scaleBilinear resizes an image with bilinear interpolation (stdlib-only
+// replacement for golang.org/x/image/draw's ApproxBiLinear). Used to shrink
+// oversized screen captures and to simulate display-scaling blur in tests.
+func scaleBilinear(img image.Image, nw, nh int) image.Image {
+	b := img.Bounds()
+	dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
+	sx := func(x int) (int, int, float64) {
+		f := float64(x) * float64(b.Dx()) / float64(nw)
+		i := int(f)
+		if i >= b.Dx()-1 {
+			return b.Dx() - 1, b.Dx() - 1, 0
+		}
+		return i, i + 1, f - float64(i)
+	}
+	sy := func(y int) (int, int, float64) {
+		f := float64(y) * float64(b.Dy()) / float64(nh)
+		i := int(f)
+		if i >= b.Dy()-1 {
+			return b.Dy() - 1, b.Dy() - 1, 0
+		}
+		return i, i + 1, f - float64(i)
+	}
+	sample := func(x, y int) [4]float64 {
+		r, g, bb, aa := img.At(x, y).RGBA()
+		return [4]float64{float64(r), float64(g), float64(bb), float64(aa)}
+	}
+	for y := 0; y < nh; y++ {
+		y0, y1, wy := sy(y)
+		for x := 0; x < nw; x++ {
+			x0, x1, wx := sx(x)
+			c00 := sample(x0, y0)
+			c10 := sample(x1, y0)
+			c01 := sample(x0, y1)
+			c11 := sample(x1, y1)
+			var o [4]float64
+			for i := 0; i < 4; i++ {
+				top := c00[i]*(1-wx) + c10[i]*wx
+				bot := c01[i]*(1-wx) + c11[i]*wx
+				o[i] = top*(1-wy) + bot*wy
+			}
+			pix := dst.Pix[dst.PixOffset(x, y):]
+			for i := 0; i < 4; i++ {
+				v := int(o[i] + 0.5)
+				if v > 0xFFFF {
+					v = 0xFFFF
+				}
+				pix[i] = byte(v >> 8)
+			}
+		}
+	}
+	return dst
+}
+
+// scaleForDecode shrinks oversized captures (a full-screen region on a big
+// monitor) so gozxing's detector and binarizer run on a sane resolution.
+// A V40 code needs ~2px/module; 1500px still gives ~8px/module.
+func scaleForDecode(img image.Image) image.Image {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	maxd := w
+	if h > maxd {
+		maxd = h
+	}
+	if maxd <= 1500 {
+		return img
+	}
+	s := 1500.0 / float64(maxd)
+	return scaleBilinear(img, int(float64(w)*s), int(float64(h)*s))
 }
 
 // DecodeRaw decodes a QR and returns the raw decoded byte stream. Unlike
@@ -91,6 +164,7 @@ func decodeOnce(img image.Image, pure bool) (*gozxing.Result, error) {
 // margin, edges and background); if that fails, the pure-barcode fast path is
 // tried, which assumes the image is exactly the code.
 func DecodeRaw(img image.Image) ([]byte, error) {
+	img = scaleForDecode(img)
 	result, err := decodeOnce(img, false)
 	if err != nil {
 		result, err = decodeOnce(img, true)

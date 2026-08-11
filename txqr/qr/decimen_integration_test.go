@@ -128,3 +128,55 @@ func TestScreenCaptureDecode(t *testing.T) {
 		t.Fatalf("screen capture frame mismatch: %v", len(got))
 	}
 }
+
+// TestScaledScreenCaptureDecode renders a V40 code at native size, then
+// rescales it to a non-integer module size with bilinear smoothing — what a
+// display-scaled monitor capture looks like — and checks it still decodes.
+func TestScaledScreenCaptureDecode(t *testing.T) {
+	payload := make([]byte, 60000)
+	for i := range payload {
+		payload[i] = byte((i*37 + (i>>8)*11) & 0xff)
+	}
+	container, _, err := decimen.PackContainer("scale.bin", "application/octet-stream", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const blockLen = 2933
+	enc := decimen.NewEncoder(container, blockLen, 0xabcd)
+	hdr := decimen.Header{
+		SessionId:  0xabcd, K: enc.K, BlockLen: blockLen,
+		TotalLen:   uint32(len(container)),
+		PayloadFnv: decimen.Fnv1a(container),
+	}
+	h := hdr
+	h.Seq = 0
+	frame := decimen.PackFrame(h, enc.Encode(0))
+
+	qrImg, err := EncodeVersioned(string(frame), 520, Low, 40, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 520px native -> 633px (1.217 scale): modules no longer land on integers,
+	// plus bilinear blur. Then place on a white canvas like a screen region.
+	src := toRGBA(qrImg)
+	dst := scaleBilinear(src, 633, 633)
+
+	canvas := image.NewRGBA(image.Rect(0, 0, 900, 800))
+	draw.Draw(canvas, canvas.Bounds(), image.White, image.Point{}, draw.Src)
+	draw.Draw(canvas, image.Rect(90, 60, 90+633, 60+633), dst, image.Point{}, draw.Src)
+
+	raw, err := DecodeRaw(canvas)
+	if err != nil {
+		t.Fatalf("scaled capture decode failed: %v", err)
+	}
+	got := ExtractFramePayload(raw)
+	if got == nil || !bytes.Equal(got, frame) {
+		t.Fatalf("scaled capture frame mismatch")
+	}
+}
+
+func toRGBA(img image.Image) *image.RGBA {
+	b := image.NewRGBA(img.Bounds())
+	draw.Draw(b, b.Bounds(), img, img.Bounds().Min, draw.Src)
+	return b
+}
