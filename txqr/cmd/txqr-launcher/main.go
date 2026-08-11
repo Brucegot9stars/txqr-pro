@@ -375,11 +375,15 @@ func exeRunning(prefix string) (bool, uint32) {
 
 // listenPorts returns the TCP listen ports owned by pid, parsed from
 // `netstat -ano -p tcp` (covers both IPv4 and IPv6 — Go's ":9000" binds IPv6).
+// CREATE_NO_WINDOW keeps the console netstat spawns from flashing a black box
+// over this GUI app.
 func listenPorts(pid uint32) []int {
 	if pid == 0 {
 		return nil
 	}
-	out, err := exec.Command("netstat", "-ano", "-p", "tcp").Output()
+	cmd := exec.Command("netstat", "-ano", "-p", "tcp")
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000} // CREATE_NO_WINDOW
+	out, err := cmd.Output()
 	if err != nil {
 		return nil
 	}
