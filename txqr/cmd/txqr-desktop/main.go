@@ -330,10 +330,10 @@ func (a *app) paintMain(hdc uintptr) {
 		case !r.scanning:
 			state = "已停止"
 		}
-		line := fmt.Sprintf("%s · %s · %s", r.label, state, st)
+		line := fmt.Sprintf("%s · %s · %d%% · %s", r.label, state, p, st)
 		ls, ln := utf16N(line)
 		textOutW(hdc, 12, lineY, ls, ln)
-		// small progress bar per region
+		// small progress bar per region, with the percentage printed on it
 		pr := rect{12, int32(lineY + 20), int32(cx - 12), int32(lineY + 34)}
 		fillRect(hdc, &pr, brTrack)
 		if p > 0 {
@@ -346,6 +346,13 @@ func (a *app) paintMain(hdc uintptr) {
 				fillRect(hdc, &rect{pr.left, pr.top, pr.left + fw, pr.bottom}, brush)
 			}
 		}
+		// percentage label centered on the bar
+		pct := itoa(p) + "%"
+		ps, pn := utf16N(pct)
+		pw, ph := textExtent(hdc, ps, pn)
+		setTextColor(hdc, rgb(255, 255, 255))
+		textOutW(hdc, int(pr.left)+(int(pr.right-pr.left)-int(pw))/2, int(pr.top)+(int(pr.bottom-pr.top)-int(ph))/2, ps, pn)
+		setTextColor(hdc, rgb(235, 238, 245))
 		lineY += 42
 	}
 
@@ -387,8 +394,7 @@ func (a *app) paintMain(hdc uintptr) {
 	deleteObject(brPV)
 }
 
-func (a *app) anyScanning() bool {
-	for _, r := range a.regions {
+func (a *app) anyScanning() bool {	for _, r := range a.regions {
 		if r.scanning {
 			return true
 		}
@@ -720,9 +726,21 @@ func utf16Buf(s string) []uint16 {
 func fileFilter(name, pattern string) *uint16 {
 	var u []uint16
 	for _, part := range []string{name, pattern} {
-		u = append(u, utf16Buf(part)...)
-		u = append(u, 0)
-	}
+	u = append(u, utf16Buf(part)...)
 	u = append(u, 0)
-	return &u[0]
+}
+u = append(u, 0)
+return &u[0]
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b []byte
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	return string(b)
 }
