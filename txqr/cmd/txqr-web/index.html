@@ -319,7 +319,7 @@ function showFrame() {
   statsEl.textContent =
     '帧 ' + (base + 1) + '/' + session.count +
     ' | 网格 ' + session.dims.cols + 'x' + session.dims.rows +
-    ' | 已发送 ' + bytesFmt(shownBytes) +
+    ' | 已播放 ' + bytesFmt(shownBytes) +
     ' | ' + bytesFmt(rateFile) + '/s';
   setTimeout(showFrame, 1000 / session.fps);
 }
@@ -371,7 +371,7 @@ function decimenTick(now) {
       '帧 ' + seqCursor +
       ' | 网格 ' + session.dims.cols + 'x' + session.dims.rows +
       ' | K=' + session.k + ' | ' + session.blockLen + 'B/帧' +
-      ' | 已发送 ' + bytesFmt(shownBytes) +
+      ' | 已播放 ' + bytesFmt(shownBytes) +
       ' | ' + bytesFmt(rateFile) + '/s' +
       ' | session ' + session.sessionId;
   }
