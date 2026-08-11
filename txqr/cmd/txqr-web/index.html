@@ -24,7 +24,11 @@
   #overlay.active { display:block; }
   #qrwrap { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; }
   #qr { width:min(92vw, 90vh); image-rendering:pixelated; }
-  #grid { display:grid; gap:6px; width:min(92vw, 90vh); height:min(92vw, 90vh); background:#000; }
+  /* The QR range frame: marks exactly where the codes are so a desktop
+     receiver knows what box to draw around them. Kept outside the codes
+     (margin + border) so it never interferes with decoding. */
+  #grid { display:grid; gap:6px; width:min(92vw, 90vh); height:min(92vw, 90vh); background:#000; position:relative; margin-top:26px; border:4px solid rgba(0,220,120,.9); outline:1px dashed rgba(255,255,255,.35); outline-offset:6px; box-shadow:0 0 20px rgba(0,220,120,.35); }
+  #grid::after { content:'二维码区域 ── 接收端框选此处'; position:absolute; left:50%; top:-26px; transform:translateX(-50%); background:rgba(0,220,120,.92); color:#00110a; font-size:12px; font-weight:bold; padding:2px 10px; border-radius:4px; white-space:nowrap; z-index:5; pointer-events:none; }
   #grid img { width:100%; height:100%; image-rendering:pixelated; }
   #stats { position:fixed; top:8px; left:0; right:0; text-align:center; font-size:13px; font-family:Consolas,monospace; opacity:.85; z-index:11; pointer-events:none; text-shadow:0 0 4px #000; }
   #hint { margin-top:10px; font-size:12px; opacity:.55; }
@@ -131,30 +135,31 @@ codecInput.addEventListener('change', () => {
   onlineParams.style.display = codecInput.value === 'online' ? 'block' : 'none';
 });
 
-// Decimen and Color Matrix are mutually exclusive. Decimen pins its own
-// wire constants (V40-L, mask 4, ECC L, blockLen 2933), so the split/codec
-// knobs that don't apply are disabled rather than silently ignored.
+// Decimen and Color Matrix are mutually exclusive. Decimen pins the reference
+// sender's parameters (2953 B/frame V40-L, ECC L, mask 4, 60 fps, 2 codes) —
+// the knobs that don't apply (split/codec/fps/grid) are all disabled so the
+// mode is never dragged around by classic-mode settings.
+const DECIMEN_FPS = 60;
+const DECIMEN_CODES = 2; // 1×2, the reference's phone-to-phone grid
 function applyDecimenMode() {
   if (decimenModeInput.checked) {
     colorModeInput.checked = false;
     splitInput.disabled = true;
     codecInput.disabled = true;
+    fpsInput.disabled = true;
+    gridInput.disabled = true;
     onlineParams.style.display = 'none';
     colorModeInput.disabled = true;
-    if (!fpsInput.dataset.userTouched) fpsInput.value = 60;
-    if (!gridInput.dataset.userTouched) gridInput.value = 4;
   } else {
     splitInput.disabled = false;
     codecInput.disabled = false;
+    fpsInput.disabled = false;
+    gridInput.disabled = false;
     colorModeInput.disabled = false;
     codecInput.dispatchEvent(new Event('change'));
   }
 }
 decimenModeInput.addEventListener('change', applyDecimenMode);
-// The knob is on by default: apply its defaults (60 fps, 4-cell grid) as soon
-// as the script loads, while still letting a manual tweak win afterwards.
-fpsInput.addEventListener('input', function () { fpsInput.dataset.userTouched = '1'; });
-gridInput.addEventListener('input', function () { gridInput.dataset.userTouched = '1'; });
 applyDecimenMode();
 colorModeInput.addEventListener('change', () => {
   if (colorModeInput.checked) decimenModeInput.checked = false;
@@ -179,11 +184,21 @@ function bytesFmt(n) {
   return n + ' B';
 }
 
-function buildTiles(cols) {
+// gridDims mirrors the reference: count of codes -> {cols, rows}.
+function gridDims(n) {
+  const cols = Math.floor(Math.sqrt(n));
+  const rows = Math.ceil(n / Math.max(1, cols));
+  return { cols, rows };
+}
+
+// buildTiles creates one tile per code, laid out per gridDims (1 → 1×1,
+// 2 → 1×2, 4 → 2×2). Classic mode passes cols*cols, decimen passes its code count.
+function buildTiles(codes, dims) {
   gridEl.innerHTML = '';
-  gridEl.style.gridTemplateColumns = 'repeat(' + cols + ', 1fr)';
+  gridEl.style.gridTemplateColumns = 'repeat(' + dims.cols + ', 1fr)';
+  gridEl.style.gridTemplateRows = 'repeat(' + dims.rows + ', 1fr)';
   tiles = [];
-  for (let i = 0; i < cols * cols; i++) {
+  for (let i = 0; i < codes; i++) {
     const img = document.createElement('img');
     img.alt = 'QR';
     gridEl.appendChild(img);
@@ -220,9 +235,11 @@ async function updateFileMD5() {
 async function encodeFile() {
   const file = fileInput.files[0];
   if (!file) { statusEl.textContent = '请先选择文件'; return null; }
+  const decimen = decimenModeInput.checked;
+  // Decimen uses fixed reference parameters; only classic mode reads the knobs.
+  const fps = decimen ? DECIMEN_FPS : (parseFloat(fpsInput.value) || 15);
+  const cols = decimen ? DECIMEN_CODES : (parseInt(gridInput.value, 10) || 1);
   const split = parseInt(splitInput.value, 10) || 1024;
-  const fps = parseFloat(fpsInput.value) || 15;
-  const cols = parseInt(gridInput.value, 10) || 1;
   const codec = codecInput.value;
   const epsilon = parseFloat(epsilonInput.value) || 0.01;
   const quality = parseInt(qualityInput.value, 10) || 3;
@@ -232,7 +249,6 @@ async function encodeFile() {
   encodeAbort = new AbortController();
   statusEl.textContent = '编码中...（点击「取消序列化」可中止）';
   try {
-    const decimen = decimenModeInput.checked;
     let url;
     if (decimen) {
       url = '/encode?mode=decimen'
@@ -252,7 +268,8 @@ async function encodeFile() {
     return {
       id: data.id, count: data.count, total: data.total,
       fps: fps, split: data.split || split, cols: cols,
-      file: file.name, size: file.size, md5: data.md5,
+      codes: decimen ? DECIMEN_CODES : cols * cols,
+      dims: gridDims(decimen ? DECIMEN_CODES : cols * cols),
       carousel: !!data.carousel, k: data.k, sessionId: data.sessionId, blockLen: data.blockLen || data.split || split,
     };
   } catch (e) {
@@ -281,7 +298,7 @@ async function start() {
   startTime = performance.now();
   paused = false;
   pauseBtn.textContent = '暂停';
-  buildTiles(session.cols);
+  buildTiles(session.codes, session.dims);
   running = true;
   overlay.classList.add('active');
   if (session.carousel) startDecimenLoop();
@@ -290,7 +307,7 @@ async function start() {
 
 function showFrame() {
   if (!running || paused) return;
-  const n = session.cols * session.cols;
+  const n = session.codes;
   for (let i = 0; i < n; i++) {
     const frameIdx = (base + i) % session.count;
     tiles[i].src = '/frame/' + session.id + '/' + frameIdx;
@@ -301,7 +318,7 @@ function showFrame() {
   const rateFile = shownBytes / elapsed;
   statsEl.textContent =
     '帧 ' + (base + 1) + '/' + session.count +
-    ' | 网格 ' + session.cols + 'x' + session.cols +
+    ' | 网格 ' + session.dims.cols + 'x' + session.dims.rows +
     ' | 已发送 ' + bytesFmt(shownBytes) +
     ' | ' + bytesFmt(rateFile) + '/s';
   setTimeout(showFrame, 1000 / session.fps);
@@ -323,7 +340,7 @@ function togglePause() {
 // transition — with simultaneous flips the same exposure would lose them all.
 function startDecimenLoop() {
   if (!session) return;
-  const n = session.cols * session.cols;
+  const n = session.codes;
   const interval = 1000 / session.fps;
   const sub = interval / n;
   const now = performance.now();
@@ -334,7 +351,7 @@ function startDecimenLoop() {
 
 function decimenTick(now) {
   if (!running || paused || !session || !session.carousel) return;
-  const n = session.cols * session.cols;
+  const n = session.codes;
   const interval = 1000 / session.fps;
   const sub = interval / n;
   let flipped = false;
@@ -352,7 +369,7 @@ function decimenTick(now) {
     const rateFile = shownBytes / elapsed;
     statsEl.textContent =
       '帧 ' + seqCursor +
-      ' | 网格 ' + session.cols + 'x' + session.cols +
+      ' | 网格 ' + session.dims.cols + 'x' + session.dims.rows +
       ' | K=' + session.k + ' | ' + session.blockLen + 'B/帧' +
       ' | 已发送 ' + bytesFmt(shownBytes) +
       ' | ' + bytesFmt(rateFile) + '/s' +
