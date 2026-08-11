@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -61,12 +62,13 @@ func rgb(r, g, b uint8) uint32 {
 // scanRegion is one user-selected screen rectangle being scanned
 // independently — the receiver supports several at once, one per monitor.
 type scanRegion struct {
-	rect     rect
-	st       decodeState
-	scanning bool
-	serial   int
-	done     bool
-	label    string
+	rect         rect
+	st           decodeState
+	scanning     bool
+	serial       int
+	done         bool
+	doneNotified int32 // atomic: completed notification sent at most once
+	label        string
 }
 
 // decJob carries one captured frame to the decode worker pool. The RGBA is
@@ -486,9 +488,13 @@ func (a *app) decWorker() {
 			continue
 		}
 		if job.r.st.feedPayload(payload) {
-			job.r.done = true
-			a.stopRegion(job.r)
-			procPostMessageW.Call(a.hwnd, wmAppDone, 0, 0)
+			// Several workers can finish the same transfer concurrently; only
+			// the first posts the save prompt (else "saved" then it pops again).
+			if atomic.CompareAndSwapInt32(&job.r.doneNotified, 0, 1) {
+				job.r.done = true
+				a.stopRegion(job.r)
+				procPostMessageW.Call(a.hwnd, wmAppDone, 0, 0)
+			}
 		}
 	}
 }
