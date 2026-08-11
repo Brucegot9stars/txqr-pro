@@ -551,21 +551,9 @@ func (a *app) paintOverlay(hdc uintptr) {
 	if a.selBuf == nil {
 		return
 	}
+	// frozen desktop as the backdrop (screenshot-tool style)
 	stretchDIBits(hdc, 0, 0, a.selW, a.selH, 0, 0, a.selW, a.selH,
 		uintptr(unsafe.Pointer(&a.selBuf[0])), &a.selInfo)
-
-	brDim := createSolidBrush(rgb(28, 28, 34))
-	brSel := createSolidBrush(rgb(0, 220, 120))
-	defer deleteObject(brDim)
-	defer deleteObject(brSel)
-
-	if !a.dragging {
-		setBkMode(hdc, transparent)
-		setTextColor(hdc, rgb(255, 255, 255))
-		hintText := "拖拽框选二维码区域，Esc 取消"
-		hint, hn := utf16N(hintText)
-		textOutW(hdc, 24, 24, hint, hn)
-	}
 
 	var sx0, sy0, sx1, sy1 int32
 	if a.dragging {
@@ -577,13 +565,43 @@ func (a *app) paintOverlay(hdc uintptr) {
 		if sy0 > sy1 {
 			sy0, sy1 = sy1, sy0
 		}
-		// dim outside
-		fillRect(hdc, &rect{0, 0, int32(a.selW), sy0}, brDim)
-		fillRect(hdc, &rect{0, sy1, int32(a.selW), int32(a.selH)}, brDim)
-		fillRect(hdc, &rect{0, sy0, sx0, sy1}, brDim)
-		fillRect(hdc, &rect{sx1, sy0, int32(a.selW), sy1}, brDim)
+		// Semi-transparent dim outside the selection (like every screenshot
+		// tool): blend a 45%-black overlay so the background stays visible
+		// enough to aim the box.
+		mem := createCompatibleDC(hdc)
+		bmp := createCompatibleBitmap(hdc, a.selW, a.selH)
+		old := selectObject(mem, bmp)
+		brBlack := createSolidBrush(rgb(0, 0, 0))
+		fillRect(mem, &rect{0, 0, int32(a.selW), int32(a.selH)}, brBlack)
+		deleteObject(brBlack)
+		bf := blendfunction{blendOp: 0, sourceConstantAlpha: 115, alphaFormat: 0}
+		// four bands around the selection
+		alphaBlend(hdc, 0, 0, a.selW, int(sy0), mem, 0, 0, a.selW, int(sy0), bf)
+		alphaBlend(hdc, 0, int(sy1), a.selW, a.selH-int(sy1), mem, 0, int(sy1), a.selW, a.selH-int(sy1), bf)
+		alphaBlend(hdc, 0, int(sy0), int(sx0), int(sy1-sy0), mem, 0, int(sy0), int(sx0), int(sy1-sy0), bf)
+		alphaBlend(hdc, int(sx1), int(sy0), a.selW-int(sx1), int(sy1-sy0), mem, int(sx1), int(sy0), a.selW-int(sx1), int(sy1-sy0), bf)
+		selectObject(mem, old)
+		deleteObject(bmp)
+		deleteDC(mem)
+
+		// bright selection border + size label
+		brSel := createSolidBrush(rgb(0, 220, 120))
 		frameRect(hdc, &rect{sx0, sy0, sx1, sy1}, brSel)
+		deleteObject(brSel)
+
+		setBkMode(hdc, transparent)
+		setTextColor(hdc, rgb(255, 255, 255))
+		sz := fmt.Sprintf("%dx%d", int(sx1-sx0), int(sy1-sy0))
+		st, sn := utf16N(sz)
+		textOutW(hdc, int(sx0), int(sy0)-18, st, sn)
+		return
 	}
+
+	setBkMode(hdc, transparent)
+	setTextColor(hdc, rgb(255, 255, 255))
+	hintText := "拖拽框选二维码区域，Esc 取消"
+	hint, hn := utf16N(hintText)
+	textOutW(hdc, 24, 24, hint, hn)
 }
 
 // ------------------------------------------------------------ save

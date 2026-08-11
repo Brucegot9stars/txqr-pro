@@ -14,6 +14,7 @@ var (
 	user32   = windows.NewLazySystemDLL("user32.dll")
 	gdi32    = windows.NewLazySystemDLL("gdi32.dll")
 	comdlg32 = windows.NewLazySystemDLL("comdlg32.dll")
+	msimg32  = windows.NewLazySystemDLL("msimg32.dll")
 
 	procGetModuleHandleW    = kernel32.NewProc("GetModuleHandleW")
 	procGetDC               = user32.NewProc("GetDC")
@@ -61,7 +62,18 @@ var (
 	procStretchDIBits          = gdi32.NewProc("StretchDIBits")
 
 	procGetSaveFileNameW = comdlg32.NewProc("GetSaveFileNameW")
+	procAlphaBlend        = msimg32.NewProc("AlphaBlend")
 )
+
+// blendfunction mirrors the Win32 BLENDFUNCTION used by AlphaBlend.
+type blendfunction struct {
+	blendOp, blendFlags, sourceConstantAlpha, alphaFormat byte
+}
+
+func alphaBlend(dst uintptr, dx, dy, dw, dh int, src uintptr, sx, sy, sw, sh int, bf blendfunction) {
+	procAlphaBlend.Call(dst, uintptr(dx), uintptr(dy), uintptr(dw), uintptr(dh), src,
+		uintptr(sx), uintptr(sy), uintptr(sw), uintptr(sh), uintptr(unsafe.Pointer(&bf)))
+}
 
 const (
 	srcCopy      = 0x00CC0020
