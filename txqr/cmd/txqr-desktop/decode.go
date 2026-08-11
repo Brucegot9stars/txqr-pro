@@ -77,6 +77,17 @@ func (s *decodeState) reset() {
 // feed decodes one captured frame and routes it to the decimen or classic
 // decoder. Returns true when the transfer just completed.
 func (s *decodeState) feed(rgba *image.RGBA) bool {
+	payload := s.decode(rgba)
+	if payload == nil {
+		return false
+	}
+	return s.feedPayload(payload)
+}
+
+// decode runs gozxing on a frame and updates counters. Thread-safe against
+// other decoders (each region's decodeState is independent), so multiple
+// capture workers can decode in parallel.
+func (s *decodeState) decode(rgba *image.RGBA) []byte {
 	// try native, then smaller, then larger — a real capture can have the QR
 	// at any relative size in the boxed region
 	raw, err := qr.DecodeRawMultiScale(rgba, []float64{1.0, 0.6, 1.7})
@@ -88,8 +99,17 @@ func (s *decodeState) feed(rgba *image.RGBA) bool {
 	if err != nil || payload == nil {
 		s.decodeFail++
 		s.saveDebugFrame(rgba)
-		return false
+		return nil
 	}
+	return payload
+}
+
+// feedPayload hands a decoded frame to the (single) decoder. Serialized per
+// region — the LT/txqr decoders are not thread-safe, so only one caller feeds
+// at a time. Cheap (µs), so it never becomes the bottleneck.
+func (s *decodeState) feedPayload(payload []byte) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.completed {
 		return true
 	}

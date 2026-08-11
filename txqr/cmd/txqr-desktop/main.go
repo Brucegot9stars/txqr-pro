@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"image"
 	"os"
 	"runtime"
 	"sync"
@@ -68,12 +69,24 @@ type scanRegion struct {
 	label    string
 }
 
+// decJob carries one captured frame to the decode worker pool. The RGBA is
+// owned by the worker (capture allocates a fresh one per frame). gen is the
+// scan generation the frame belongs to, so stale frames from an old scan can
+// be dropped instead of poisoning a fresh decoder or stopping it early.
+type decJob struct {
+	r    *scanRegion
+	gen  int
+	rgba *image.RGBA
+}
+
 type app struct {
 	hwnd     uintptr
 	hinst    uintptr
 	btns     [6]rect
 	btnText  [6]string
 	saveFails bool // keep undecodable frames to %TEMP%\qrt-debug
+
+	decQueue chan decJob // frames waiting for a decode worker (bounded; drop when full)
 
 	regions []*scanRegion
 
@@ -149,6 +162,21 @@ func main() {
 	a.hwnd = hwnd
 	procShowWindow.Call(hwnd, swShow)
 	procUpdateWindow.Call(hwnd)
+
+	// Decode worker pool: capture threads never block on gozxing; each worker
+	// decodes frames in parallel (gozxing is CPU-bound and shares no state),
+	// then feeds the (serial) decoder.
+	nworkers := 4
+	if p := runtime.GOMAXPROCS(0); p > nworkers {
+		nworkers = p
+	}
+	if nworkers > 8 {
+		nworkers = 8
+	}
+	a.decQueue = make(chan decJob, nworkers*2)
+	for i := 0; i < nworkers; i++ {
+		go a.decWorker()
+	}
 
 	var m msg
 	for {
@@ -389,6 +417,10 @@ func (a *app) stopRegion(r *scanRegion) {
 	r.serial++
 }
 
+// runCapture captures the region at a fixed cadence and submits each frame to
+// the decode pool; decoding happens on workers, so a slow frame never stalls
+// the capture cadence. Frames are dropped when all workers are busy — a stale
+// frame is worth less than the next one.
 func (a *app) runCapture(r *scanRegion, gen int) {
 	for {
 		if !r.scanning || gen != r.serial {
@@ -414,18 +446,35 @@ func (a *app) runCapture(r *scanRegion, gen int) {
 				biBitCount: 32,
 			}}
 			a.mu.Unlock()
-			done := r.st.feed(rgba)
-			procPostMessageW.Call(a.hwnd, wmAppRefresh, 0, 0)
-			if done {
-				r.done = true
-				a.stopRegion(r)
-				procPostMessageW.Call(a.hwnd, wmAppDone, 0, 0)
-				return
+			select {
+			case a.decQueue <- decJob{r: r, gen: gen, rgba: rgba}:
+			default: // all workers busy: drop this frame
 			}
+			procPostMessageW.Call(a.hwnd, wmAppRefresh, 0, 0)
 		}
 		elapsed := time.Since(start)
-		if elapsed < 30*time.Millisecond {
-			time.Sleep(30*time.Millisecond - elapsed)
+		if elapsed < 16*time.Millisecond {
+			time.Sleep(16*time.Millisecond - elapsed)
+		}
+	}
+}
+
+// decWorker decodes frames from the pool and feeds the (single) decoder of
+// each region. Decoding is parallel across workers; feeding is serialized by
+// the decoder's own lock.
+func (a *app) decWorker() {
+	for job := range a.decQueue {
+		if job.r.serial != job.gen || !job.r.scanning {
+			continue // stale frame from a stopped/restarted scan
+		}
+		payload := job.r.st.decode(job.rgba)
+		if payload == nil {
+			continue
+		}
+		if job.r.st.feedPayload(payload) {
+			job.r.done = true
+			a.stopRegion(job.r)
+			procPostMessageW.Call(a.hwnd, wmAppDone, 0, 0)
 		}
 	}
 }
