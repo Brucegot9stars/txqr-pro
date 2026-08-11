@@ -241,7 +241,7 @@ func (s *decodeState) snapshot(byBlocks bool) (progress int, status string, done
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.completed {
-		return 100, "完成", true
+		return 100, "平均 " + fmtBytes(s.avgSpeedBps()) + "/s", true
 	}
 	p := 0
 	if s.decimenDec != nil {
@@ -288,13 +288,20 @@ func (s *decodeState) currentSpeedBps() int64 {
 			}
 		}
 	}
-	if s.bytes > 0 {
-		elapsed := time.Since(s.startTime)
-		if elapsed > 0 {
-			return int64(float64(s.bytes) / elapsed.Seconds())
-		}
+	return s.avgSpeedBps()
+}
+
+// avgSpeedBps is the whole-transfer effective-data rate: total deduplicated
+// parsed bytes over the entire session.
+func (s *decodeState) avgSpeedBps() int64 {
+	if s.bytes <= 0 {
+		return 0
 	}
-	return 0
+	elapsed := time.Since(s.startTime)
+	if elapsed <= 0 {
+		return 0
+	}
+	return int64(float64(s.bytes) / elapsed.Seconds())
 }
 
 // pushSpeedSample records cumulative effective bytes; used by the live speed.
