@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -81,6 +82,12 @@ type decJob struct {
 	rgba *image.RGBA
 }
 
+// saveJob hands a completed transfer's bytes to the single saver goroutine.
+type saveJob struct {
+	data []byte
+	name string
+}
+
 type app struct {
 	hwnd       uintptr
 	hinst      uintptr
@@ -89,7 +96,9 @@ type app struct {
 	saveFails  bool // keep undecodable frames to %TEMP%\qrt-debug
 	progressByBlocks bool // decimen progress flavor: solved blocks vs frames collected
 
-	decQueue chan decJob // frames waiting for a decode worker (bounded; drop when full)
+	decQueue  chan decJob   // frames waiting for a decode worker (bounded; drop when full)
+	saveQueue chan saveJob  // completed transfers waiting for the saver (never dropped)
+	lastSaved string        // most recently written path (shown on wmAppDone)
 
 	regions []*scanRegion
 
@@ -180,6 +189,10 @@ func main() {
 	for i := 0; i < nworkers; i++ {
 		go a.decWorker()
 	}
+	// The saver serializes disk writes for completed transfers; decode workers
+	// only enqueue and never block on file IO.
+	a.saveQueue = make(chan saveJob, 16)
+	go a.saver()
 
 	var m msg
 	for {
@@ -209,7 +222,12 @@ func (a *app) wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		procInvalidateRect.Call(hwnd, 0, 0)
 		return 0
 	case wmAppDone:
-		a.saveDialog()
+		a.mu.Lock()
+		saved := a.lastSaved
+		a.mu.Unlock()
+		if saved != "" {
+			messageBox(hwnd, "已保存: "+saved, "完成", 0)
+		}
 		return 0
 	case wmClose:
 		procDestroyWindow.Call(hwnd)
@@ -489,14 +507,56 @@ func (a *app) decWorker() {
 		}
 		if job.r.st.feedPayload(payload) {
 			// Several workers can finish the same transfer concurrently; only
-			// the first posts the save prompt (else "saved" then it pops again).
+			// the first hands the bytes to the saver.
 			if atomic.CompareAndSwapInt32(&job.r.doneNotified, 0, 1) {
 				job.r.done = true
 				a.stopRegion(job.r)
-				procPostMessageW.Call(a.hwnd, wmAppDone, 0, 0)
+				job.r.st.mu.Lock()
+				data, name := job.r.st.result, job.r.st.fileName
+				job.r.st.mu.Unlock()
+				if data != nil {
+					// Completion events are rare; block rather than drop.
+					a.saveQueue <- saveJob{data: data, name: name}
+				}
 			}
 		}
 	}
+}
+
+// saver is the single writer for completed transfers. It serializes disk I/O
+// off the decode workers, then tells the UI (which must show dialogs on its
+// own thread) the path it wrote.
+func (a *app) saver() {
+	for job := range a.saveQueue {
+		path := saveToDisk(job)
+		a.mu.Lock()
+		a.lastSaved = path
+		a.mu.Unlock()
+		procPostMessageW.Call(a.hwnd, wmAppDone, 0, 0)
+	}
+}
+
+// saveToDisk writes a completed transfer to the user's Downloads folder
+// (falling back to the current directory) and returns the path.
+func saveToDisk(job saveJob) string {
+	name := job.name
+	if name == "" {
+		name = fmt.Sprintf("received_%d.bin", time.Now().Unix())
+	}
+	name = filepath.Base(name)
+	dir := ""
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		dir = filepath.Join(home, "Downloads")
+	}
+	if dir != "" {
+		os.MkdirAll(dir, 0o755)
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, job.data, 0o644); err != nil {
+		path = name
+		os.WriteFile(path, job.data, 0o644)
+	}
+	return path
 }
 
 // ------------------------------------------------------------ selection overlay
