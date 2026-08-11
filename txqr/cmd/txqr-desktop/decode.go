@@ -38,14 +38,14 @@ type decodeState struct {
 	mode      string // "decimen" or "txqr"
 }
 
-// debugFramesOn enables saving undecodable captures to the temp dir when the
-// environment variable is set — a field-diagnosis aid for "nothing decodes".
+// debugFramesOn is true when undecodable captures are dumped to the temp dir
+// for diagnosis. Always on (capped) so a failing session leaves evidence.
 func debugFramesOn() bool {
-	return os.Getenv("QRT_DEBUG_FRAMES") == "1"
+	return true
 }
 
 func (s *decodeState) saveDebugFrame(rgba *image.RGBA) {
-	if !debugFramesOn() || s.savedDebug >= 10 {
+	if !debugFramesOn() || s.savedDebug >= 20 {
 		return
 	}
 	dir := filepath.Join(os.TempDir(), "qrt-debug")
@@ -80,7 +80,9 @@ func (s *decodeState) reset() {
 // feed decodes one captured frame and routes it to the decimen or classic
 // decoder. Returns true when the transfer just completed.
 func (s *decodeState) feed(rgba *image.RGBA) bool {
-	raw, err := qr.DecodeRaw(rgba)
+	// try native, then smaller, then larger — a real capture can have the QR
+	// at any relative size in the boxed region
+	raw, err := qr.DecodeRawMultiScale(rgba, []float64{1.0, 0.6, 1.7})
 	payload := qr.ExtractFramePayload(raw)
 
 	s.mu.Lock()

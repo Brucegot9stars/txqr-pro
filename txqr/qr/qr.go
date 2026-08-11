@@ -175,6 +175,38 @@ func DecodeRaw(img image.Image) ([]byte, error) {
 	return result.GetRawBytes(), nil
 }
 
+// DecodeRawMultiScale decodes a QR trying several image scales in order,
+// returning the first result that yields a real frame payload. Real screen
+// captures can place the code at any relative size; gozxing's detector works
+// best when the code is neither tiny nor enormous in the frame, so a downscale
+// often turns a "too small relative to the box" miss into a hit.
+func DecodeRawMultiScale(img image.Image, scales []float64) ([]byte, error) {
+	var lastErr error
+	for _, s := range scales {
+		w, h := img.Bounds().Dx(), img.Bounds().Dy()
+		nw, nh := int(float64(w)*s), int(float64(h)*s)
+		if nw < 8 || nh < 8 {
+			continue
+		}
+		cand := img
+		if s != 1.0 {
+			cand = scaleBilinear(img, nw, nh)
+		}
+		raw, err := DecodeRaw(cand)
+		lastErr = err
+		if err != nil {
+			continue
+		}
+		if ExtractFramePayload(raw) != nil {
+			return raw, nil
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no payload at any scale")
+	}
+	return nil, lastErr
+}
+
 // bitReader reads MSB-first from a byte slice.
 type bitReader struct {
 	b   []byte
