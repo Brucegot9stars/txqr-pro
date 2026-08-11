@@ -14,7 +14,9 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -36,6 +38,7 @@ var (
 	procShowWindow       = user32.NewProc("ShowWindow")
 	procUpdateWindow     = user32.NewProc("UpdateWindow")
 	procInvalidateRect   = user32.NewProc("InvalidateRect")
+	procPostMessageW     = user32.NewProc("PostMessageW")
 	procBeginPaint       = user32.NewProc("BeginPaint")
 	procEndPaint         = user32.NewProc("EndPaint")
 	procSetTimer         = user32.NewProc("SetTimer")
@@ -67,7 +70,6 @@ var (
 	procTextOutW               = windows.NewLazySystemDLL("gdi32.dll").NewProc("TextOutW")
 	procGetTextExtentPoint32W  = windows.NewLazySystemDLL("gdi32.dll").NewProc("GetTextExtentPoint32W")
 	procGetClientRect          = user32.NewProc("GetClientRect")
-	procRoundRect              = windows.NewLazySystemDLL("gdi32.dll").NewProc("RoundRect")
 	procEllipse                = windows.NewLazySystemDLL("gdi32.dll").NewProc("Ellipse")
 )
 
@@ -158,17 +160,19 @@ type processEntry32 struct {
 }
 
 type launcher struct {
-	hwnd      uintptr
-	hinst     uintptr
-	dir       string
-	btns      [4]rect
-	sender    bool
-	receiver  bool
-	senderPID   uint32
-	receiverPID uint32
+	hwnd    uintptr
+	hinst   uintptr
+	dir     string
+	btns    [4]rect
+	pressed int // button index currently pressed (for press feedback)
+
+	mu            sync.Mutex // guards the process/port snapshot
+	sender        bool
+	receiver      bool
+	senderPID     uint32
+	receiverPID   uint32
 	senderPorts   []int // cached by refresh(); paint never spawns netstat
 	receiverPorts []int
-	pressed       int // button index currently pressed (for press feedback)
 }
 
 func procCall(p *windows.LazyProc, a ...uintptr) uintptr {
@@ -318,11 +322,19 @@ func (a *launcher) onButton(i int) {
 	case idxRecvStop:
 		stopProcess("qrt-pro-receiver")
 	}
-	a.refresh()
+	// Refresh off the UI thread so clicking never blocks on netstat; the
+	// next paint picks the new snapshot up when it's ready.
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		a.refresh()
+		procPostMessageW.Call(a.hwnd, wmTimer, timerRefresh, 0)
+	}()
 	procInvalidateRect.Call(a.hwnd, 0, 0)
 }
 
 func (a *launcher) refresh() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.sender, a.senderPID = exeRunning("qrt-pro-sender")
 	a.receiver, a.receiverPID = exeRunning("qrt-pro-receiver")
 	if a.sender {
@@ -497,8 +509,21 @@ func (a *launcher) paint(hdc uintptr) {
 		{"发送端 (txqr-web)", a.senderExe(), a.sender, a.senderPID, a.senderPorts},
 		{"桌面接收端 (框选扫描)", a.receiverExe(), a.receiver, a.receiverPID, a.receiverPorts},
 	}
+	// snapshot under the lock so the async refresh can't tear a row
+	a.mu.Lock()
+	rowData := []struct {
+		label, exe string
+		running    bool
+		pid        uint32
+		ports      []int
+	}{
+		{rows[0].label, a.senderExe(), a.sender, a.senderPID, a.senderPorts},
+		{rows[1].label, a.receiverExe(), a.receiver, a.receiverPID, a.receiverPorts},
+	}
+	a.mu.Unlock()
+
 	rowY := 66
-	for ri, row := range rows {
+	for ri, row := range rowData {
 		rowY = a.drawRow(hdc, w, rowY, ri, row.label, row.exe, row.running, row.pid, row.ports)
 	}
 
@@ -537,10 +562,10 @@ func (a *launcher) drawRow(hdc uintptr, w, y, idx int, label, exe string, runnin
 	stopX := startX + btnW + 10
 	a.btns[idx*2] = rect{int32(startX), int32(y), int32(startX + btnW), int32(y + btnH)}
 	a.btns[idx*2+1] = rect{int32(stopX), int32(y), int32(stopX + btnW), int32(y + btnH)}
-	a.drawButton(hdc, a.btns[idx*2], "启动", idx*2, rgb(52, 80, 150))
-	stopColor := uint32(rgb(70, 72, 88))
+	a.drawButton(hdc, a.btns[idx*2], "启动", idx*2, rgb(58, 104, 200))
+	stopColor := uint32(rgb(88, 90, 104))
 	if running {
-		stopColor = rgb(42, 128, 74)
+		stopColor = rgb(44, 148, 82)
 	}
 	a.drawButton(hdc, a.btns[idx*2+1], "停止", idx*2+1, stopColor)
 
@@ -577,18 +602,19 @@ func (a *launcher) drawRow(hdc uintptr, w, y, idx int, label, exe string, runnin
 }
 
 func (a *launcher) drawButton(hdc uintptr, r rect, label string, idx int, base uint32) {
+	fill := base
 	if a.pressed == idx {
-		base = lighten(base, 0.18)
+		fill = lighten(base, 0.28) // clear press feedback
 	}
-	br := procCall(procCreateSolidBrush, uintptr(base))
-	procRoundRect.Call(hdc, uintptr(r.left), uintptr(r.top), uintptr(r.right), uintptr(r.bottom), 8, 8)
+	br := procCall(procCreateSolidBrush, uintptr(fill))
+	fillRect(hdc, int(r.left), int(r.top), int(r.right), int(r.bottom), br)
 	procDeleteObject.Call(br)
-	brB := procCall(procCreateSolidBrush, uintptr(lighten(base, 0.35)))
+	brB := procCall(procCreateSolidBrush, uintptr(lighten(base, 0.45)))
 	frameRect(hdc, int(r.left), int(r.top), int(r.right), int(r.bottom), brB)
 	procDeleteObject.Call(brB)
 	s, n := utf16N(label)
 	sw, sh := textExtent(hdc, s, n)
-	setTextColor(hdc, rgb(240, 244, 250))
+	setTextColor(hdc, rgb(255, 255, 255))
 	textOutW(hdc, int(r.left)+(int(r.right-r.left)-int(sw))/2, int(r.top)+(int(r.bottom-r.top)-int(sh))/2, s, n)
 }
 
