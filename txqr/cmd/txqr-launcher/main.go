@@ -6,9 +6,13 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -139,12 +143,14 @@ type processEntry32 struct {
 }
 
 type launcher struct {
-	hwnd    uintptr
-	hinst   uintptr
-	dir     string
-	btns    [4]rect
-	sender  bool // running
+	hwnd     uintptr
+	hinst    uintptr
+	dir      string
+	btns     [4]rect
+	sender   bool
 	receiver bool
+	senderPID   uint32
+	receiverPID uint32
 }
 
 func procCall(p *windows.LazyProc, a ...uintptr) uintptr {
@@ -190,7 +196,7 @@ func main() {
 	hwnd := procCall(procCreateWindowExW, 0,
 		uintptr(unsafe.Pointer(utf16Ptr("QRTLauncher"))),
 		uintptr(unsafe.Pointer(utf16Ptr("QRT 启动器"))),
-		wsOverlapped|wsVisible, 200, 160, 460, 240, 0, 0, inst, 0)
+		wsOverlapped|wsVisible, 200, 140, 470, 250, 0, 0, inst, 0)
 	if hwnd == 0 {
 		return
 	}
@@ -282,32 +288,75 @@ func (a *launcher) onButton(i int) {
 }
 
 func (a *launcher) refresh() {
-	a.sender = exeRunning("qrt-pro-sender")
-	a.receiver = exeRunning("qrt-pro-receiver")
+	a.sender, a.senderPID = exeRunning("qrt-pro-sender")
+	a.receiver, a.receiverPID = exeRunning("qrt-pro-receiver")
 }
 
-// exeRunning reports whether any process's module name starts with prefix.
-func exeRunning(prefix string) bool {
+// exeRunning reports whether any process's module name starts with prefix, and
+// returns the first matching PID.
+func exeRunning(prefix string) (bool, uint32) {
 	snap := procCall(procCreateToolhelp32Snapshot, th32csSnapProcess, 0)
 	if snap == uintptr(^uintptr(0)) {
-		return false
+		return false, 0
 	}
 	defer procCloseHandle.Call(snap)
 	var pe processEntry32
 	pe.dwSize = uint32(unsafe.Sizeof(pe))
 	if procCall(procProcess32FirstW, snap, uintptr(unsafe.Pointer(&pe))) == 0 {
-		return false
+		return false, 0
 	}
 	for {
 		name := windows.UTF16ToString(pe.szExeFile[:])
 		if strings.HasPrefix(strings.ToLower(name), prefix) {
-			return true
+			return true, pe.th32ProcessID
 		}
 		if procCall(procProcess32NextW, snap, uintptr(unsafe.Pointer(&pe))) == 0 {
-			return false
+			return false, 0
 		}
 	}
 }
+
+// listenPorts returns the TCP listen ports owned by pid, parsed from
+// `netstat -ano -p tcp` (covers both IPv4 and IPv6 — Go's ":9000" binds IPv6).
+func listenPorts(pid uint32) []int {
+	if pid == 0 {
+		return nil
+	}
+	out, err := exec.Command("netstat", "-ano", "-p", "tcp").Output()
+	if err != nil {
+		return nil
+	}
+	pidStr := strconv.Itoa(int(pid))
+	var ports []int
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 || f[3] != "LISTENING" || f[4] != pidStr {
+			continue
+		}
+		local := f[1] // e.g. "0.0.0.0:9000" or "[::]:9000"
+		if i := strings.LastIndexByte(local, ':'); i >= 0 {
+			if p, err := strconv.Atoi(local[i+1:]); err == nil {
+				ports = append(ports, p)
+			}
+		}
+	}
+	return ports
+}
+
+// exeMeta extracts the version (from the filename, e.g. v1.3.0) and build
+// time (file modification time) of an exe for display.
+func exeMeta(exe string) (version, buildTime string) {
+	base := filepath.Base(exe)
+	if m := versionRe.FindString(base); m != "" {
+		version = m
+	}
+	if st, err := os.Stat(exe); err == nil {
+		buildTime = st.ModTime().Format("2006-01-02 15:04")
+	}
+	return version, buildTime
+}
+
+var versionRe = regexp.MustCompile(`v\d+\.\d+(\.\d+)?`)
 
 // startProcess launches exe with ShellExecute (GUI subsystem, no console).
 func startProcess(hwnd uintptr, exe, dir string) {
@@ -368,11 +417,14 @@ func (a *launcher) paint(hdc uintptr) {
 
 	rows := []struct {
 		label   string
+		exe     string
 		running bool
+		pid     uint32
 		rowY    int
+		detailY int
 	}{
-		{"发送端 (txqr-web · :9000)", a.sender, 44},
-		{"桌面接收端 (框选扫描)", a.receiver, 92},
+		{"发送端 (txqr-web)", a.senderExe(), a.sender, a.senderPID, 44, 78},
+		{"桌面接收端 (框选扫描)", a.receiverExe(), a.receiver, a.receiverPID, 104, 138},
 	}
 	for ri, row := range rows {
 		// label
@@ -413,11 +465,41 @@ func (a *launcher) paint(hdc uintptr) {
 		sl2, sln2 := utf16N(st)
 		textOutW(hdc, 416, row.rowY+7, sl2, sln2)
 		setTextColor(hdc, rgb(235, 238, 245))
+
+		// detail line: PID · port · version · build time
+		setTextColor(hdc, rgb(160, 170, 190))
+		var detail string
+		if row.running {
+			ver, bt := exeMeta(row.exe)
+			ports := listenPorts(row.pid)
+			portStr := "—"
+			if len(ports) > 0 {
+				portStr = ":" + itoa(ports[0])
+			}
+			detail = fmt.Sprintf("PID %d · %s · %s · 构建 %s", row.pid, portStr, ver, bt)
+		} else {
+			detail = "—"
+		}
+		dl, dln := utf16N(detail)
+		textOutW(hdc, 14, row.detailY, dl, dln)
+		setTextColor(hdc, rgb(235, 238, 245))
 	}
 
 	hint, hn := utf16N("提示：停止只匹配本工具的进程；launcher 自身不会被停止。")
 	setTextColor(hdc, rgb(130, 130, 150))
-	textOutW(hdc, 14, 150, hint, hn)
+	textOutW(hdc, 14, 180, hint, hn)
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b []byte
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	return string(b)
 }
 
 // ---- tiny GDI shims with plain int coords so paint() stays readable ----
