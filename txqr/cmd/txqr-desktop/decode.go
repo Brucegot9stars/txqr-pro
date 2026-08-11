@@ -39,6 +39,15 @@ type decodeState struct {
 	// SaveFails keeps undecodable captures to %TEMP%\qrt-debug when enabled
 	// (a diagnosis aid; writing every failed frame slows the receiver).
 	SaveFails bool
+
+	speedWnd []speedSample // sliding window of (time, effective bytes)
+}
+
+// speedSample records cumulative effective bytes at a moment; the window's
+// delta drives the live speed line.
+type speedSample struct {
+	t time.Time
+	b int64
 }
 
 func (s *decodeState) saveDebugFrame(rgba *image.RGBA) {
@@ -68,6 +77,7 @@ func (s *decodeState) reset() {
 	s.lastTime = time.Time{}
 	s.frames = 0
 	s.bytes = 0
+	s.speedWnd = nil
 	s.completed = false
 	s.result = nil
 	s.fileName = ""
@@ -141,6 +151,7 @@ func (s *decodeState) feedDecimenLocked(frame []byte) bool {
 	s.decimenDec.AddFrame(f.Header.Seq, f.Payload)
 	if s.decimenDec.FramesNew > before {
 		s.bytes += int64(len(f.Payload))
+		s.pushSpeedSample()
 	}
 	if s.decimenDec.IsComplete() {
 		container := s.decimenDec.Assemble()
@@ -167,6 +178,7 @@ func (s *decodeState) feedTxqrLocked(payload []byte) bool {
 	s.txqrDec.Decode(string(payload))
 	if s.txqrDec.Read() > before {
 		s.bytes += int64(len(payload))
+		s.pushSpeedSample()
 	}
 	if s.txqrDec.IsCompleted() {
 		s.completed = true
@@ -201,7 +213,15 @@ func (s *decodeState) snapshot() (progress int, status string, done bool) {
 	}
 	p := 0
 	if s.decimenDec != nil {
-		p = s.decimenDec.SolvedCount() * 100 / int(s.decimenHdr.K)
+		// Progress by frames COLLECTED (new seqs), not blocks solved: the
+		// peeling cascade back-loads — blocks solved hockey-sticks near the
+		// end (stalls ~50% then jumps), so solved-count progress looks frozen.
+		// The receiver needs about k*1.05 distinct frames to finish.
+		need := int(float64(s.decimenHdr.K) * 1.05)
+		if need < 1 {
+			need = 1
+		}
+		p = s.decimenDec.FramesNew * 100 / need
 		if p > 99 {
 			p = 99
 		}
@@ -218,18 +238,38 @@ func (s *decodeState) snapshot() (progress int, status string, done bool) {
 	return p, status, false
 }
 
-// currentSpeedBps is the effective-data rate: deduplicated parsed bytes over
-// the whole session so far. It never dips to 0 while valid frames arrive, even
-// when they come in slowly — a sliding window showed 0 between sparse samples.
+// currentSpeedBps is the live effective-data rate: a sliding ~5s window of
+// deduplicated parsed bytes. Falls back to the session average when the window
+// has fewer than two samples (sparse valid frames), so the line never shows a
+// bogus 0 between slow arrivals.
 func (s *decodeState) currentSpeedBps() int64 {
-	if s.bytes <= 0 {
-		return 0
+	if len(s.speedWnd) >= 2 {
+		last := s.speedWnd[len(s.speedWnd)-1]
+		first := s.speedWnd[0]
+		span := last.t.Sub(first.t)
+		if span > 0 {
+			delta := last.b - first.b
+			if delta > 0 {
+				return int64(float64(delta) / span.Seconds())
+			}
+		}
 	}
-	elapsed := time.Since(s.startTime)
-	if elapsed <= 0 {
-		return 0
+	if s.bytes > 0 {
+		elapsed := time.Since(s.startTime)
+		if elapsed > 0 {
+			return int64(float64(s.bytes) / elapsed.Seconds())
+		}
 	}
-	return int64(float64(s.bytes) / elapsed.Seconds())
+	return 0
+}
+
+// pushSpeedSample records cumulative effective bytes; used by the live speed.
+func (s *decodeState) pushSpeedSample() {
+	s.speedWnd = append(s.speedWnd, speedSample{t: time.Now(), b: s.bytes})
+	cutoff := time.Now().Add(-5 * time.Second)
+	for len(s.speedWnd) > 1 && s.speedWnd[0].t.Before(cutoff) {
+		s.speedWnd = s.speedWnd[1:]
+	}
 }
 
 func fmtStatus(mode string, frames, captured, decodeFail int, bytes, speedBps int64) string {
