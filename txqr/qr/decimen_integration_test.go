@@ -2,6 +2,9 @@ package qr
 
 import (
 	"bytes"
+	"image"
+	"image/color"
+	"image/draw"
 	"testing"
 
 	"github.com/divan/txqr/decimen"
@@ -12,8 +15,7 @@ import (
 // a gozxing decode, then re-parses the frame and decodes the fountain. This
 // is the definitive check that the byte-mode QR pipeline carries the exact
 // wire bytes the Android receiver will depend on.
-func TestDecimenFrameQRRoundTrip(t *testing.T) {
-	file := make([]byte, 120_000)
+func TestDecimenFrameQRRoundTrip(t *testing.T) {	file := make([]byte, 120_000)
 	for i := range file {
 		file[i] = byte((i*37 + (i>>8)*11) & 0xff)
 	}
@@ -81,5 +83,48 @@ func TestDecimenFrameQRRoundTrip(t *testing.T) {
 	}
 	if c.Name != "test.bin" || !bytes.Equal(c.Bytes, file) {
 		t.Fatalf("unpacked file mismatch: name=%q", c.Name)
+	}
+}
+
+// TestScreenCaptureDecode simulates a real desktop capture: the QR sits inside
+// a larger frame with offset and margin (a boxed screen region), decoded via
+// the normal detector path the desktop receiver uses.
+func TestScreenCaptureDecode(t *testing.T) {
+	payload := make([]byte, 90000)
+	for i := range payload {
+		payload[i] = byte((i*37 + (i>>8)*11) & 0xff)
+	}
+	container, _, err := decimen.PackContainer("cap.bin", "application/octet-stream", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const blockLen = 2933
+	enc := decimen.NewEncoder(container, blockLen, 0xbeef)
+	hdr := decimen.Header{
+		SessionId:  0xbeef, K: enc.K, BlockLen: blockLen,
+		TotalLen:   uint32(len(container)),
+		PayloadFnv: decimen.Fnv1a(container),
+	}
+	h := hdr
+	h.Seq = 0
+	frame := decimen.PackFrame(h, enc.Encode(0))
+
+	qrImg, err := EncodeVersioned(string(frame), 400, Low, 40, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Put the 400px code into an 800x700 "screen" at an offset with margin.
+	canvas := image.NewRGBA(image.Rect(0, 0, 800, 700))
+	draw.Draw(canvas, canvas.Bounds(), image.White, image.Point{}, draw.Src)
+	draw.Draw(canvas, canvas.Bounds(), image.NewUniform(color.RGBA{220, 220, 220, 255}), image.Point{}, draw.Src)
+	draw.Draw(canvas, image.Rect(120, 90, 120+400, 90+400), qrImg, image.Point{}, draw.Src)
+
+	raw, err := DecodeRaw(canvas)
+	if err != nil {
+		t.Fatalf("DecodeRaw on screen-like capture: %v", err)
+	}
+	got := ExtractFramePayload(raw)
+	if got == nil || !bytes.Equal(got, frame) {
+		t.Fatalf("screen capture frame mismatch: %v", len(got))
 	}
 }

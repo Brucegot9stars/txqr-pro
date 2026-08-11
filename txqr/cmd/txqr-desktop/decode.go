@@ -26,6 +26,8 @@ type decodeState struct {
 	lastTime  time.Time
 	frames    int
 	bytes     int64
+	captured  int // QR decode attempts
+	decodeFail int // attempts that yielded no payload
 	completed bool
 	result    []byte
 	fileName  string
@@ -51,16 +53,15 @@ func (s *decodeState) reset() {
 // decoder. Returns true when the transfer just completed.
 func (s *decodeState) feed(rgba *image.RGBA) bool {
 	raw, err := qr.DecodeRaw(rgba)
-	if err != nil {
-		return false
-	}
 	payload := qr.ExtractFramePayload(raw)
-	if payload == nil {
-		return false
-	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.captured++
+	if err != nil || payload == nil {
+		s.decodeFail++
+		return false
+	}
 	if s.completed {
 		return true
 	}
@@ -156,20 +157,22 @@ func (s *decodeState) snapshot() (progress int, status string, done bool) {
 			}
 		}
 	}
-	status = fmtStatus(s.mode, s.frames, s.bytes, s.startTime)
+	status = fmtStatus(s.mode, s.frames, s.captured, s.decodeFail, s.bytes, s.startTime)
 	return p, status, false
 }
 
-func fmtStatus(mode string, frames int, bytes int64, start time.Time) string {
+func fmtStatus(mode string, frames, captured, decodeFail int, bytes int64, start time.Time) string {
 	elapsed := time.Since(start).Seconds()
 	speed := "0 KB/s"
 	if elapsed > 0.1 {
 		speed = fmtBytes(int64(float64(bytes)/elapsed)) + "/s"
 	}
 	if mode == "decimen" {
-		return fmt.Sprintf("decimen · 帧 %d · 有效 %s · %s", frames, fmtBytes(bytes), speed)
+		return fmt.Sprintf("捕获%d · 解码失败%d · 有效帧%d · 有效 %s · %s",
+			captured, decodeFail, frames, fmtBytes(bytes), speed)
 	}
-	return fmt.Sprintf("txqr · 帧 %d · %s · %s", frames, fmtBytes(bytes), speed)
+	return fmt.Sprintf("捕获%d · 解码失败%d · 有效帧%d · %s · %s",
+		captured, decodeFail, frames, fmtBytes(bytes), speed)
 }
 
 func fmtBytes(n int64) string {

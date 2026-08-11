@@ -52,18 +52,33 @@ func EncodeVersioned(data string, size int, lvl RecoveryLevel, version, mask int
 
 // Decode an image with QR code.
 func Decode(img image.Image) (string, error) {
+	raw, err := DecodeRaw(img)
+	if err != nil {
+		return "", err
+	}
+	// DecodeRaw can return the raw data codewords for a code the charset
+	// decoder rejects; fall back to text only when a raw decode failed.
+	if payload := ExtractFramePayload(raw); payload != nil {
+		return string(payload), nil
+	}
+	return string(raw), nil
+}
+
+// decodeOnce runs the QR reader, optionally with the pure-barcode fast path.
+func decodeOnce(img image.Image, pure bool) (*gozxing.Result, error) {
 	bitmap, err := gozxing.NewBinaryBitmapFromImage(img)
 	if err != nil {
-		return "", fmt.Errorf("gozxing bitmap: %v", err)
+		return nil, err
 	}
-
 	hints := make(map[gozxing.DecodeHintType]interface{})
-	hints[gozxing.DecodeHintType_PURE_BARCODE] = true
-	result, err := zqrcode.NewQRCodeReader().Decode(bitmap, hints)
-	if err != nil {
-		return "", fmt.Errorf("gozxing: %v", err)
+	if pure {
+		hints[gozxing.DecodeHintType_PURE_BARCODE] = true
+	} else {
+		// The full detector asserts this hint unconditionally; an absent key
+		// panics gozxing, so a no-op callback keeps it quiet.
+		hints[gozxing.DecodeHintType_NEED_RESULT_POINT_CALLBACK] = gozxing.ResultPointCallback(func(gozxing.ResultPoint) {})
 	}
-	return result.GetText(), nil
+	return zqrcode.NewQRCodeReader().Decode(bitmap, hints)
 }
 
 // DecodeRaw decodes a QR and returns the raw decoded byte stream. Unlike
@@ -71,15 +86,15 @@ func Decode(img image.Image) (string, error) {
 // the decimen frames and every txqr sender emit — GetText() would map bytes
 // through a charset and corrupt any byte ≥ 0x80, so the raw bytes are the only
 // safe representation of a binary frame.
+//
+// The full detector runs first (robust to real captures that have quiet-zone
+// margin, edges and background); if that fails, the pure-barcode fast path is
+// tried, which assumes the image is exactly the code.
 func DecodeRaw(img image.Image) ([]byte, error) {
-	bitmap, err := gozxing.NewBinaryBitmapFromImage(img)
+	result, err := decodeOnce(img, false)
 	if err != nil {
-		return nil, fmt.Errorf("gozxing bitmap: %v", err)
+		result, err = decodeOnce(img, true)
 	}
-
-	hints := make(map[gozxing.DecodeHintType]interface{})
-	hints[gozxing.DecodeHintType_PURE_BARCODE] = true
-	result, err := zqrcode.NewQRCodeReader().Decode(bitmap, hints)
 	if err != nil {
 		return nil, fmt.Errorf("gozxing: %v", err)
 	}
@@ -135,7 +150,7 @@ func ExtractFramePayload(raw []byte) []byte {
 			}
 			out[i] = byte(v)
 		}
-		if isDecimenFrame(out) || bytes.IndexByte(out, '|') >= 0 {
+		if plausiblePayload(out) {
 			return out
 		}
 		return nil
@@ -144,6 +159,28 @@ func ExtractFramePayload(raw []byte) []byte {
 		return p
 	}
 	return try(8)
+}
+
+// plausiblePayload decides whether a guessed byte-mode payload is a real frame:
+// a decimen frame, a classic txqr chunk (header|payload), or plain text.
+// This keeps the wrong count-width guess from winning, while still accepting
+// text-only codes (no '|') that a generic decoder should read.
+func plausiblePayload(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	if isDecimenFrame(b) {
+		return true
+	}
+	if bytes.IndexByte(b, '|') >= 0 {
+		return true
+	}
+	for _, c := range b {
+		if c < 0x09 || (c > 0x0D && c < 0x20) || c > 0x7E {
+			return false
+		}
+	}
+	return true
 }
 
 func isDecimenFrame(b []byte) bool {
