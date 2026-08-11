@@ -28,6 +28,7 @@ type decodeState struct {
 	txqrDec    *txqr.Decoder
 
 	startTime time.Time
+	endTime   time.Time // frozen when the transfer completes (avg speed is stable)
 	lastTime  time.Time
 	frames    int
 	bytes     int64
@@ -83,6 +84,7 @@ func (s *decodeState) reset() {
 	s.decimenDec = nil
 	s.txqrDec = nil
 	s.startTime = time.Time{}
+	s.endTime = time.Time{}
 	s.lastTime = time.Time{}
 	s.frames = 0
 	s.bytes = 0
@@ -169,6 +171,7 @@ func (s *decodeState) feedDecimenLocked(frame []byte) bool {
 		if file, err := decimen.UnpackContainer(container); err == nil {
 			if shaMatches(container, file.Bytes) {
 				s.completed = true
+				s.endTime = time.Now()
 				s.result = file.Bytes
 				s.fileName = file.Name
 				return true
@@ -213,6 +216,7 @@ func (s *decodeState) feedTxqrLocked(payload []byte) bool {
 	s.txqrDec.Decode(chunk)
 	if s.txqrDec.IsCompleted() {
 		s.completed = true
+		s.endTime = time.Now()
 		s.result = s.txqrDec.DataBytes()
 		s.fileName = ""
 		return true
@@ -292,12 +296,17 @@ func (s *decodeState) currentSpeedBps() int64 {
 }
 
 // avgSpeedBps is the whole-transfer effective-data rate: total deduplicated
-// parsed bytes over the entire session.
+// parsed bytes over the entire session. Uses the frozen endTime once complete,
+// so the "done" figure is stable.
 func (s *decodeState) avgSpeedBps() int64 {
 	if s.bytes <= 0 {
 		return 0
 	}
-	elapsed := time.Since(s.startTime)
+	end := s.endTime
+	if end.IsZero() {
+		end = time.Now()
+	}
+	elapsed := end.Sub(s.startTime)
 	if elapsed <= 0 {
 		return 0
 	}
