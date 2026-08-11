@@ -84,6 +84,12 @@ func decodeOnce(img image.Image, pure bool) (*gozxing.Result, error) {
 	return zqrcode.NewQRCodeReader().Decode(bitmap, hints)
 }
 
+// ScaleBilinear resizes an image with bilinear interpolation (exported for
+// callers that need to pre-process frames before decode).
+func ScaleBilinear(img image.Image, nw, nh int) image.Image {
+	return scaleBilinear(img, nw, nh)
+}
+
 // scaleBilinear resizes an image with bilinear interpolation (stdlib-only
 // replacement for golang.org/x/image/draw's ApproxBiLinear). Used to shrink
 // oversized screen captures and to simulate display-scaling blur in tests.
@@ -199,6 +205,32 @@ func DecodeRawMultiScale(img image.Image, scales []float64) ([]byte, error) {
 		}
 		if ExtractFramePayload(raw) != nil {
 			return raw, nil
+		}
+	}
+
+	// Fallback: the sender's range frame often gets boxed in with the code —
+	// its border lines make gozxing read the format information wrong
+	// (FormatException). Cropping the outer band then upscaling removes the
+	// interference and raises the module resolution. Verified to turn the
+	// previously-all-fail captures into decodes.
+	b := img.Bounds()
+	dx := int(float64(b.Dx()) * 0.06)
+	dy := int(float64(b.Dy()) * 0.06)
+	if b.Dx()-2*dx > 60 && b.Dy()-2*dy > 60 {
+		cropped := image.NewRGBA(image.Rect(0, 0, b.Dx()-2*dx, b.Dy()-2*dy))
+		for y := 0; y < cropped.Bounds().Dy(); y++ {
+			for x := 0; x < cropped.Bounds().Dx(); x++ {
+				cropped.Set(x, y, img.At(b.Min.X+x+dx, b.Min.Y+y+dy))
+			}
+		}
+		for _, sc := range []float64{2.0, 2.5} {
+			cw, ch := cropped.Bounds().Dx(), cropped.Bounds().Dy()
+			scaled := scaleBilinear(cropped, int(float64(cw)*sc), int(float64(ch)*sc))
+			raw, err := DecodeRaw(scaled)
+			lastErr = err
+			if err == nil && ExtractFramePayload(raw) != nil {
+				return raw, nil
+			}
 		}
 	}
 	if lastErr == nil {
