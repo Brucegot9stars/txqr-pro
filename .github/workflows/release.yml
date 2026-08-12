@@ -31,6 +31,24 @@ jobs:
           go build -trimpath -ldflags "-s -w -H windowsgui" -o ../../../dist/qrt-pro-sender-windows-amd64.exe .
           ls -lh ../../../dist/
 
+      - name: Build Windows desktop receiver
+        working-directory: txqr/cmd/txqr-desktop
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          go build -trimpath -ldflags "-s -w -H windowsgui" -o ../../../dist/qrt-pro-receiver-desktop-windows-amd64.exe .
+
+      - name: Build Windows launcher
+        working-directory: txqr/cmd/txqr-launcher
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          go build -trimpath -ldflags "-s -w -H windowsgui" -o ../../../dist/qrt-pro-launcher.exe .
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -63,4 +81,6 @@ jobs:
         with:
           files: |
             dist/qrt-pro-sender-windows-amd64.exe
+            dist/qrt-pro-receiver-desktop-windows-amd64.exe
+            dist/qrt-pro-launcher.exe
             dist/qrt-pro-reader-${{ github.ref_name }}.apk
