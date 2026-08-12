@@ -5,6 +5,8 @@ CLAUDE.md
 
 # 打包产物
 dist/
+# 参考项目(已独立移植, 不再跟踪)
+reference/
 # 编译产物与日志
 txqr/bin/
 *.exe
