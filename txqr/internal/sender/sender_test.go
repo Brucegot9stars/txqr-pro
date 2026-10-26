@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/divan/txqr/qr"
 )
 
 // startTestServer binds a free loopback port and fails the test loudly rather
@@ -249,5 +251,71 @@ func TestMaxUploadRejectsOversizeBody(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status %d want 413", resp.StatusCode)
+	}
+}
+
+// TestColorModeClampsSplitToMatrixCapacity covers the bug where the UI's
+// default split (2048) is larger than a color matrix frame can hold: every
+// frame failed to render, the server answered 500 and the transfer produced
+// nothing. The split has to be clamped to the matrix capacity, and the
+// effective value echoed back so the UI can show it.
+func TestColorModeClampsSplitToMatrixCapacity(t *testing.T) {
+	srv := startTestServer(t)
+	body := bytes.Repeat([]byte("qrt-pro color mode "), 300) // ~6 KB
+
+	resp, err := http.Post(srv.url("/encode?mode=color&split=2048&codec=lt"),
+		"application/octet-stream", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("encode status %d: %s", resp.StatusCode, b)
+	}
+
+	var out struct {
+		ID    string `json:"id"`
+		Count int    `json:"count"`
+		Split int    `json:"split"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.Split <= 0 || out.Split > qr.NumColorPayloadBytes()-colorFrameOverhead {
+		t.Errorf("split = %d, want in (0, %d]", out.Split, qr.NumColorPayloadBytes()-colorFrameOverhead)
+	}
+	if out.Count == 0 {
+		t.Fatal("no frames encoded")
+	}
+
+	// Every frame must render to a PNG; a nil PNG is what silently failed before.
+	img, err := http.Get(srv.url("/frame/" + out.ID + "/0"))
+	if err != nil {
+		t.Fatalf("frame: %v", err)
+	}
+	defer img.Body.Close()
+	if img.StatusCode != http.StatusOK {
+		t.Fatalf("frame status %d", img.StatusCode)
+	}
+	png, _ := io.ReadAll(img.Body)
+	if len(png) < 8 || !bytes.Equal(png[:4], []byte{0x89, 'P', 'N', 'G'}) {
+		t.Fatalf("frame %d bytes, not a PNG", len(png))
+	}
+}
+
+// TestClampColorSplit pins the arithmetic the color path relies on.
+func TestClampColorSplit(t *testing.T) {
+	cap := qr.NumColorPayloadBytes() - colorFrameOverhead
+	cases := []struct{ in, want int }{
+		{1, 1},
+		{1024, 1024},
+		{2048, cap},
+		{cap, cap},
+	}
+	for _, c := range cases {
+		if got := clampColorSplit(c.in); got != c.want {
+			t.Errorf("clampColorSplit(%d) = %d, want %d", c.in, got, c.want)
+		}
 	}
 }

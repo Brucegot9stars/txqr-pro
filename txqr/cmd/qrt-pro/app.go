@@ -103,6 +103,12 @@ type app struct {
 	lastErr string
 	started time.Time
 
+	// senderBusy guards the start/stop network operation, which runs off the
+	// message thread: binding a wildcard address can take seconds on some
+	// Windows setups (interface enumeration / firewall), and blocking the
+	// message loop freezes the whole window.
+	senderBusy bool
+
 	// Selection overlay state. It lives on the UI thread only, so no lock.
 	selBuf   []byte
 	selW     int
@@ -507,13 +513,40 @@ func (a *app) handleRegionClick(id uikit.ControlID) {
 
 // ---------------------------------------------------------------- actions
 
+// toggleSender starts or stops the sender service. Both directions run off the
+// message thread: net.Listen on a wildcard address can take seconds here
+// (observed 3-30 s depending on adapter/firewall state), and doing that inline
+// froze the window so completely that clicks queued up behind it and the
+// button looked dead. The busy flag drops re-entrant clicks instead of
+// queueing a start immediately followed by a stop.
 func (a *app) toggleSender() {
-	if a.srv.Stats().Listening {
-		a.stopSender()
+	a.mu.Lock()
+	if a.senderBusy {
+		a.mu.Unlock()
 		return
 	}
+	a.senderBusy = true
+	a.mu.Unlock()
+
+	stop := a.srv.Stats().Listening
+	a.setStatus("发送服务处理中…")
+	go func() {
+		if stop {
+			a.stopSender()
+		} else {
+			a.startSender()
+		}
+		a.mu.Lock()
+		a.senderBusy = false
+		a.mu.Unlock()
+		w32.PostMessage(a.hwnd, wmAppRefresh, 0, 0)
+	}()
+}
+
+// startSender binds :9000, falling back to any free port so a port already
+// taken by another program never leaves the user with a dead button.
+func (a *app) startSender() {
 	if err := a.srv.Start(":9000"); err != nil {
-		// Port 9000 busy: fall back to any free port instead of failing the user.
 		if err2 := a.srv.Start(":0"); err2 != nil {
 			a.setError("发送服务启动失败: " + err.Error())
 			return
@@ -527,6 +560,13 @@ func (a *app) toggleSender() {
 func (a *app) stopSender() {
 	if err := a.srv.Close(); err != nil {
 		a.setError("发送服务停止失败: " + err.Error())
+		return
+	}
+	// Never report success on a port that is still bound: that is exactly how
+	// the old sync.Once bug hid itself (status said "已停止" while the page
+	// kept answering).
+	if a.srv.Stats().Listening {
+		a.setError("发送服务停止失败：端口仍在监听")
 		return
 	}
 	a.setStatus("发送服务已停止")

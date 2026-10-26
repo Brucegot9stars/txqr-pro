@@ -28,7 +28,8 @@
 ├── docs/
 │   ├── protocol-analysis.md   # decimen 协议逐字节规格（权威依据）
 │   ├── cleanup-analysis.md    # 目录清理分析报告
-│   └── code-audit.md          # 代码审计报告（逻辑/并发/资源/线程安全）
+│   ├── code-audit.md          # 代码审计报告（逻辑/并发/资源/线程安全）
+│   └── mode-and-codec-analysis.md  # 编码方案与工作模式的原理、实测与结论
 ├── .github/workflows/         # 发布流水线（qrt-pro + sender + APK）与 CI 测试（含 -race）
 ├── dist/                      # 打包好的 portable 产物
 └── README.md
@@ -132,10 +133,23 @@ gradlew.bat :app:assembleDebug --no-daemon
 
 ## 版本
 
-当前版本：`v1.4.0`（见 Git tag）。Android 端 `versionCode=6` / `versionName=1.4.0`。
+当前版本：`v1.4.1`（见 Git tag）。Android 端 `versionCode=7` / `versionName=1.4.1`。
 
 v1.4.0 的主要变化：桌面端三个 exe 合并为统一的 `qrt-pro.exe`，接收端界面重做，并修复
 了代码审计发现的 30 项缺陷（详见 `docs/code-audit.md`）。
+
+v1.4.1 是缺陷修复版本：
+
+- **「停止服务」第二次以后失效**：`Close()` 被 `sync.Once` 包着，只能生效一次，
+  端口继续服务而界面显示已停止；同时把发送服务启停移出 UI 线程（本机绑定通配地址
+  实测耗时 3–30 秒，会把窗口冻住）。见 `docs/code-audit.md` A8。
+- **Binary 编码跨端不一致**：Go 端是「随机半数源块异或」，Android 端写成「按序重复源块」，
+  导致解码报成功但数据错误。已重写 Kotlin 侧。
+- **Online 编码参数不在线上格式里**：发送端改 ε/quality 会让接收端解出错误数据，
+  已将参数固化为两端共用的常量。
+- **Color Matrix 模式默认发不出去**：默认 `split=2048` 超过矩阵容量 1587 B，
+  每帧渲染失败；已自动钳制到 1539 并回传有效值。
+- 新增 `docs/mode-and-codec-analysis.md`：五种编码方案与两种工作模式的原理、实测与结论。
 
 ## License
 

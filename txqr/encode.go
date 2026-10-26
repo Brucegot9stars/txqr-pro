@@ -9,13 +9,23 @@ import (
 	fountain "github.com/google/gofountain"
 )
 
+// Online code parameters. They are part of the wire format: the frame header
+// carries only the tag "online", so a receiver must rebuild the codec from
+// these constants alone (see gofountainCodec). Letting one end change them
+// makes the two ends disagree — the decoder still reports completion but
+// returns bytes that never match the source, which surfaces as a corrupted
+// file reported as a successful transfer.
+const (
+	onlineEpsilon = 0.01
+	onlineQuality = 3
+	onlineSeed    = 42
+)
+
 // Encoder represents protocol encoder.
 type Encoder struct {
 	chunkLen         int
 	redundancyFactor float64
 	codec            CodecType
-	onlineEpsilon    float64
-	onlineQuality    int
 	fileName         string
 }
 
@@ -25,8 +35,6 @@ func NewEncoder(n int, codec CodecType) *Encoder {
 		chunkLen:         n,
 		redundancyFactor: 2.0,
 		codec:            codec,
-		onlineEpsilon:    0.01,
-		onlineQuality:    3,
 	}
 }
 
@@ -42,11 +50,10 @@ func (e *Encoder) SetRedundancyFactor(rf float64) {
 	e.redundancyFactor = rf
 }
 
-// SetOnlineParams sets the Online codec parameters.
-func (e *Encoder) SetOnlineParams(epsilon float64, quality int) {
-	e.onlineEpsilon = epsilon
-	e.onlineQuality = quality
-}
+// SetOnlineParams is intentionally absent. epsilon, quality and the RNG seed
+// are fixed by the wire format (see onlineEpsilon above): the frame header has
+// no room for them, so a sender that changed them would emit frames no
+// receiver can decode correctly.
 
 // Encode encodes data and splits it into chunks to be
 // further converted to QR code frames.
@@ -154,7 +161,7 @@ func (e *Encoder) createGofountainCodec(numChunks int, ct CodecType) fountain.Co
 	case CodecRaptor:
 		return fountain.NewRaptorCodec(numChunks, 4)
 	case CodecOnline:
-		return fountain.NewOnlineCodec(numChunks, e.onlineEpsilon, e.onlineQuality, 42)
+		return fountain.NewOnlineCodec(numChunks, onlineEpsilon, onlineQuality, onlineSeed)
 	default:
 		return fountain.NewLubyCodec(numChunks,
 			rand.New(fountain.NewMersenneTwister(200)),

@@ -1,10 +1,20 @@
 package com.qrtpro.reader.decoder
 
-class LubyCodec(val sourceBlocks: Int) {
+/**
+ * Maps a code block id to the source blocks it is composed of. Both the LT and
+ * the random-binary fountain share the same decoder — only this mapping
+ * differs — so the peeling/Gaussian machinery is written once.
+ */
+interface BlockPicker {
+    val sourceBlocks: Int
+    fun pickIndices(codeBlockIndex: Long): IntArray
+}
+
+class LubyCodec(override val sourceBlocks: Int) : BlockPicker {
     private val random = MersenneTwister()
     private val degreeCdf = solitonDistribution(sourceBlocks)
 
-    fun pickIndices(codeBlockIndex: Long): IntArray {
+    override fun pickIndices(codeBlockIndex: Long): IntArray {
         random.seed(codeBlockIndex)
         val d = pickDegree(random, degreeCdf)
         return sampleUniform(random, d, sourceBlocks)
@@ -15,7 +25,7 @@ class LubyCodec(val sourceBlocks: Int) {
     }
 }
 
-class LubyDecoder(private val codec: LubyCodec, private val messageLength: Int) {
+class LubyDecoder(private val codec: BlockPicker, private val messageLength: Int) {
     val matrix = SparseMatrix(codec.sourceBlocks)
 
     fun addBlocks(blocks: List<LTBlock>): Boolean {

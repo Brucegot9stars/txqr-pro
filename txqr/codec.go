@@ -49,7 +49,7 @@ func gofountainCodec(numChunks int, ct CodecType) fountain.Codec {
 	case CodecRaptor:
 		return fountain.NewRaptorCodec(numChunks, 4)
 	case CodecOnline:
-		return fountain.NewOnlineCodec(numChunks, 0.01, 3, 42)
+		return fountain.NewOnlineCodec(numChunks, onlineEpsilon, onlineQuality, onlineSeed)
 	default:
 		return fountain.NewLubyCodec(numChunks,
 			rand.New(fountain.NewMersenneTwister(200)),

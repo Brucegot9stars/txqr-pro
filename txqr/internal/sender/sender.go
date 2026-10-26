@@ -62,6 +62,7 @@ type session struct {
 	frames    [][]byte
 	pngs      [][]byte
 	total     int
+	split     int    // effective payload bytes per frame, after any mode clamp
 	mode      string // "qr", "color" or "decimen"
 	createdAt time.Time
 
@@ -103,10 +104,11 @@ type Server struct {
 	transfers int
 	bytesSent int64
 
-	listener  net.Listener
-	srv       *http.Server
-	mux       *http.ServeMux
-	stopOnce  sync.Once
+	listener net.Listener
+	srv      *http.Server
+	mux      *http.ServeMux
+	// done belongs to the current run: Start replaces it, so a stop/start
+	// cycle never reuses (and re-closes) a channel that is already closed.
 	done      chan struct{}
 	maxUpload int64
 }
@@ -118,6 +120,9 @@ func New() *Server {
 		done:      make(chan struct{}),
 		maxUpload: DefaultMaxUpload,
 	}
+	// Before the first Start nothing runs, so Done() must report that instead
+	// of blocking a caller that selects on it.
+	close(s.done)
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("/", s.serveIndex)
 	s.mux.HandleFunc("/encode", s.handleEncode)
@@ -136,6 +141,7 @@ func (s *Server) SetMaxUpload(n int64) {
 
 // Start binds addr and serves until Close. addr may use port 0 to let the OS
 // pick a free port; read Addr afterwards. Start is a no-op when already running.
+// Start may be called again after Close: every run gets its own done channel.
 func (s *Server) Start(addr string) error {
 	s.mu.Lock()
 	running := s.listener != nil
@@ -158,19 +164,27 @@ func (s *Server) Start(addr string) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
+
+	done := make(chan struct{})
 	s.mu.Lock()
+	if s.listener != nil { // lost a race with a concurrent Start
+		s.mu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
 	s.listener = ln
 	s.srv = srv
+	s.done = done
 	s.mu.Unlock()
 
 	go func() {
-		defer close(s.done)
+		defer close(done)
 		err := srv.Serve(ln)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("sender: serve stopped: %v", err)
 		}
 	}()
-	go s.cleanup()
+	go s.cleanup(done)
 	return nil
 }
 
@@ -242,32 +256,57 @@ func (s *Server) LANURLs() []string {
 	return out
 }
 
-// Close stops serving and releases the listener. It is idempotent and safe to
-// call before Start.
+// Close stops serving and releases the listener. It is idempotent, safe to call
+// before Start, and safe to call repeatedly across Start/Close cycles: the
+// server used to guard this with a single sync.Once, so the *second* stop after
+// a restart silently did nothing and the port stayed open while the UI claimed
+// the service had stopped.
 func (s *Server) Close() error {
+	s.mu.Lock()
+	srv, ln, done := s.srv, s.listener, s.done
+	s.srv, s.listener = nil, nil
+	s.mu.Unlock()
+	if srv == nil && ln == nil {
+		return nil // nothing running
+	}
+
 	var err error
-	s.stopOnce.Do(func() {
-		s.mu.Lock()
-		srv, ln := s.srv, s.listener
-		s.srv, s.listener = nil, nil
-		s.mu.Unlock()
-		if srv != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			err = srv.Shutdown(ctx)
-			// Shutdown waits for idle clients; unblock listeners promptly.
-			if cerr := srv.Close(); cerr != nil && err == nil {
-				err = cerr
-			}
+	if srv != nil {
+		// Short graceful-drain window: the payloads served here are already
+		// rendered PNGs, so anything in flight finishes well inside it. A
+		// longer grace period would only make "stop" feel sluggish.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		err = srv.Shutdown(ctx)
+		// Shutdown waits for in-flight requests; force whatever is left.
+		if cerr := srv.Close(); cerr != nil && err == nil {
+			err = cerr
 		}
-		_ = ln
-	})
+	}
+	if ln != nil {
+		// Shutdown already closes it; closing again only makes the release
+		// explicit for the case where srv was nil.
+		_ = ln.Close()
+	}
+	// Wait for Serve to return so the port is really free before a restart,
+	// but never hang the UI thread on a stuck handler.
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+		}
+	}
 	return err
 }
 
-// Done returns a channel closed once Serve returns. Closing the server from
-// the UI is enough in practice; this exists for tests and the standalone cmd.
-func (s *Server) Done() <-chan struct{} { return s.done }
+// Done returns a channel closed once the *current* run's Serve returns. It is
+// already closed before the first Start and after every Close, so selecting on
+// it never blocks on a stopped server.
+func (s *Server) Done() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.done
+}
 
 // Stats snapshots what the UI wants to print.
 func (s *Server) Stats() Stats {
@@ -308,14 +347,14 @@ func (s *Server) recordEvent(e Event) {
 }
 
 // cleanup drops sessions nobody has asked for recently. It runs on its own
-// ticker and stops when the server stops, unlike the old time.Tick loop that
-// never terminated.
-func (s *Server) cleanup() {
+// ticker and stops when the run it belongs to ends, unlike the old time.Tick
+// loop that never terminated.
+func (s *Server) cleanup(done <-chan struct{}) {
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
 	for {
 		select {
-		case <-s.done:
+		case <-done:
 			return
 		case <-t.C:
 			s.mu.Lock()
@@ -359,19 +398,15 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 		mode = v
 	}
 
+	// The color matrix holds far fewer bytes per frame than a QR symbol, and
+	// the UI keeps the same split knob as classic mode. Without this clamp the
+	// default split (2048) makes every frame fail to render and the transfer
+	// silently emits nothing.
+	if mode == "color" {
+		split = clampColorSplit(split)
+	}
+
 	codec := txqr.ParseCodec(r.URL.Query().Get("codec"))
-	onlineEpsilon := 0.01
-	if v := r.URL.Query().Get("epsilon"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
-			onlineEpsilon = f
-		}
-	}
-	onlineQuality := 3
-	if v := r.URL.Query().Get("quality"); v != "" {
-		if q, err := strconv.Atoi(v); err == nil && q > 0 {
-			onlineQuality = q
-		}
-	}
 
 	body, err := s.readBody(w, r)
 	if err != nil {
@@ -389,7 +424,7 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 	case "decimen":
 		sess, err = encodeDecimen(r, body)
 	default:
-		sess, err = encodeClassic(body, split, mode, codec, onlineEpsilon, onlineQuality)
+		sess, err = encodeClassic(body, split, mode, codec)
 	}
 	if err != nil {
 		http.Error(w, "encode: "+err.Error(), http.StatusInternalServerError)
@@ -432,13 +467,15 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 		"count": len(sess.frames),
 		"total": sess.total,
 		"md5":   hex.EncodeToString(sum[:]),
+		// Echo the payload size actually used: a mode clamp can make it
+		// smaller than what the client asked for.
+		"split": sess.split,
 	}
 	if mode == "decimen" {
 		resp["carousel"] = true
 		resp["k"] = sess.k
 		resp["sessionId"] = sess.sessionID
 		resp["blockLen"] = sess.blockLen
-		resp["split"] = sess.blockLen
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
@@ -471,14 +508,29 @@ func truncateName(s string, n int) string {
 	return s[:n] + "…"
 }
 
+// colorFrameOverhead is the longest "blockCode/chunkLen/total/codec|" header
+// the classic pipeline can prepend. It is reserved out of the matrix capacity
+// so a color frame can never exceed what ColorMatrixEncode accepts.
+const colorFrameOverhead = 48
+
+// clampColorSplit caps the payload size to what one color matrix frame can
+// carry. The sender renders "header|payload" as a whole frame, so the header
+// has to be reserved or every frame fails to render.
+func clampColorSplit(split int) int {
+	max := qr.NumColorPayloadBytes() - colorFrameOverhead
+	if max < 1 {
+		return split
+	}
+	if split > max {
+		return max
+	}
+	return split
+}
+
 // encodeClassic is the text-based pipeline (QR/color, LT/Raptor/…).
-func encodeClassic(body []byte, split int, mode string, codec txqr.CodecType,
-	onlineEpsilon float64, onlineQuality int) (*session, error) {
+func encodeClassic(body []byte, split int, mode string, codec txqr.CodecType) (*session, error) {
 	str := string(body)
 	encoder := txqr.NewEncoder(split, codec)
-	if codec == txqr.CodecOnline {
-		encoder.SetOnlineParams(onlineEpsilon, onlineQuality)
-	}
 	frames, err := encoder.Encode(str)
 	if err != nil {
 		return nil, err
@@ -487,6 +539,7 @@ func encodeClassic(body []byte, split int, mode string, codec txqr.CodecType,
 		frames:    make([][]byte, len(frames)),
 		pngs:      make([][]byte, len(frames)),
 		total:     len(str),
+		split:     split,
 		mode:      mode,
 		createdAt: time.Now(),
 	}
@@ -538,6 +591,7 @@ func encodeDecimen(r *http.Request, body []byte) (*session, error) {
 		frames:    make([][]byte, cycle),
 		pngs:      make([][]byte, cycle),
 		total:     len(container),
+		split:     DecimenBlockLen,
 		mode:      "decimen",
 		createdAt: time.Now(),
 		carousel:  true,

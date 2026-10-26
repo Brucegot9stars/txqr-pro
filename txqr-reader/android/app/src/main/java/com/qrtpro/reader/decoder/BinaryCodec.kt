@@ -1,49 +1,35 @@
 package com.qrtpro.reader.decoder
 
-class BinaryCodec(val sourceBlocks: Int) {
-    fun pickIndices(codeBlockIndex: Long): IntArray {
-        val idx = (codeBlockIndex % sourceBlocks).toInt()
-        return intArrayOf(idx)
-    }
-
-    fun newDecoder(messageLength: Int): BinaryDecoder {
-        return BinaryDecoder(this, messageLength)
-    }
-}
-
-class BinaryDecoder(private val codec: BinaryCodec, private val messageLength: Int) {
-    val blocks = arrayOfNulls<ByteArray>(codec.sourceBlocks)
-    private var received = 0
-    private var completed = false
-
-    fun addBlocks(blkList: List<LTBlock>): Boolean {
-        for (block in blkList) {
-            val idx = codec.pickIndices(block.blockCode)
-            val i = idx[0]
-            if (blocks[i] == null) {
-                blocks[i] = block.data.copyOf()
-                received++
-            }
-            if (received == codec.sourceBlocks) {
-                completed = true
-                return true
+/**
+ * Random binary fountain code, mirroring gofountain's binaryCodec.
+ *
+ * The previous implementation took the block code modulo the number of source
+ * blocks — a degree-1 systematic round-robin, i.e. plain repetition of the
+ * source blocks. The Go sender (github.com/google/gofountain) instead builds
+ * every code block from a *random half* of the source blocks: for each source
+ * block b it draws one bit from a Mersenne Twister seeded with the block code
+ * and includes b when that bit is 1. The two ends therefore disagreed, the
+ * receiver treated random XOR combinations as if they were source blocks, and
+ * the user got a silently corrupted file reported as a success.
+ *
+ * Wire compatibility: this mapping and the RNG draw are wire format. Changing
+ * either breaks every stream already in flight.
+ */
+class BinaryCodec(override val sourceBlocks: Int) : BlockPicker {
+    override fun pickIndices(codeBlockIndex: Long): IntArray {
+        val random = MersenneTwister()
+        random.seed(codeBlockIndex)
+        val indices = ArrayList<Int>(sourceBlocks)
+        for (b in 0 until sourceBlocks) {
+            // Go: rand.New(NewMersenneTwister(codeBlockIndex)).Intn(2) == 1
+            if (random.nextInt(2) == 1) {
+                indices.add(b)
             }
         }
-        return false
+        return indices.toIntArray()
     }
 
-    fun decode(): ByteArray? {
-        if (!completed) return null
-        val (lenLong, lenShort, numLong, numShort) = partition(messageLength, codec.sourceBlocks)
-        val result = ByteArray(messageLength)
-        var pos = 0
-        for (i in 0 until codec.sourceBlocks) {
-            val block = blocks[i] ?: return null
-            val len = if (i < numLong) lenLong else lenShort
-            val copyLen = minOf(len, block.size, messageLength - pos)
-            System.arraycopy(block, 0, result, pos, copyLen)
-            pos += len
-        }
-        return result
+    fun newDecoder(messageLength: Int): LubyDecoder {
+        return LubyDecoder(this, messageLength)
     }
 }

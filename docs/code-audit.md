@@ -3,7 +3,19 @@
 范围：`txqr/`（Go 桌面端）与 `txqr-reader/android/`（Kotlin 接收端）。
 目标：逻辑错误、边界条件遗漏、空指针风险、异常处理不完整、资源泄漏、协程/线程使用不当、线程安全。
 
-本报告按「严重程度 → 位置 → 问题 → 处置」记录。第一至第三节共 30 项，全部为 ✅（已修复）；第四节的 3 项收尾工作同样已完成。
+本报告按「严重程度 → 位置 → 问题 → 处置」记录。第一至第三节共 31 项，全部为 ✅（已修复）；第四节的 3 项收尾工作同样已完成。
+
+> **补记（编码方案与工作模式专项）**：针对五种喷泉码与两种工作模式做的专项验证又发现
+> 3 个跨端/静默损坏缺陷，均已修复，详见 **`docs/mode-and-codec-analysis.md` §4**：
+> - **Binary**：Go 端是「随机半数源块异或」，Kotlin 端却写成「按序重复源块」，
+>   两端不一致 → Android 解码**报成功但数据错误**。已重写 Kotlin 侧并复用 `LubyDecoder`。
+> - **Online**：ε/quality 不在帧头里，发送端改参数后接收端仍报完成但数据错误。
+>   已把参数固化为包级常量并移除发送页输入框。
+> - **Color Matrix**：默认 `split=2048` 超过矩阵容量 1587 B，每帧渲染失败、无任何输出。
+>   已加 `clampColorSplit()` 并把实际值回传 UI。
+>
+> 另有一条重要事实：**桌面接收端不支持 Color Matrix 模式**（`qr.ColorMatrixDecode`
+> 无调用方，桌面端只走 zxing QR），该模式只有 Android 端能收。
 
 ---
 
@@ -93,6 +105,53 @@ dc.Blit(0, 0, rc.W(), rc.H(), mem, 0, 0)  // 2. BitBlt 复制的正是"当前选
 | `Blit → Restore`（修复后） | `rgb(15,17,23)` 背景、`rgb(28,33,45)` 面板 |
 
 同时给 `internal/w32` 的 `DC` 增加了 `Pixel()`（`CLR_INVALID` 视为失败）。该检查已写入 `.github/workflows/test.yml` 的 Windows job：若采样出现白色即判失败；若环境无交互式桌面（`WM_PAINT` 未触发、日志为空）则跳过而非误报。
+
+### A8 ✅ 「停止服务」第二次以后完全失效（`sync.Once` 把停止做成了终身一次）
+
+位置：`internal/sender/sender.go`（`Close`）+ `cmd/qrt-pro/app.go`（`toggleSender` / `stopSender`）
+
+症状：点停止服务后，状态栏写「发送服务已停止」，但端口仍在监听、发送页面照常响应，看起来像「后台进程没退出」。
+
+根因：
+
+```go
+type Server struct {
+	stopOnce sync.Once   // ← 一个 Server 的生命周期里只会生效一次
+	done     chan struct{}
+}
+
+func (s *Server) Close() error {
+	s.stopOnce.Do(func() { /* 真正关闭 listener/srv */ })
+	return err               // 第二次调用：直接返回 nil，什么都没做
+}
+```
+
+`Start` 在停止后可以正常重启（`listener == nil`），于是 **启动 → 停止 → 启动 → 停止** 的第二次停止是空操作：`listener` 保持非 nil（`Stats().Listening` 仍为 true），端口继续服务，而 `Close()` 返回 nil 让调用方以为成功了。
+
+连带缺陷：
+
+1. `done` 在 `Start` 的 goroutine 里用 `defer close(s.done)`，而它是 `New()` 里建的单例 channel —— 第二次 `Serve` 返回时会对已关闭的 channel 再 `close`，直接 panic。
+2. `cleanup()` 的退出条件是同一个 `done`，重启后它立刻返回，会话 GC 实际不再运行。
+3. `toggleSender` 在 UI 线程上同步调用 `Start` / `Close`。实测本机绑定通配地址 `:9000` 在冷启动时可耗时 **3–30 秒**（网卡枚举 / 防火墙），期间整个消息循环被阻塞：界面不重绘、点击排队，按钮看起来完全没反应。
+
+处置：
+
+- 去掉 `stopOnce`，`Close()` 改为「锁内取出 srv/listener 并置 nil → 锁外关闭」，重复调用天然幂等；关闭后 `select` 等 `Serve` 返回（上限 3 s），保证重启时端口真的已释放。`srv.Shutdown` 的宽限期从 2 s 收紧到 1 s，因为它跑在按钮回调里。
+- `done` 改为**每次 Start 新建**，由该次运行的 goroutine 关闭；`Done()` 加锁读取。未启动时 `done` 是已关闭的 channel，`select` 不会挂住。
+- `cleanup(done)` 改为接收本次运行的 channel。
+- `toggleSender` 把启动/停止放到后台 goroutine，`senderBusy` 标志丢弃重入点击，完成后 `PostMessage(wmAppRefresh)` 回 UI 线程重绘；状态栏先显示「发送服务处理中…」。
+- `stopSender` 关闭后再查一次 `Stats().Listening`，仍在监听就报错而不是谎称已停止。
+
+验证：新增 `internal/sender/lifecycle_test.go`（4 个用例，全部按 **OS 层能否 connect** 判定，不看服务自己的记账）：
+
+| 用例 | 覆盖内容 |
+| --- | --- |
+| `TestStopAfterRestartReleasesPort` | 启动→停止→启动→停止 后端口必须关闭（修复前该用例失败：`listening=true`、HTTP 仍返回 200） |
+| `TestRepeatedCyclesKeepWorking` | 连续 5 个启停周期都正常，无已关闭 channel 的 panic |
+| `TestCloseWithOpenBrowserConnection` | 浏览器页面开着（keep-alive 连接）时停止必须立即成功，不等连接 |
+| `TestDoneNeverBlocks` | `Done()` 在未启动/运行中/已停止三种状态都不挂住 |
+
+真机验证（临时注入自检、跑完即删）：真实 exe 连点 3 轮「启动服务 / 停止服务」，每轮启动后 `listening=true`、端口可连，停止后 `listening=false`、端口拒绝连接；`toggleSender()` 本身耗时 0 ms（不再阻塞界面）。
 
 ---
 
@@ -331,3 +390,4 @@ UI 线程写、worker 线程读的 `bool` 字段。
 | `./gradlew :app:assembleDebug --offline` | ✅ BUILD SUCCESSFUL |
 | 三张页面离屏快照配色复核 | ✅ 大面积纯红/纯黑已消除 |
 | 真实窗口 DC 采样（`QRT_PAINT_CHECK`） | ✅ 修复前全 `rgb(255,255,255)`，修复后为主题色 |
+| 发送服务启停（`internal/sender/lifecycle_test.go`） | ✅ 5 个启停周期端口都真正释放（A8） |

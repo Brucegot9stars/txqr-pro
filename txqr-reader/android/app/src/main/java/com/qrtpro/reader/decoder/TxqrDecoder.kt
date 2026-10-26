@@ -6,7 +6,7 @@ class TxqrDecoder {
     private var activeCodec: CodecType = CodecType.LT
     private var lubyCodec: LubyCodec? = null
     private var lubyDecoder: LubyDecoder? = null
-    private var binaryDecoder: BinaryDecoder? = null
+    private var binaryDecoder: LubyDecoder? = null
     private var raptorDecoder: RaptorDecoder? = null
     private var raptorQDecoder: RaptorQDecoder? = null
     private var onlineDecoder: OnlineDecoder? = null
