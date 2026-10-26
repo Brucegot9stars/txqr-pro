@@ -1,0 +1,90 @@
+name: Test
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Everything that can be built and run on Windows: the whole module.
+  # -race needs cgo, so the Windows job runs the full suite without it.
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: txqr
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: txqr/go.sum
+
+      - name: gofmt
+        run: |
+          $bad = gofmt -l ./cmd ./internal
+          if ($bad) { Write-Error "gofmt needed:`n$bad"; exit 1 }
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -timeout 300s
+
+      # The off-screen -snapshot route reads the bitmap handle directly, so it
+      # cannot catch a bug in the blit that puts pixels onto a real window DC
+      # (a release once shipped a blank window exactly that way). QRT_PAINT_CHECK
+      # samples the window DC after the blit; a white sample means the blank
+      # window came back.
+      - name: Real-window paint check
+        shell: bash
+        run: |
+          go build -o qrt-pro-paintcheck.exe ./cmd/qrt-pro
+          rm -f paintcheck.log
+          QRT_PAINT_CHECK="$PWD/paintcheck.log" ./qrt-pro-paintcheck.exe &
+          APP=$!
+          sleep 6
+          taskkill //PID $APP //F || true
+          sleep 1
+          if [ ! -s paintcheck.log ]; then
+            echo "WM_PAINT never fired (no interactive desktop) - skipping"
+            exit 0
+          fi
+          cat paintcheck.log
+          if grep -q "rgb(255,255,255)" paintcheck.log; then
+            echo "blank window: blit put nothing on the window DC"
+            exit 1
+          fi
+
+  # -race requires cgo. The w32/scanner/uikit packages pull in
+  # golang.org/x/sys/windows and cannot compile off Windows, so the race
+  # detector covers the platform-neutral packages that hold the concurrent
+  # logic (sender sessions, decimen fountain, qr codec).
+  race:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: txqr
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: txqr/go.sum
+
+      - name: Test with race detector
+        run: go test -race ./internal/sender/... ./decimen/... ./qr/... -timeout 300s

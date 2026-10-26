@@ -11,12 +11,15 @@
 
 ```
 008-qrt-pro-opti/
-├── txqr/                      # 发送端 + 桌面接收端 + 启动器（Go），fork 自 divan/txqr
-│   ├── cmd/txqr-web/          #   网页发送端（主要使用，"序列化工具"）
-│   ├── cmd/txqr-desktop/      #   桌面接收端（框选扫描）
-│   ├── cmd/txqr-launcher/     #   GUI 启动器（一键启停）
+├── txqr/                      # 桌面端（Go），fork 自 divan/txqr
+│   ├── cmd/qrt-pro/           #   统一桌面应用：发送端 + 接收端 + 已收文件（唯一入口）
+│   ├── cmd/txqr-web/          #   无界面命令行发送端（薄封装 internal/sender）
 │   ├── cmd/txqr-ascii/        #   终端 ASCII 发送端
 │   ├── cmd/txqr-gif/          #   GIF 发送端
+│   ├── internal/w32/          #   Win32/GDI 底层：资源所有权、DPI、COLORREF
+│   ├── internal/sender/       #   可嵌入的发送端 HTTP 服务（页面已 go:embed）
+│   ├── internal/scanner/      #   接收端管线：区域管理、解码 worker 池、落盘
+│   ├── internal/uikit/        #   立即模式绘制层：主题、按钮、卡片、进度条
 │   ├── decimen/               #   decimen 协议（systematic-carousel + DCF2）
 │   ├── qr/                    #   QR 编解码 + 彩色矩阵
 │   └── third_party/go-qrcode/ #   go.mod replace 目标，本地副本
@@ -24,11 +27,48 @@
 │   └── android/               # 接收端（Android, Kotlin/Compose）
 ├── docs/
 │   ├── protocol-analysis.md   # decimen 协议逐字节规格（权威依据）
-│   └── cleanup-analysis.md    # 目录清理分析报告
-├── .github/workflows/         # 发布流水线（3 个 exe + APK）
+│   ├── cleanup-analysis.md    # 目录清理分析报告
+│   └── code-audit.md          # 代码审计报告（逻辑/并发/资源/线程安全）
+├── .github/workflows/         # 发布流水线（qrt-pro + sender + APK）与 CI 测试（含 -race）
 ├── dist/                      # 打包好的 portable 产物
 └── README.md
 ```
+
+## 统一桌面应用（cmd/qrt-pro）
+
+以前需要三个 exe：`序列化工具.exe`（发送端）、`qrt-pro-receiver-desktop-*.exe`（接收端）、
+`qrt-pro-launcher.exe`（管理前两者的外进程启动器）。三者只通过进程名互相识别，命名不一致的
+bug 正源于此。现在它们合并为**一个进程、一个窗口**：
+
+- 左侧导航栏切换「发送端 / 接收端 / 已收文件」，发送端与接收端可同时工作；
+- 停止扫描从「遍历进程树」退化为一次方法调用；
+- 接收端支持多区域（多屏各扫一路）、实时预览、逐区域进度与统计。
+
+```sh
+cd txqr
+go build -ldflags "-s -w -H windowsgui" -o qrt-pro.exe ./cmd/qrt-pro
+```
+
+离屏出图（用于文档截图与布局回归，锁屏环境下同样可用）：
+
+```sh
+qrt-pro.exe -snapshot shot.png -tab 1 -demo -w 1080 -h 720   # -tab: 0 发送端 1 接收端 2 已收文件
+```
+
+启动后若窗口是一片空白，可以用绘制自检定位（GUI 程序没有控制台，这是唯一客观手段）：
+
+```sh
+set QRT_PAINT_CHECK=%CD%\paint.log
+qrt-pro.exe          # 跑几秒后关掉，paint.log 记录 WM_PAINT 后在窗口 DC 上采样的像素
+```
+
+采样点应出现主题色 `rgb(15,17,23)`（背景）与 `rgb(28,33,45)`（面板）；若全是 `rgb(255,255,255)`，
+说明双缓冲的内容根本没贴到窗口上（CI 里就靠这条断言防回归）。
+
+> 旧的 `cmd/txqr-desktop` 与 `cmd/txqr-launcher` 已随本次合并删除（仍在 Git 历史中，
+> 需要时 `git checkout <旧提交> -- txqr/cmd/txqr-desktop` 即可取回）。
+> `dist/` 下 `qrt-pro-receiver-desktop-*.exe`、`qrt-pro-launcher.exe`、`序列化工具.exe`
+> 是这三个旧入口的构建产物，功能全部在 `qrt-pro.exe` 里，已移入 `dist/_legacy/` 待清理。
 
 ## 协议要点
 
@@ -92,7 +132,10 @@ gradlew.bat :app:assembleDebug --no-daemon
 
 ## 版本
 
-当前版本：`v1.3.0`（见 Git tag）。Android 端 `versionCode=5` / `versionName=1.3.0`。
+当前版本：`v1.4.0`（见 Git tag）。Android 端 `versionCode=6` / `versionName=1.4.0`。
+
+v1.4.0 的主要变化：桌面端三个 exe 合并为统一的 `qrt-pro.exe`，接收端界面重做，并修复
+了代码审计发现的 30 项缺陷（详见 `docs/code-audit.md`）。
 
 ## License
 

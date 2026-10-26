@@ -1,0 +1,333 @@
+# QRT Pro 代码审计报告
+
+范围：`txqr/`（Go 桌面端）与 `txqr-reader/android/`（Kotlin 接收端）。
+目标：逻辑错误、边界条件遗漏、空指针风险、异常处理不完整、资源泄漏、协程/线程使用不当、线程安全。
+
+本报告按「严重程度 → 位置 → 问题 → 处置」记录。第一至第三节共 30 项，全部为 ✅（已修复）；第四节的 3 项收尾工作同样已完成。
+
+---
+
+## 一、严重（会导致崩溃、死锁或明显错误行为）
+
+### A1 ✅ GDI 对象生命周期错误：空心形状继承了别人的画刷
+
+位置：`txqr/internal/w32/w32.go`（`DC.Select` / `RoundRect` / `Ellipse`）
+
+两个缺陷叠加：
+
+1. `RoundRect`/`Ellipse` 用 `Select()` 选中画笔后，在函数返回时 `defer Close()` 删除它——**但此时对象仍被选中在 DC 中**。GDI 禁止删除仍被选中的对象，`DeleteObject` 会失败并留下一个悬空的选中句柄。
+2. `Select()` 里有一个「已见过就不重复选」的短路（`if _, seen := d.old[obj]; seen`）。`NULL_BRUSH`/`NULL_PEN` 是**进程级共享的常量句柄**，因此每个 DC 只会被真正选中一次，之后所有 `Select(NULL_BRUSH)` 全部空转。
+
+后果：`NoFill`（空心）矩形根本没有切回空画刷，而是沿用了 DC 里残留的那个画刷。实测表现是**接收端「扫描区域」整块面板被涂成 `RGB(239,68,68)` 纯红**——那正是「失败帧」开关里 8px 红色状态圆点的画刷。同时每次绘制都泄漏一个 GDI 句柄，累积到 Windows 的 ~10000 上限后所有绘制静默失败。
+
+处置：
+- 新增 `newDC()`，创建时用 `GetCurrentObject` 记录 DC 自带的 `stockBrush`/`stockPen`；
+- 新增 `resetObjects()`，每次形状绘制完成后把 DC 还原到这两个对象；
+- `RoundRect`/`Ellipse` 改为「显式选中（含 NULL stock）→ 绘制 → `resetObjects()` → 删除自己的句柄」；
+- 新增 `NewBrushOrNull` / `NewPenOrNull`，`Brush`/`Pen` 增加 `stock` 标记，`Close()` 对 stock 对象空操作。
+
+### A2 ✅ `w32.RoundRect` 把「无填充」当成黑色
+
+位置：`txqr/internal/w32/w32.go`
+
+调用方用颜色 `0` 表示「不填充」，而 `0` 就是黑色，于是所有 `NoFill` 控件（ghost 按钮、非激活导航项、面板描边）都被涂成黑块。
+
+处置：引入 `NoFill Color = 0xFF000000` 哨兵（COLORREF 只用低 24 位，该值不可能是真实颜色），命中时改用 `GetStockObject(NULL_BRUSH)` / `NULL_PEN`，并在注释里写明原因。
+
+### A3 ✅ `sender.Stats()` 自死锁
+
+位置：`txqr/internal/sender/sender.go`
+
+`Stats()` 持锁后又调用 `Addr()`，`Addr()` 再次请求同一把 `sync.Mutex`。Go 的互斥锁**不可重入**，直接死锁（测试中表现为 60s 超时 panic）。
+
+处置：拆出无锁版本 `addrLocked()`，`Stats()` 调用它；`Addr()` 改为 `defer` 解锁。
+
+### A4 ✅ 除零 panic：`SolvedCount() * 100 / int(hdr.K)`
+
+位置：`txqr/internal/scanner/decode.go`
+
+`K` 来自网络/二维码帧，为 0 时直接 panic，整个接收进程退出。
+
+处置：新增 `kDivisor(k uint16) int`，`K == 0` 时返回 1；补充 `TestProgressWithZeroK` 用例。
+
+### A5 ✅ `locateFinderCenters` 数组越界
+
+位置：`txqr-reader/.../ScannerViewModel.kt`
+
+```kotlin
+if (result.size >= 2 && result[1].second > result[2].second)
+```
+
+`size == 2` 时访问 `result[2]` → `IndexOutOfBoundsException`，从相机分析线程抛出导致崩溃。
+
+处置：条件改为 `result.size >= 3`。
+
+### A6 ✅ 关闭 scanner 时向已关闭的 channel 发送
+
+位置：`txqr/internal/scanner/scanner.go`
+
+`RemoveRegion`/`Clear`/`Stop` 与 worker 并发时，`decQueue`/`saveQueue` 可能已被关闭 → `send on closed channel` panic。
+
+处置：队列由 `qMu sync.RWMutex` + `closed` 标志保护，发送前先取读锁并检查 `closed`。
+
+### A7 ✅ 双缓冲 Blit 与 Restore 顺序颠倒：真实窗口一片空白
+
+位置：`cmd/qrt-pro/app.go`（`paintMain`）与 `cmd/qrt-pro/overlay.go`（`paintOverlay`）
+
+```go
+mem.Restore()                             // 1. 把 DC 还原成创建时的 1×1 占位位图
+dc.Blit(0, 0, rc.W(), rc.H(), mem, 0, 0)  // 2. BitBlt 复制的正是"当前选中的位图"
+```
+
+`Restore()` 的本意是在 `bmp.Close()` 之前取消选中（GDI 不允许删除仍被选中的对象），但它同时把 DC 还原为 `CreateCompatibleDC` 自带的 **1×1 单色占位位图**。`BitBlt` 复制的是 DC 当前选中的位图，于是窗口上贴的是那张 1×1 白位图 —— 表现出来就是一个空白（白色）窗口。
+
+离屏 `-snapshot` 完全不受影响：`ReadBits` 走 `GetDIBits`，直接对 `bmp` 句柄取像素，不依赖 DC 的选中状态。**这正是"截图正确、真窗口空白"的原因**——本轮所有视觉验证都跑在快照路径上，所以直到真正启动才发现。
+
+处置：`Blit` 与 `Restore` 交换顺序（`Restore` 仍排在 `defer bmp.Close()` 之前，defer 是 LIFO，所以从代码顺序看它在后、执行时仍先于 Close）。
+
+验证手段：新增 `QRT_PAINT_CHECK=<path>` 环境变量，`WM_PAINT` 结束后用 `GetPixel` 采样窗口 DC 上的 5 个点并写入该文件（GUI 程序没有控制台，这是唯一客观手段）。对照实验：
+
+| 顺序 | 采样结果 |
+| --- | --- |
+| `Restore → Blit`（错误） | 5 个点全为 `rgb(255,255,255)` |
+| `Blit → Restore`（修复后） | `rgb(15,17,23)` 背景、`rgb(28,33,45)` 面板 |
+
+同时给 `internal/w32` 的 `DC` 增加了 `Pixel()`（`CLR_INVALID` 视为失败）。该检查已写入 `.github/workflows/test.yml` 的 Windows job：若采样出现白色即判失败；若环境无交互式桌面（`WM_PAINT` 未触发、日志为空）则跳过而非误报。
+
+---
+
+## 二、中等（逻辑错误、数据竞争、资源泄漏）
+
+### B1 ✅ 跨线程共享可变状态（Android）
+
+位置：`ScannerViewModel.kt`
+
+`onQrCodeScanned()` 运行在相机分析线程，`consumeBarcodes()`（ML Kit 回调）与 UI ticker 运行在主线程，但 `decodeInFlight`、`trackBox`、`streamMode` 都是普通字段：
+
+- `decodeInFlight` 的读-改-写不是原子的，两个线程可同时判定为 false；
+- `trackBox` 是 `Rect`，**可变对象**，即使引用是 volatile 也仍然存在数据竞争；
+- `decodeColorMatrix()` 直接在分析线程里调用 `decoder.decodeFrame()` 并写 `_uiState`，与主线程 ticker 操作同一个 decoder 实例。
+
+处置：`decodeInFlight` 改 `AtomicBoolean`；`streamMode`/`trackBox` 加 `@Volatile` 且读取时 `Rect(it)` 防御性拷贝；`decodeColorMatrix` 拆成「分析线程只做像素采样、返回 `ByteArray`」+「`viewModelScope.launch` 回主线程应用结果」。
+
+### B2 ✅ `_uiState.value = value.copy(...)` 非原子读改写
+
+位置：`ScannerViewModel.kt` 多处
+
+先读 `value` 再赋值 `copy` 的结果，两次操作之间另一个协程的更新会被覆盖。
+
+处置：统一改用 `_uiState.update { ... }`（单次原子 CAS 循环）。
+
+### B3 ✅ UI ticker 在非扫描态空转
+
+位置：`ScannerViewModel.kt`
+
+`while (true) { refreshUiState(); delay(500) }`，非扫描态时 `refreshUiState` 早期返回但仍执行 `_uiState.value = 同值`。`MutableStateFlow` 每次赋值都会发射，于是**每 500ms 触发一次全量重组，直到进程结束**。
+
+处置：非扫描态时 `uiTicker?.cancel()` 并置空，`startScan()` 重新起 ticker。
+
+### B4 ✅ 相机与线程池泄漏（Android）
+
+位置：`ui/ScannerScreen.kt`
+
+`imageAnalysis.setAnalyzer(Executors.newSingleThreadExecutor())` 每次绑定都新建一个单线程池且**从不 shutdown**；`ProcessCameraProvider` 也从不 `unbindAll()`。反复进入扫描页会累积非守护线程并一直占用相机。
+
+处置：用 `remember` 持有 executor，用 `DisposableEffect { onDispose { unbindAll(); shutdown() } }` 释放。
+
+### B5 ✅ `cameraProviderFuture.get()` 未捕获异常
+
+位置：`ui/ScannerScreen.kt`
+
+`get()` 在 provider 初始化失败时抛 `ExecutionException`，listener 直接死掉，界面只剩黑屏且无任何提示。
+
+处置：try/catch 并打日志后返回。
+
+### B6 ✅ Bitmap 未回收
+
+位置：`ScannerViewModel.kt`
+
+`imageProxyToBitmap()` 每帧分配两张全分辨率 `ARGB_8888` 位图（1920×1080 约 8MB，旋转时甚至三张），裁剪图也未回收，全部依赖 GC——在高帧率扫描下会造成明显的内存压力与 GC 抖动。
+
+处置：旋转用的中间位图用完即 `recycle()`；裁剪图在 `onComplete` 回收；用 `isRecycled` 保证重复释放安全（裁剪失败回退全帧的路径上有两个分支都可能释放它）。
+
+### B7 ✅ `decodeInFlight` 可能永久卡住
+
+位置：`ScannerViewModel.kt`
+
+`barcodeScanner?.process(...)` 在 scanner 已关闭时为 `null`，整条 `?.addOnCompleteListener` 链被跳过，**`decodeInFlight` 永远保持 true，之后每一帧都被静默丢弃**。同理，`process()` 同步抛异常时也不会复位。
+
+处置：scanner 为 null 时立即复位并 `close()`；所有 `process()` 调用包 try/catch，异常路径同样复位并回收位图。
+
+### B8 ✅ 裁剪矩形越界
+
+位置：`ScannerViewModel.kt`
+
+`Bitmap.createBitmap(bitmap, l, t, w, h)` 在矩形越界或宽高 ≤ 0 时抛 `IllegalArgumentException`。
+
+处置：新增 `safeCrop()`，先 `coerceIn` 到合法范围，再 try/catch 兜底返回 null。
+
+### B9 ✅ 保存失败被当成成功
+
+位置：`ScannerViewModel.kt` + `FileSaver.kt` + `MainActivity.kt`
+
+`FileSaver.saveData()` 返回 `Unit` 且内部 catch 后只弹 Toast，调用方**无法区分成功与失败**；`saveDataToFile` 也没有异常处理，无论结果如何都会把状态置为 `IDLE` 并生成 `ScanResult`。而 `MainActivity` 一调用就把 `showResult = true`，保存失败时 `scanResult` 永远为 null，用户被卡在扫描页且看不到错误。
+
+处置：
+- `FileSaver.saveData()` 改为返回 `Boolean`，去掉吞异常的宽 catch 之外保留 Toast；
+- `saveDataToFile` 用 `runCatching` 捕获，失败时写入 `error` 状态并回到 `COMPLETED`；空文件名直接拒绝；
+- `MainActivity` 用 `LaunchedEffect(uiState.error)` 复位 `showResult`，并把 `!!` 换成安全取值。
+
+### B10 ✅ 文件名未净化 / 路径穿越
+
+位置：`FileSaver.kt`
+
+`MediaStore.Downloads.DISPLAY_NAME` 与旧版 `File(downloadsDir, fileName)` 都直接使用用户输入，包含 `/`、`..` 或控制字符时行为不可控（旧版可写出 Downloads 目录之外）。
+
+处置：新增 `sanitizeFileName()`（去控制字符与非法字符、去首尾点与空格、限长 120）；旧版分支增加 `canonicalPath` 前缀校验；`openOutputStream` 返回 null 时视为失败而非成功。
+
+### B11 ✅ 接收端写入失败被静默吞掉
+
+位置：`txqr/internal/scanner/scanner.go`
+
+`writeToDisk` 的错误没有回传，`saver()` 仍然弹出「保存成功」。
+
+处置：`SavedFile` 增加 `Errored`/`Err`，通过 `OnSaved` 回调上报，UI 在「已收文件」页以红色标出失败原因。
+
+### B12 ✅ 同名文件被静默覆盖
+
+位置：`txqr/internal/scanner/scanner.go`
+
+连续接收同名文件会直接覆盖上一次的结果。
+
+处置：新增 `uniquePath()`，同名追加 `(2)`、`(3)` 序号。
+
+### B13 ✅ 解码 worker 重复保存
+
+位置：`txqr/internal/scanner/scanner.go`
+
+多个 worker 同时判定完成时，同一区域会被保存多次。
+
+处置：`doneOnce.CompareAndSwap(0, 1)` 保证 exactly-once。
+
+### B14 ✅ `SaveFails` 数据竞争
+
+位置：`txqr/internal/scanner/decode.go`
+
+UI 线程写、worker 线程读的 `bool` 字段。
+
+处置：改为 `atomic.Int32`（`SaveFailFlag`）。
+
+### B15 ✅ `time.Tick` 泄漏
+
+位置：`txqr/internal/sender/sender.go`
+
+`cleanup()` 使用 `time.Tick`，即使服务关闭定时器也不会被回收。
+
+处置：改为 `time.NewTicker` + `done` channel，退出时 `Stop()`。
+
+### B16 ✅ 上传限流与错误码混淆
+
+位置：`txqr/internal/sender/sender.go`
+
+- `handleMD5` 没有处理 `MaxBytesError`，超限请求返回 400 而不是 413；
+- `handleFrame` 把「帧下标越界」和「渲染失败」都返回 500；旧版本越界时返回 **200 + 空 body**，播放器会一直卡在等待帧。
+
+处置：抽出统一 `readBody(w, r)` 供两个 handler 共用；`handleFrame` 增加 `badIndex` 标志，越界返回 400，渲染失败返回 500。
+
+### B17 ✅ `pushSpeedSample` 持有底层数组
+
+位置：`txqr/internal/scanner/decode.go`
+
+用 reslice 丢弃旧样本，底层数组不会被回收，长时间扫描会稳定占用一大块内存。
+
+处置：改为 `copy` 左移。
+
+### B18 ✅ HTTP 服务缺少超时与隔离
+
+位置：`txqr/internal/sender/sender.go`
+
+使用 `http.DefaultServeMux`（会被任意依赖包污染）、`ListenAndServe`（无超时，慢连接可耗尽资源）。
+
+处置：私有 `http.ServeMux` + 显式 `http.Server`（`ReadHeaderTimeout`/`WriteTimeout`/`IdleTimeout`）+ `MaxBytesReader` 限流 + `stopOnce` 幂等关闭。
+
+### B19 ✅ 进度值越界导致 Compose 崩溃
+
+位置：`ui/ScannerScreen.kt`
+
+`LinearProgressIndicator(progress = { progress / 100f })`，解码器在最后几帧可能短暂上报 >100，Compose 对超出 `0..1` 的 progress 抛异常。
+
+处置：`progress.coerceIn(0, 100) / 100f`。
+
+---
+
+## 三、结构性整改（需求 1：整合到一个启动器）
+
+### C1 ✅ 三个 exe 合并为一个进程
+
+原先：`序列化工具.exe`（sender）+ `qrt-pro-receiver-desktop-*.exe`（receiver）+ `qrt-pro-launcher.exe`（外进程管理）。三者只通过进程名互相识别，命名不一致类 bug 因此而来。
+
+现在：`cmd/qrt-pro` 单进程同时托管 sender（`internal/sender`）与 receiver（`internal/scanner`）：
+
+- 停止扫描从「遍历进程树」退化为一次方法调用；
+- 只有一个消息循环需要保活；
+- 发送端页面、接收端页面、已收文件页面在同一窗口内用左侧导航栏切换。
+
+同时把可复用逻辑抽成独立包，避免新旧两处实现各自演化：
+
+| 包 | 职责 |
+| --- | --- |
+| `internal/w32` | Win32/GDI 底层（资源所有权、DPI、COLORREF、UTF-16 计数） |
+| `internal/sender` | 可嵌入的发送端 HTTP 服务（`go:embed` 页面） |
+| `internal/scanner` | 接收端管线（区域管理、解码 worker 池、落盘） |
+| `internal/uikit` | 立即模式绘制层（主题、按钮、卡片、进度条、预览） |
+
+`cmd/txqr-web` 保留为无界面的命令行发送端，仅剩 62 行薄封装。
+
+### C2 ✅ 离屏渲染快照能力
+
+`cmd/qrt-pro -snapshot <path> -tab <0|1|2> [-demo] [-w] [-h]`：走与 `WM_PAINT` 完全相同的 `drawInto()` 代码路径，自建位图 + `GetDIBits` 回读 + PNG 导出。锁屏/无桌面环境下也能出图，用于文档截图与布局回归检查。
+
+### C3 ✅ 绘制调用跟踪
+
+`internal/w32` 支持 `QRT_DRAW_LOG=<path>`，把每次 `RoundRect`/`Ellipse`/`VerticalGradient` 的矩形与颜色写成一行日志。GUI 程序无法挂控制台，这是定位「这块为什么是红色」最快的手段（A1 就是靠它定位的）。
+
+---
+
+## 四、收尾项
+
+### D1 ✅ 删除已被取代的旧实现副本
+
+`cmd/txqr-desktop`（`main.go` 821 行 + `decode.go` 347 行 + `win32.go` 365 行）与 `cmd/txqr-launcher`（741 行）合计约 2200 行，功能已被 `internal/scanner` + `internal/w32` + `cmd/qrt-pro` 取代，而两份副本里仍保留着 A4/A6/B11/B12/B14/B15 等项的原始缺陷（本轮只修了抽取出来的新包）。
+
+处置：两个目录连同其测试一并 `git rm`（仍在 Git 历史中，可 `git checkout <旧提交> -- txqr/cmd/txqr-desktop` 取回）。
+
+仍未处理：`dist/` 下 `qrt-pro-receiver-desktop-*.exe`、`qrt-pro-launcher.exe`、`序列化工具.exe` 三个旧产物。`dist/` 被 `.gitignore` 忽略、不在版本控制内，删除后不可恢复，因此留给使用者自行清理；README 已注明它们可以安全删除。
+
+### D2 ✅ 导航副标题文案
+
+`cmd/qrt-pro/app.go` 侧栏副标题原为 `"光佃轮·一步到位"`，`光佃轮` 不成词。处置：改为 `"收发一体·一步到位"`，与「发送端 + 接收端合并为一个进程」这一改动相符。若原文案另有含义，改回来只需一行。
+
+### D3 ✅ CI 增加 `-race` job
+
+`CGO_ENABLED=0` 时 `go test -race` 无法运行，本机也没有可用的 C 工具链（只有 clang，缺 Windows SDK 头文件）。
+
+处置：新增 `.github/workflows/test.yml`，两个 job：
+
+- `windows`：`windows-latest`，`CGO_ENABLED=0`，跑 `gofmt -l` 校验 + `go build ./...` + `go vet ./...` + `go test ./...`（全模块）；
+- `race`：`ubuntu-latest`，`CGO_ENABLED=1`，跑 `go test -race ./internal/sender/... ./decimen/... ./qr/...`。
+
+`internal/w32`、`internal/scanner`、`internal/uikit`、`cmd/qrt-pro` 通过 `golang.org/x/sys/windows` 只能在 Windows 下编译，因此 `-race` 覆盖的是与平台无关的并发逻辑（sender 会话与清理协程、decimen 喷泉码、qr 编解码）。若要让 scanner 也进 race，需在 Windows runner 上装 MinGW 并开 CGO，成本较高，暂未做。
+
+---
+
+## 五、验证
+
+| 检查项 | 结果 |
+| --- | --- |
+| `go build ./...` | ✅ |
+| `go vet ./...` | ✅ |
+| `go test ./...`（含 sender/scanner 新增用例） | ✅ 全部通过 |
+| `./gradlew :app:compileDebugKotlin --offline` | ✅ |
+| `./gradlew :app:assembleDebug --offline` | ✅ BUILD SUCCESSFUL |
+| 三张页面离屏快照配色复核 | ✅ 大面积纯红/纯黑已消除 |
+| 真实窗口 DC 采样（`QRT_PAINT_CHECK`） | ✅ 修复前全 `rgb(255,255,255)`，修复后为主题色 |

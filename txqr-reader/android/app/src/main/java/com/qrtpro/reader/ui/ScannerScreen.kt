@@ -105,6 +105,11 @@ private fun CameraPreview(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    // One executor for the lifetime of this composable. The old code created it
+    // inline per binding and never shut it down, so every re-entry into the
+    // screen leaked a non-daemon thread that also kept the camera alive.
+    val analyzerExecutor = remember { Executors.newSingleThreadExecutor() }
+    var cameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
 
     AndroidView(
         modifier = modifier,
@@ -119,7 +124,15 @@ private fun CameraPreview(
 
             val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
             cameraProviderFuture.addListener({
-                val cameraProvider = cameraProviderFuture.get()
+                // get() throws if the provider failed to initialise; without
+                // this the listener dies and the screen shows a black preview.
+                val provider = try {
+                    cameraProviderFuture.get()
+                } catch (t: Throwable) {
+                    android.util.Log.w("QRT", "camera provider unavailable: ${t.message}")
+                    return@addListener
+                }
+                cameraProvider = provider
 
                 val preview = Preview.Builder().build().also {
                     it.surfaceProvider = previewView.surfaceProvider
@@ -130,28 +143,40 @@ private fun CameraPreview(
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
 
-                imageAnalysis.setAnalyzer(Executors.newSingleThreadExecutor()) { imageProxy ->
+                imageAnalysis.setAnalyzer(analyzerExecutor) { imageProxy ->
                     viewModel.onQrCodeScanned(imageProxy)
                 }
 
                 val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
                 try {
-                    cameraProvider.unbindAll()
-                    cameraProvider.bindToLifecycle(
+                    provider.unbindAll()
+                    provider.bindToLifecycle(
                         lifecycleOwner,
                         cameraSelector,
                         preview,
                         imageAnalysis
                     )
                 } catch (e: Exception) {
-                    e.printStackTrace()
+                    android.util.Log.w("QRT", "bindToLifecycle failed: ${e.message}")
                 }
             }, ContextCompat.getMainExecutor(ctx))
 
             previewView
         }
     )
+
+    DisposableEffect(Unit) {
+        onDispose {
+            try {
+                cameraProvider?.unbindAll()
+            } catch (t: Throwable) {
+                android.util.Log.w("QRT", "unbindAll failed: ${t.message}")
+            }
+            cameraProvider = null
+            analyzerExecutor.shutdown()
+        }
+    }
 }
 
 @Composable
@@ -298,8 +323,10 @@ private fun ProgressPanel(
             )
             Spacer(modifier = Modifier.height(8.dp))
 
+            // coerceIn: the decoder can briefly report >100 while the last
+            // frames land, and Compose throws on a progress outside 0..1.
             LinearProgressIndicator(
-                progress = { progress / 100f },
+                progress = { progress.coerceIn(0, 100) / 100f },
                 modifier = Modifier.fillMaxWidth().height(8.dp),
                 color = Color.Green,
                 trackColor = Color.DarkGray,

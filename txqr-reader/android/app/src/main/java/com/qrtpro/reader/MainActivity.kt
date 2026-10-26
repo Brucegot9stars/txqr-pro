@@ -34,9 +34,17 @@ fun TxqrReaderApp() {
     val uiState by viewModel.uiState.collectAsState()
     var showResult by remember { mutableStateOf(false) }
 
-    if (showResult && uiState.scanResult != null) {
+    // A failed save never produces a ScanResult, so the flag has to be dropped
+    // again — otherwise the app sits on the scanning screen with the error
+    // buried in the state and no visible way back.
+    LaunchedEffect(uiState.error) {
+        if (uiState.error != null) showResult = false
+    }
+
+    val result = uiState.scanResult
+    if (showResult && result != null) {
         ResultScreen(
-            scanResult = uiState.scanResult!!,
+            scanResult = result,
             onBackToScan = {
                 showResult = false
                 viewModel.startScan()

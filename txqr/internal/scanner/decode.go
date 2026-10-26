@@ -1,4 +1,13 @@
-package main
+// Package scanner implements the desktop receive pipeline: capture screen
+// rectangles at a fixed cadence, decode the QR frames, reassemble the transfer
+// and hand the bytes to a single writer goroutine.
+//
+// It is deliberately UI-free. The unified app (cmd/qrt-pro) and any future
+// headless wrapper share it; the UI observes it through snapshots and callbacks
+// rather than touching its state directly. That separation is also what lets
+// the concurrency bugs below stay fixed: nothing outside may read or write
+// region state without going through this package's accessors.
+package scanner
 
 import (
 	"bytes"
@@ -11,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/divan/txqr"
@@ -18,8 +28,9 @@ import (
 	"github.com/divan/txqr/qr"
 )
 
-// decodeState holds the receive-side decoders and progress stats. All access
-// goes through the mutex; the capture loop and the UI both touch it.
+// decodeState holds the receive-side decoders and progress stats for one region.
+// Every field is reachable only with mu held, except SaveFails, which is written
+// from the UI thread and read by workers — hence its own atomic.
 type decodeState struct {
 	mu sync.Mutex
 
@@ -27,21 +38,19 @@ type decodeState struct {
 	decimenHdr decimen.Header
 	txqrDec    *txqr.Decoder
 
-	startTime time.Time
-	endTime   time.Time // frozen when the transfer completes (avg speed is stable)
-	lastTime  time.Time
-	frames    int
-	bytes     int64
-	captured  int     // QR decode attempts
-	decodeFail int    // attempts that yielded no payload
-	savedDebug int    // debug frames written
-	completed bool
-	result    []byte
-	fileName  string
-	mode      string // "decimen" or "txqr"
-	// SaveFails keeps undecodable captures to %TEMP%\qrt-debug when enabled
-	// (a diagnosis aid; writing every failed frame slows the receiver).
-	SaveFails bool
+	startTime  time.Time
+	endTime    time.Time // frozen when the transfer completes (avg speed stays stable)
+	lastTime   time.Time
+	frames     int
+	bytes      int64
+	captured   int // QR decode attempts
+	decodeFail int
+	savedDebug int
+	completed  bool
+	result     []byte
+	fileName   string
+	mode       string // "decimen" or "txqr"
+	SaveFails  SaveFailFlag
 
 	speedWnd []speedSample // sliding window of (time, effective bytes)
 
@@ -53,15 +62,35 @@ type decodeState struct {
 	txqrSeen  map[int]struct{}
 }
 
-// speedSample records cumulative effective bytes at a moment; the window's
-// delta drives the live speed line.
+// SaveFailFlag is written by the UI thread and read by every decode worker, so
+// it must not be a plain bool sharing a decodeState's other fields: racing that
+// read/write pair would be undefined behaviour even though only one thread ever
+// mutates the flag.
+type SaveFailFlag struct{ v atomic.Int32 }
+
+// Set stores the flag.
+func (f *SaveFailFlag) Set(on bool) {
+	if on {
+		f.v.Store(1)
+		return
+	}
+	f.v.Store(0)
+}
+
+// Get reports the flag.
+func (f *SaveFailFlag) Get() bool { return f.v.Load() != 0 }
+
 type speedSample struct {
 	t time.Time
 	b int64
 }
 
+// debugFrameLimit bounds how many undecodable captures ever hit disk, so
+// "save failed frames" can never fill the temp dir.
+const debugFrameLimit = 20
+
 func (s *decodeState) saveDebugFrame(rgba *image.RGBA) {
-	if !s.SaveFails || s.savedDebug >= 20 {
+	if !s.SaveFails.Get() || s.savedDebug >= debugFrameLimit {
 		return
 	}
 	dir := filepath.Join(os.TempDir(), "qrt-debug")
@@ -73,6 +102,8 @@ func (s *decodeState) saveDebugFrame(rgba *image.RGBA) {
 	if err != nil {
 		return
 	}
+	// Errors are intentionally swallowed (diagnostics must not break scanning),
+	// but the file handle must still be closed.
 	png.Encode(f, rgba)
 	f.Close()
 	s.savedDebug++
@@ -88,6 +119,8 @@ func (s *decodeState) reset() {
 	s.lastTime = time.Time{}
 	s.frames = 0
 	s.bytes = 0
+	s.captured = 0
+	s.decodeFail = 0
 	s.speedWnd = nil
 	s.txqrTotal, s.txqrChunk, s.txqrNeed, s.txqrGot = 0, 0, 0, 0
 	s.txqrSeen = nil
@@ -97,22 +130,12 @@ func (s *decodeState) reset() {
 	s.mode = ""
 }
 
-// feed decodes one captured frame and routes it to the decimen or classic
-// decoder. Returns true when the transfer just completed.
-func (s *decodeState) feed(rgba *image.RGBA) bool {
-	payload := s.decode(rgba)
-	if payload == nil {
-		return false
-	}
-	return s.feedPayload(payload)
-}
-
-// decode runs gozxing on a frame and updates counters. Thread-safe against
-// other decoders (each region's decodeState is independent), so multiple
-// capture workers can decode in parallel.
+// decode runs gozxing on a frame and updates counters. Each region owns its own
+// decodeState, so several capture workers may be inside this at once for
+// different regions without colliding.
 func (s *decodeState) decode(rgba *image.RGBA) []byte {
-	// try native, then smaller, then larger — a real capture can have the QR
-	// at any relative size in the boxed region
+	// try native, then smaller, then larger — a real capture can have the QR at
+	// any relative size inside the boxed region
 	raw, err := qr.DecodeRawMultiScale(rgba, []float64{1.0, 0.6, 1.7})
 	payload := qr.ExtractFramePayload(raw)
 
@@ -127,9 +150,9 @@ func (s *decodeState) decode(rgba *image.RGBA) []byte {
 	return payload
 }
 
-// feedPayload hands a decoded frame to the (single) decoder. Serialized per
-// region — the LT/txqr decoders are not thread-safe, so only one caller feeds
-// at a time. Cheap (µs), so it never becomes the bottleneck.
+// feedPayload hands a decoded frame to the (single) decoder. Serialised per
+// region — the LT/txqr decoders are not thread-safe, and it is cheap (µs), so
+// it never becomes the bottleneck.
 func (s *decodeState) feedPayload(payload []byte) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -159,7 +182,7 @@ func (s *decodeState) feedDecimenLocked(frame []byte) bool {
 	s.mode = "decimen"
 	s.frames++
 	// Count ONLY genuinely new payload bytes (dedup by seq) as "effective":
-	// repeated frames the camera re-reads inflate a raw byte counter.
+	// repeated frames the camera re-reads would otherwise inflate the counter.
 	before := s.decimenDec.FramesNew
 	s.decimenDec.AddFrame(f.Header.Seq, f.Payload)
 	if s.decimenDec.FramesNew > before {
@@ -239,18 +262,37 @@ func shaMatches(container, file []byte) bool {
 	return bytes.Equal(got[:], want)
 }
 
-// snapshot copies the stats the UI needs, under the mutex. byBlocks selects
-// the decimen progress flavor: solved blocks vs frames collected.
+// Snapshot is a point-in-time, copy-out view of one region's progress. Nothing
+// referenced here aliases live scanner state, so the UI can hold it freely.
+type Snapshot struct {
+	ID       int
+	Label    string
+	W, H     int
+	Scanning bool
+	Done     bool
+	Progress int
+	Status   string
+	Mode     string
+	Speed    int64
+	AvgSpeed int64
+	Bytes    int64
+	Frames   int
+	Captured int
+	Failed   int
+}
+
+// snapshot copies the stats the UI needs, under the mutex. byBlocks selects the
+// decimen progress flavour: solved blocks vs frames collected.
 func (s *decodeState) snapshot(byBlocks bool) (progress int, status string, done bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.completed {
-		return 100, "平均 " + fmtBytes(s.avgSpeedBps()) + "/s", true
+		return 100, "平均 " + FmtBytes(s.avgSpeedBps()) + "/s", true
 	}
 	p := 0
 	if s.decimenDec != nil {
 		if byBlocks {
-			p = s.decimenDec.SolvedCount() * 100 / int(s.decimenHdr.K)
+			p = s.decimenDec.SolvedCount() * 100 / kDivisor(s.decimenHdr.K)
 		} else {
 			// Progress by frames COLLECTED (new seqs), not blocks solved: the
 			// peeling cascade back-loads — solved count stalls ~50% then jumps.
@@ -276,10 +318,38 @@ func (s *decodeState) snapshot(byBlocks bool) (progress int, status string, done
 	return p, status, false
 }
 
+// kDivisor guards every percentage denominator derived from a frame header: a
+// malformed or hostile frame carries K == 0 and would otherwise panic the whole
+// receiver with an integer divide by zero.
+func kDivisor(k uint16) int {
+	if k == 0 {
+		return 1
+	}
+	return int(k)
+}
+
+// stats returns the numeric readouts the UI trends over time.
+func (s *decodeState) stats() (speed, avg int64, bytes int64, frames int, captured, failed int, mode string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.currentSpeedBps(), s.avgSpeedBps(), s.bytes, s.frames, s.captured, s.decodeFail, s.mode
+}
+
+// completedResult copies out the assembled bytes; it must be reset() before the
+// same region can be scanned again.
+func (s *decodeState) completedResult() ([]byte, string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.completed {
+		return nil, "", false
+	}
+	return s.result, s.fileName, true
+}
+
 // currentSpeedBps is the live effective-data rate: a sliding ~5s window of
 // deduplicated parsed bytes. Falls back to the session average when the window
-// has fewer than two samples (sparse valid frames), so the line never shows a
-// bogus 0 between slow arrivals.
+// has fewer than two samples, so the line never shows a bogus 0 between slow
+// arrivals.
 func (s *decodeState) currentSpeedBps() int64 {
 	if len(s.speedWnd) >= 2 {
 		last := s.speedWnd[len(s.speedWnd)-1]
@@ -297,7 +367,7 @@ func (s *decodeState) currentSpeedBps() int64 {
 
 // avgSpeedBps is the whole-transfer effective-data rate: total deduplicated
 // parsed bytes over the entire session. Uses the frozen endTime once complete,
-// so the "done" figure is stable.
+// so the "done" figure stays stable.
 func (s *decodeState) avgSpeedBps() int64 {
 	if s.bytes <= 0 {
 		return 0
@@ -313,35 +383,59 @@ func (s *decodeState) avgSpeedBps() int64 {
 	return int64(float64(s.bytes) / elapsed.Seconds())
 }
 
-// pushSpeedSample records cumulative effective bytes; used by the live speed.
+// pushSpeedSample records cumulative effective bytes; it trims the window
+// eagerly so a long scan never accumulates unbounded samples.
 func (s *decodeState) pushSpeedSample() {
 	s.speedWnd = append(s.speedWnd, speedSample{t: time.Now(), b: s.bytes})
 	cutoff := time.Now().Add(-5 * time.Second)
 	for len(s.speedWnd) > 1 && s.speedWnd[0].t.Before(cutoff) {
-		s.speedWnd = s.speedWnd[1:]
+		// Shift instead of re-slicing forever: repeated reslicing of a large
+		// backing array retains memory that will never be used again.
+		copy(s.speedWnd, s.speedWnd[1:])
+		s.speedWnd = s.speedWnd[:len(s.speedWnd)-1]
 	}
 }
 
 func fmtStatus(mode string, frames, captured, decodeFail int, bytes, speedBps int64) string {
 	speed := "0 KB/s"
 	if speedBps > 0 {
-		speed = fmtBytes(speedBps) + "/s"
+		speed = FmtBytes(speedBps) + "/s"
 	}
 	if mode == "decimen" {
 		return fmt.Sprintf("捕获%d · 解码失败%d · 有效帧%d · 有效 %s · %s",
-			captured, decodeFail, frames, fmtBytes(bytes), speed)
+			captured, decodeFail, frames, FmtBytes(bytes), speed)
 	}
 	return fmt.Sprintf("捕获%d · 解码失败%d · 有效帧%d · %s · %s",
-		captured, decodeFail, frames, fmtBytes(bytes), speed)
+		captured, decodeFail, frames, FmtBytes(bytes), speed)
 }
 
-func fmtBytes(n int64) string {
+// FmtBytes renders a byte count with a binary unit.
+func FmtBytes(n int64) string {
 	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.2f GB", float64(n)/(1<<30))
 	case n >= 1<<20:
 		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
 	case n >= 1<<10:
 		return fmt.Sprintf("%.1f KB", float64(n)/(1<<10))
 	default:
 		return fmt.Sprintf("%d B", n)
+	}
+}
+
+// FmtElapsed renders a duration compactly for a status line.
+func FmtElapsed(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d >= time.Hour:
+		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	case d >= time.Minute:
+		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+	case d >= time.Second:
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	default:
+		return fmt.Sprintf("%dms", d.Milliseconds())
 	}
 }
