@@ -66,12 +66,21 @@ jobs:
       - name: Stage release APK with version name
         working-directory: txqr-reader/android
         run: |
-          mkdir -p ../../../dist
-          cp app/build/outputs/apk/release/app-release.apk ../../../dist/qrt-pro-reader-${{ github.ref_name }}.apk
+          # txqr-reader/android -> ../.. is the repo root; one more ".." would
+          # drop the APK outside the workspace, where the upload step silently
+          # reported "pattern does not match any files" and shipped a release
+          # without the APK.
+          mkdir -p ../../dist
+          cp app/build/outputs/apk/release/app-release.apk "../../dist/qrt-pro-reader-${{ github.ref_name }}.apk"
+          ls -lh ../../dist/
+          # Fail loudly rather than publish a release that is missing an asset.
+          test -s "../../dist/qrt-pro-reader-${{ github.ref_name }}.apk"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
+          # A silently missing asset is worse than a red build: catch it here.
+          fail_on_unmatched_files: true
           files: |
             dist/qrt-pro-windows-amd64-${{ github.ref_name }}.exe
             dist/qrt-pro-sender-windows-amd64-${{ github.ref_name }}.exe
