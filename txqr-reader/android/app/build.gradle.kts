@@ -5,20 +5,21 @@ plugins {
 }
 
 android {
-    namespace = "com.txqr.reader"
+    namespace = "com.qrtpro.reader"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.txqr.reader"
+        applicationId = "com.qrtpro.reader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 7
+        versionName = "1.4.1"
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
@@ -38,6 +39,7 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     // Compose BOM
     val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
     implementation(composeBom)

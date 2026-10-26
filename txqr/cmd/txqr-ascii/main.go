@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/divan/txqr"
@@ -16,6 +17,7 @@ import (
 func main() {
 	split := flag.Int("split", 100, "Chunk size for data split per frame")
 	delay := flag.Duration("delay", 100*time.Millisecond, "Delay between frames")
+	codec := flag.String("codec", "", "Codec type: lt (default), binary, raptor, raptorq, online")
 	flag.Parse()
 
 	if len(flag.Args()) != 1 {
@@ -30,7 +32,9 @@ func main() {
 	}
 
 	str := string(data)
-	chunks, err := txqr.NewEncoder(*split).Encode(str)
+	encoder := txqr.NewEncoder(*split, txqr.ParseCodec(*codec))
+	encoder.SetFileName(filepath.Base(filename))
+	chunks, err := encoder.Encode(str)
 	if err != nil {
 		log.Fatalf("Encode failed: %v", err)
 	}

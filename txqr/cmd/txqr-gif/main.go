@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/divan/txqr"
 	"github.com/divan/txqr/qr"
@@ -19,6 +20,7 @@ func main() {
 	size := flag.Int("size", 300, "QR code size")
 	fps := flag.Int("fps", 5, "Animation FPS")
 	output := flag.String("o", "out.gif", "Output animated gif file")
+	codec := flag.String("codec", "", "Codec type: lt (default), binary, raptor, raptorq, online")
 	flag.Parse()
 
 	if len(flag.Args()) != 1 {
@@ -32,7 +34,7 @@ func main() {
 		log.Fatalf("[ERROR] Read input file: %v", err)
 	}
 
-	out, err := AnimatedGif(data, *size, *fps, *splitSize, qr.Medium)
+	out, err := AnimatedGif(data, filepath.Base(filename), *size, *fps, *splitSize, qr.Medium, txqr.ParseCodec(*codec))
 	if err != nil {
 		log.Fatalf("[ERROR] Creating animated gif: %v", err)
 	}
@@ -44,9 +46,11 @@ func main() {
 	log.Println("Written output to", *output)
 }
 
-func AnimatedGif(data []byte, imgSize int, fps, size int, lvl qr.RecoveryLevel) ([]byte, error) {
+func AnimatedGif(data []byte, name string, imgSize int, fps, size int, lvl qr.RecoveryLevel, codec txqr.CodecType) ([]byte, error) {
 	str := string(data)
-	chunks, err := txqr.NewEncoder(size).Encode(str)
+	encoder := txqr.NewEncoder(size, codec)
+	encoder.SetFileName(name)
+	chunks, err := encoder.Encode(str)
 	if err != nil {
 		return nil, fmt.Errorf("encode: %v", err)
 	}

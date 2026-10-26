@@ -1,0 +1,27 @@
+# Keep every text file LF in the repository *and* in the working tree.
+#
+# Without this, a Windows checkout (core.autocrlf=true, which GitHub Actions
+# runners use) materialises CRLF, and `gofmt -l` then reports every single Go
+# file as "needs formatting" because gofmt always writes LF. That made the
+# Windows CI job fail with a list of files nobody had touched.
+#
+# Binary formats are excluded so they are never line-ending converted.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.apk binary
+*.exe binary
+*.zip binary
+*.jar binary
+# Windows scripts keep CRLF: cmd.exe is unreliable with LF-only .bat files.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.woff binary
+*.woff2 binary
+*.ttf binary

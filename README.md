@@ -10,17 +10,66 @@
 ## 目录结构
 
 ```
-008-qrt-pro/
-├── txqr/                 # 发送端（Go），fork 自 divan/txqr
-│   ├── cmd/txqr-web/     #   网页发送端（主要使用，"序列化工具"）
-│   ├── cmd/txqr-ascii/   #   终端 ASCII 发送端
-│   ├── cmd/txqr-gif/     #   GIF 发送端
-│   └── bin/              #   编译产物
-├── txqr-reader/          # 接收端（Android, Kotlin/Compose）
-│   └── android/          #   Google Android 工程
-├── dist/                 # 打包好的 portable 发送端 exe
+008-qrt-pro-opti/
+├── txqr/                      # 桌面端（Go），fork 自 divan/txqr
+│   ├── cmd/qrt-pro/           #   统一桌面应用：发送端 + 接收端 + 已收文件（唯一入口）
+│   ├── cmd/txqr-web/          #   无界面命令行发送端（薄封装 internal/sender）
+│   ├── cmd/txqr-ascii/        #   终端 ASCII 发送端
+│   ├── cmd/txqr-gif/          #   GIF 发送端
+│   ├── internal/w32/          #   Win32/GDI 底层：资源所有权、DPI、COLORREF
+│   ├── internal/sender/       #   可嵌入的发送端 HTTP 服务（页面已 go:embed）
+│   ├── internal/scanner/      #   接收端管线：区域管理、解码 worker 池、落盘
+│   ├── internal/uikit/        #   立即模式绘制层：主题、按钮、卡片、进度条
+│   ├── decimen/               #   decimen 协议（systematic-carousel + DCF2）
+│   ├── qr/                    #   QR 编解码 + 彩色矩阵
+│   └── third_party/go-qrcode/ #   go.mod replace 目标，本地副本
+├── txqr-reader/
+│   └── android/               # 接收端（Android, Kotlin/Compose）
+├── docs/
+│   ├── protocol-analysis.md   # decimen 协议逐字节规格（权威依据）
+│   ├── cleanup-analysis.md    # 目录清理分析报告
+│   ├── code-audit.md          # 代码审计报告（逻辑/并发/资源/线程安全）
+│   └── mode-and-codec-analysis.md  # 编码方案与工作模式的原理、实测与结论
+├── .github/workflows/         # 发布流水线（qrt-pro + sender + APK）与 CI 测试（含 -race）
+├── dist/                      # 打包好的 portable 产物
 └── README.md
 ```
+
+## 统一桌面应用（cmd/qrt-pro）
+
+以前需要三个 exe：`序列化工具.exe`（发送端）、`qrt-pro-receiver-desktop-*.exe`（接收端）、
+`qrt-pro-launcher.exe`（管理前两者的外进程启动器）。三者只通过进程名互相识别，命名不一致的
+bug 正源于此。现在它们合并为**一个进程、一个窗口**：
+
+- 左侧导航栏切换「发送端 / 接收端 / 已收文件」，发送端与接收端可同时工作；
+- 停止扫描从「遍历进程树」退化为一次方法调用；
+- 接收端支持多区域（多屏各扫一路）、实时预览、逐区域进度与统计。
+
+```sh
+cd txqr
+go build -ldflags "-s -w -H windowsgui" -o qrt-pro.exe ./cmd/qrt-pro
+```
+
+离屏出图（用于文档截图与布局回归，锁屏环境下同样可用）：
+
+```sh
+qrt-pro.exe -snapshot shot.png -tab 1 -demo -w 1080 -h 720   # -tab: 0 发送端 1 接收端 2 已收文件
+```
+
+启动后若窗口是一片空白，可以用绘制自检定位（GUI 程序没有控制台，这是唯一客观手段）：
+
+```sh
+set QRT_PAINT_CHECK=%CD%\paint.log
+qrt-pro.exe          # 跑几秒后关掉，paint.log 记录 WM_PAINT 后在窗口 DC 上采样的像素
+```
+
+采样点应出现主题色 `rgb(15,17,23)`（背景）与 `rgb(28,33,45)`（面板）；若全是 `rgb(255,255,255)`，
+说明双缓冲的内容根本没贴到窗口上（CI 里就靠这条断言防回归）。
+
+> 旧的 `cmd/txqr-desktop` 与 `cmd/txqr-launcher` 已随本次合并删除（仍在 Git 历史中，
+> 需要时 `git checkout <旧提交> -- txqr/cmd/txqr-desktop` 即可取回）。
+> `dist/` 下 `qrt-pro-receiver-desktop-*.exe`、`qrt-pro-launcher.exe`、`序列化工具.exe`
+> 是这三个旧入口的构建产物，功能全部在 `qrt-pro.exe` 里，已移入 `dist/_legacy/` 待清理。
 
 ## 协议要点
 
@@ -59,7 +108,7 @@ go build -ldflags "-s -w" -o txqr-web.exe .     # 或使用 bin/ / dist/ 内已�
   - MersenneTwister（Int63/Float64/Perm）、RFC5053 分区、soliton CDF、PickIndices。
   - 已去除 base64 还原逻辑，`dataBytes` 直接返回原始字节。
 - **原始二进制保存**：通过 MediaStore 写入 Downloads，按内容自动推断后缀。
-- 实时速度：2 秒滑动窗口瞬时速率，每 500ms 刷新。
+- 实时速度：2 秒滑动窗口瞬时速率 + 全程平均速率，每 500ms 刷新。
 - 支持扫码完成后重扫（「Scan Another」）。
 
 ### 构建接收端 APK
@@ -72,6 +121,10 @@ gradlew.bat :app:assembleDebug --no-daemon
 # 产物：app\build\outputs\apk\debug\app-debug.apk
 ```
 
+> ⚠️ **工程路径必须为纯 ASCII**。AGP 会硬性检查并直接失败：
+> `Your project path contains non-ASCII characters`。
+> `local.properties` 记录本机 SDK 路径（`sdk.dir`），已被 `.gitignore` 忽略，换机器需自行生成。
+
 ## 使用流程
 
 1. 接收端手机安装 APK。
@@ -80,7 +133,23 @@ gradlew.bat :app:assembleDebug --no-daemon
 
 ## 版本
 
-当前版本：`v1.0.0`（见 Git tag）。
+当前版本：`v1.4.1`（见 Git tag）。Android 端 `versionCode=7` / `versionName=1.4.1`。
+
+v1.4.0 的主要变化：桌面端三个 exe 合并为统一的 `qrt-pro.exe`，接收端界面重做，并修复
+了代码审计发现的 30 项缺陷（详见 `docs/code-audit.md`）。
+
+v1.4.1 是缺陷修复版本：
+
+- **「停止服务」第二次以后失效**：`Close()` 被 `sync.Once` 包着，只能生效一次，
+  端口继续服务而界面显示已停止；同时把发送服务启停移出 UI 线程（本机绑定通配地址
+  实测耗时 3–30 秒，会把窗口冻住）。见 `docs/code-audit.md` A8。
+- **Binary 编码跨端不一致**：Go 端是「随机半数源块异或」，Android 端写成「按序重复源块」，
+  导致解码报成功但数据错误。已重写 Kotlin 侧。
+- **Online 编码参数不在线上格式里**：发送端改 ε/quality 会让接收端解出错误数据，
+  已将参数固化为两端共用的常量。
+- **Color Matrix 模式默认发不出去**：默认 `split=2048` 超过矩阵容量 1587 B，
+  每帧渲染失败；已自动钳制到 1539 并回传有效值。
+- 新增 `docs/mode-and-codec-analysis.md`：五种编码方案与两种工作模式的原理、实测与结论。
 
 ## License
 
