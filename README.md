@@ -10,15 +10,23 @@
 ## 目录结构
 
 ```
-008-qrt-pro/
-├── txqr/                 # 发送端（Go），fork 自 divan/txqr
-│   ├── cmd/txqr-web/     #   网页发送端（主要使用，"序列化工具"）
-│   ├── cmd/txqr-ascii/   #   终端 ASCII 发送端
-│   ├── cmd/txqr-gif/     #   GIF 发送端
-│   └── bin/              #   编译产物
-├── txqr-reader/          # 接收端（Android, Kotlin/Compose）
-│   └── android/          #   Google Android 工程
-├── dist/                 # 打包好的 portable 发送端 exe
+008-qrt-pro-opti/
+├── txqr/                      # 发送端 + 桌面接收端 + 启动器（Go），fork 自 divan/txqr
+│   ├── cmd/txqr-web/          #   网页发送端（主要使用，"序列化工具"）
+│   ├── cmd/txqr-desktop/      #   桌面接收端（框选扫描）
+│   ├── cmd/txqr-launcher/     #   GUI 启动器（一键启停）
+│   ├── cmd/txqr-ascii/        #   终端 ASCII 发送端
+│   ├── cmd/txqr-gif/          #   GIF 发送端
+│   ├── decimen/               #   decimen 协议（systematic-carousel + DCF2）
+│   ├── qr/                    #   QR 编解码 + 彩色矩阵
+│   └── third_party/go-qrcode/ #   go.mod replace 目标，本地副本
+├── txqr-reader/
+│   └── android/               # 接收端（Android, Kotlin/Compose）
+├── docs/
+│   ├── protocol-analysis.md   # decimen 协议逐字节规格（权威依据）
+│   └── cleanup-analysis.md    # 目录清理分析报告
+├── .github/workflows/         # 发布流水线（3 个 exe + APK）
+├── dist/                      # 打包好的 portable 产物
 └── README.md
 ```
 
@@ -59,7 +67,7 @@ go build -ldflags "-s -w" -o txqr-web.exe .     # 或使用 bin/ / dist/ 内已�
   - MersenneTwister（Int63/Float64/Perm）、RFC5053 分区、soliton CDF、PickIndices。
   - 已去除 base64 还原逻辑，`dataBytes` 直接返回原始字节。
 - **原始二进制保存**：通过 MediaStore 写入 Downloads，按内容自动推断后缀。
-- 实时速度：2 秒滑动窗口瞬时速率，每 500ms 刷新。
+- 实时速度：2 秒滑动窗口瞬时速率 + 全程平均速率，每 500ms 刷新。
 - 支持扫码完成后重扫（「Scan Another」）。
 
 ### 构建接收端 APK
@@ -72,6 +80,10 @@ gradlew.bat :app:assembleDebug --no-daemon
 # 产物：app\build\outputs\apk\debug\app-debug.apk
 ```
 
+> ⚠️ **工程路径必须为纯 ASCII**。AGP 会硬性检查并直接失败：
+> `Your project path contains non-ASCII characters`。
+> `local.properties` 记录本机 SDK 路径（`sdk.dir`），已被 `.gitignore` 忽略，换机器需自行生成。
+
 ## 使用流程
 
 1. 接收端手机安装 APK。
@@ -80,7 +92,7 @@ gradlew.bat :app:assembleDebug --no-daemon
 
 ## 版本
 
-当前版本：`v1.0.0`（见 Git tag）。
+当前版本：`v1.3.0`（见 Git tag）。Android 端 `versionCode=5` / `versionName=1.3.0`。
 
 ## License
 

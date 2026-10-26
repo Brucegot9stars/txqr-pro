@@ -10,12 +10,11 @@ See related blog posts for more details:
 
 # Demo
 
-![Demo](./docs/demo.gif)
+Demo animation and the automated tester app were removed during repository
+cleanup (see `../docs/cleanup-analysis.md`). The production sender lives in
+`cmd/txqr-web` and the desktop receiver in `cmd/txqr-desktop`.
 
-Reader iOS app in the demo (uses this lib via Gomobile): [https://github.com/divan/txqr-reader](https://github.com/divan/txqr-reader)
-
-## Automated tester app
-Also see `cmd/txqr-tester` app for automated testing of different encoder parameters.
+Reader iOS app in the original demo (uses this lib via Gomobile): [https://github.com/divan/txqr-reader](https://github.com/divan/txqr-reader)
 
 # Licence
 

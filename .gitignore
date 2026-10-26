@@ -18,3 +18,4 @@ txqr/bin/
 .kotlin/
 local.properties
 build_log.txt
+.workbuddy/

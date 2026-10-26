@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -308,19 +309,76 @@ func (a *launcher) hit(x, y int) int {
 	return -1
 }
 
-func (a *launcher) senderExe() string  { return filepath.Join(a.dir, "qrt-pro-sender-windows-amd64-v1.3.0.exe") }
-func (a *launcher) receiverExe() string { return filepath.Join(a.dir, "qrt-pro-receiver-desktop-windows-amd64-v1.3.0.exe") }
+// Accepted file names for each supervised process, in priority order.
+// The release artifacts have shipped under several spellings: the CI
+// workflow emits a version-stamped name, local portable builds use a
+// localized product name, and older builds carry no version suffix. Resolve
+// against the directory instead of hardcoding a single spelling.
+var (
+	senderCandidates = []string{
+		"qrt-pro-sender-windows-amd64-v1.3.0.exe",
+		"qrt-pro-sender-windows-amd64.exe",
+		"序列化工具.exe",
+	}
+	receiverCandidates = []string{
+		"qrt-pro-receiver-desktop-windows-amd64-v1.3.0.exe",
+		"qrt-pro-receiver-desktop-windows-amd64.exe",
+	}
+)
+
+// Fallback globs catch version-stamped builds whose version differs from the
+// one listed above, so a release bump does not require editing this file.
+var (
+	senderGlobs    = []string{"qrt-pro-sender-windows-amd64*.exe"}
+	receiverGlobs  = []string{"qrt-pro-receiver-desktop-windows-amd64*.exe"}
+)
+
+// resolveExe returns the first candidate that exists in dir. When none are
+// present it falls back to a glob match, and finally to the primary candidate
+// path so the UI still shows which file it expects to find.
+func resolveExe(dir string, candidates []string, globs []string) string {
+	for _, name := range candidates {
+		p := filepath.Join(dir, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	for _, pattern := range globs {
+		matches, err := filepath.Glob(filepath.Join(dir, pattern))
+		if err == nil && len(matches) > 0 {
+			sort.Strings(matches)
+			return matches[len(matches)-1]
+		}
+	}
+	return filepath.Join(dir, candidates[0])
+}
+
+// procPrefix returns the process-name prefix used to detect a running
+// instance of exe (the module name without its extension), so detection and
+// stop work regardless of which spelling resolved.
+func procPrefix(exe string) string {
+	base := filepath.Base(exe)
+	return strings.ToLower(strings.TrimSuffix(base, filepath.Ext(base)))
+}
+
+func (a *launcher) senderExe() string {
+	return resolveExe(a.dir, senderCandidates, senderGlobs)
+}
+
+func (a *launcher) receiverExe() string {
+	return resolveExe(a.dir, receiverCandidates, receiverGlobs)
+}
 
 func (a *launcher) onButton(i int) {
 	switch i {
 	case idxSenderStart:
 		startProcess(a.hwnd, a.senderExe(), a.dir)
 	case idxSenderStop:
-		stopProcess("qrt-pro-sender")
+		stopProcess(procPrefix(a.senderExe()))
 	case idxRecvStart:
 		startProcess(a.hwnd, a.receiverExe(), a.dir)
 	case idxRecvStop:
-		stopProcess("qrt-pro-receiver")
+		stopProcess(procPrefix(a.receiverExe()))
 	}
 	// Refresh off the UI thread so clicking never blocks on netstat; the
 	// next paint picks the new snapshot up when it's ready.
@@ -335,8 +393,8 @@ func (a *launcher) onButton(i int) {
 func (a *launcher) refresh() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.sender, a.senderPID = exeRunning("qrt-pro-sender")
-	a.receiver, a.receiverPID = exeRunning("qrt-pro-receiver")
+	a.sender, a.senderPID = exeRunning(procPrefix(a.senderExe()))
+	a.receiver, a.receiverPID = exeRunning(procPrefix(a.receiverExe()))
 	if a.sender {
 		a.senderPorts = listenPorts(a.senderPID)
 	} else {
