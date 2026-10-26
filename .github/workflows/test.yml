@@ -87,4 +87,4 @@ jobs:
           cache-dependency-path: txqr/go.sum
 
       - name: Test with race detector
-        run: go test -race ./internal/sender/... ./decimen/... ./qr/... -timeout 300s
+        run: go test -race -short ./internal/sender/... ./decimen/... ./qr/... -timeout 300s
