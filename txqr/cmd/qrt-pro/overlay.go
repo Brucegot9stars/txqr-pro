@@ -130,6 +130,10 @@ func (a *app) finishSelect() {
 	id := a.scan.AddRegion(scanner.Rect{L: rect.L, T: rect.T, R: rect.R, B: rect.B})
 	if id > 0 {
 		a.resumeAfter[id] = true
+		// The new region is appended, so with enough regions it lands below the
+		// fold. Reveal it immediately — otherwise the box the user just drew
+		// gets no feedback at all.
+		a.regions.scrollToEnd()
 	}
 	a.resumeAll()
 	w32.Invalidate(a.hwnd)

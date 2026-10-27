@@ -77,9 +77,14 @@ func renderSnapshot(path string, tab int, demo bool, w, h int32) error {
 		a.tab = tab
 	}
 	if demo {
+		// Five regions on purpose: the list only fits three, so the demo also
+		// exercises the scroll viewport and its scrollbar.
 		for _, r := range []scanner.Rect{
 			{L: 320, T: 260, R: 720, B: 610},
 			{L: 1180, T: 300, R: 1560, B: 640},
+			{L: 100, T: 800, R: 520, B: 1040},
+			{L: 780, T: 720, R: 1180, B: 980},
+			{L: 1600, T: 640, R: 1880, B: 900},
 		} {
 			a.scan.AddRegion(r)
 		}
@@ -131,6 +136,11 @@ func (a *app) wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr 
 		return 0
 	case w32.WMLButtonUp:
 		a.onRelease(w32.LParamPoint(lParam))
+		return 0
+	case w32.WMMouseWheel:
+		// WM_MOUSEWHEEL reports *screen* coordinates, unlike the button
+		// messages, so it has to be mapped before the hit test.
+		a.onWheel(w32.WheelDelta(wParam), w32.ScreenToClient(hwnd, w32.LParamPoint(lParam)))
 		return 0
 	case w32.WMSetCursor:
 		a.applyCursor()

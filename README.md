@@ -133,7 +133,7 @@ gradlew.bat :app:assembleDebug --no-daemon
 
 ## 版本
 
-当前版本：`v1.4.1`（见 Git tag）。Android 端 `versionCode=7` / `versionName=1.4.1`。
+当前版本：`v1.4.2`（见 Git tag）。Android 端 `versionCode=8` / `versionName=1.4.2`。
 
 v1.4.0 的主要变化：桌面端三个 exe 合并为统一的 `qrt-pro.exe`，接收端界面重做，并修复
 了代码审计发现的 30 项缺陷（详见 `docs/code-audit.md`）。
@@ -150,6 +150,15 @@ v1.4.1 是缺陷修复版本：
 - **Color Matrix 模式默认发不出去**：默认 `split=2048` 超过矩阵容量 1587 B，
   每帧渲染失败；已自动钳制到 1539 并回传有效值。
 - 新增 `docs/mode-and-codec-analysis.md`：五种编码方案与两种工作模式的原理、实测与结论。
+
+v1.4.2 是缺陷修复版本：
+
+- **接收端列表不能滚动**：「扫描区域」超过 3 个、或「已收文件」超过一屏时，多出来的行
+  被直接丢弃且没有任何滚动手段。现在支持滚轮、拖动和右侧滚动条，新增区域会自动滚到可见处。
+  见 `docs/code-audit.md` B20。
+- 顺带修掉两个被它暴露的底层缺陷：`RoundRectGradient` 用 `SelectClipRgn`（替换语义）
+  会顶掉外层裁剪，改为 `ExtSelectClipRgn(RGN_AND)` 求交；裁剪区外的控件不再注册，
+  滚出半个身位的按钮点不到。
 
 ## License
 

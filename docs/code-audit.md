@@ -3,7 +3,7 @@
 范围：`txqr/`（Go 桌面端）与 `txqr-reader/android/`（Kotlin 接收端）。
 目标：逻辑错误、边界条件遗漏、空指针风险、异常处理不完整、资源泄漏、协程/线程使用不当、线程安全。
 
-本报告按「严重程度 → 位置 → 问题 → 处置」记录。第一至第三节共 31 项，全部为 ✅（已修复）；第四节的 3 项收尾工作同样已完成。
+本报告按「严重程度 → 位置 → 问题 → 处置」记录。第一至第三节共 32 项，全部为 ✅（已修复）；第四节的 3 项收尾工作同样已完成。
 
 > **补记（编码方案与工作模式专项）**：针对五种喷泉码与两种工作模式做的专项验证又发现
 > 3 个跨端/静默损坏缺陷，均已修复，详见 **`docs/mode-and-codec-analysis.md` §4**：
@@ -317,6 +317,51 @@ UI 线程写、worker 线程读的 `bool` 字段。
 
 处置：`progress.coerceIn(0, 100) / 100f`。
 
+### B20 ✅ 列表面板无法滚动：超过三行直接看不到
+
+位置：`cmd/qrt-pro/views.go`（`drawRegionList` / `drawFilesView`）
+
+两个列表都用「画到超出面板就 `break`」的方式处理溢出：
+
+```go
+for i, s := range snaps {
+	rowTop := top + int32(i)*pitch
+	row := ...
+	if row.B > inner.B {
+		break // 第 4 行之后既不画，也没有任何滚动手段
+	}
+	a.drawRegionRow(row, i, s)
+}
+```
+
+所以第 4 个及以后的扫描区域（以及较长的已收文件列表）被静默丢弃：计数显示「5 个」，列表里只能看到 3 个，
+既不能滚轮也不能拖动，新加的区域落在末尾等于没有反馈。
+
+处置：
+
+- 新增 `cmd/qrt-pro/scroll.go`：`scrollList` 保存 offset / viewport / content，提供 `layout`（每帧重算并
+  clamp，窗口变矮或删掉行后不会停在越界位置）、`wheel`、`beginDrag`/`dragTo`/`endDrag`、`scrollToEnd`。
+- 列表改为按 `offset` 平移绘制，并用 `Ctx.PushClip(viewport)` 裁剪；完全在视口外的行直接 `continue`。
+- 输入：新增 `WM_MOUSEWHEEL` 处理（`WM_MOUSEWHEEL` 报的是**屏幕坐标**，先 `ScreenToClient` 再判定在哪个列表上），
+  滚轮一格 = 一个行距，`delta` 不足 120 的高精度滚轮/触控板也按一格处理（否则这类设备完全没反应）；
+  在列表空白处按下拖动可滚动，按在控件上则控件优先。
+- 新增右侧滚动条（滑块 + 轨道），只在内容超出时出现。
+- 新增区域时 `scrollToEnd()`：新行在末尾，跳到底部才算给了反馈。
+
+顺带修掉两个被这个功能暴露出来的底层问题：
+
+- `RoundRectGradient` 用 `SelectClipRgn` 设置圆角裁剪，而它是**替换**语义，会把列表视口的裁剪整块顶掉——
+  行卡片因此能画到面板外面。改为 `ExtSelectClipRgn(..., RGN_AND)` 求交，并用 `SaveDC/RestoreDC`
+  保存/恢复，而不是 `SelectClipRgn(h, 0)` 硬清零。
+- `internal/w32` 新增 `DC.PushClip/PopClip`（`SaveDC` + `IntersectClipRect` + `RestoreDC`）与
+  `ScreenToClient`、`WheelDelta`；`uikit.Ctx.PushClip` 同时让**控件矩形中心落在裁剪区外时不注册**，
+  否则滚出半个身位的行按钮还能从列表外面点到。
+
+验证：`cmd/qrt-pro/scroll_test.go` 6 个用例（clamp、短内容不滚、滚轮方向与高精度增量、拖动、
+内容缩短后重新 clamp、pinToEnd）；真机自检驱动真实 handler：滚轮下三格 → 停在 271（max），
+上一格 → 135（正好一个行距），拖动上移 120 → 120，删掉一个区域后 → 自动 clamp 到 135。
+自检还抓到我写反的 `regionRowMetrics()` 返回值顺序（`_, pitch :=` 拿到的其实是行高，每格少滚 8px）。
+
 ---
 
 ## 三、结构性整改（需求 1：整合到一个启动器）
@@ -391,3 +436,4 @@ UI 线程写、worker 线程读的 `bool` 字段。
 | 三张页面离屏快照配色复核 | ✅ 大面积纯红/纯黑已消除 |
 | 真实窗口 DC 采样（`QRT_PAINT_CHECK`） | ✅ 修复前全 `rgb(255,255,255)`，修复后为主题色 |
 | 发送服务启停（`internal/sender/lifecycle_test.go`） | ✅ 5 个启停周期端口都真正释放（A8） |
+| 列表滚动（`cmd/qrt-pro/scroll_test.go`） | ✅ 6 个用例 + 真机 handler 自检（B20） |

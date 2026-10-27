@@ -245,15 +245,23 @@ func (a *app) drawRegionList(r w32.Rect) {
 		})
 		return
 	}
+	// The list scrolls: more than three regions simply do not fit, and before
+	// this the extra rows were silently clipped with no way to reach them.
+	viewport := w32.Rect{L: inner.L, T: top, R: inner.R - a.px(10), B: inner.B}
 	pitch, rowH := a.regionRowMetrics()
+	a.regions.layout(viewport, int32(len(snaps))*pitch)
+
+	a.ui.PushClip(viewport)
 	for i, s := range snaps {
-		rowTop := top + int32(i)*pitch
-		row := w32.Rect{L: inner.L, T: rowTop, R: inner.R, B: rowTop + rowH}
-		if row.B > inner.B {
-			break
+		rowTop := viewport.T + int32(i)*pitch - a.regions.offset
+		row := w32.Rect{L: viewport.L, T: rowTop, R: viewport.R, B: rowTop + rowH}
+		if !uikit.TrimToViewport(row, viewport) {
+			continue // fully scrolled out: skip the whole row
 		}
 		a.drawRegionRow(row, i, s)
 	}
+	a.ui.PopClip()
+	a.drawScrollbar(&a.regions)
 }
 
 // regionRowMetrics returns the row height and the distance between rows. They
@@ -451,14 +459,22 @@ func (a *app) drawFilesView(r w32.Rect) {
 		return
 	}
 	pitch := a.px(56)
+	// Same treatment as the region list: a long transfer history has to be
+	// reachable, not clipped.
+	viewport := w32.Rect{L: inner.L, T: inner.T, R: inner.R - a.px(10), B: inner.B}
+	a.files.layout(viewport, int32(len(files))*pitch)
+
+	a.ui.PushClip(viewport)
 	for i, f := range files {
-		rowTop := inner.T + int32(i)*pitch
-		row := w32.Rect{L: inner.L, T: rowTop, R: inner.R, B: rowTop + pitch - u}
-		if row.B > inner.B {
-			break
+		rowTop := viewport.T + int32(i)*pitch - a.files.offset
+		row := w32.Rect{L: viewport.L, T: rowTop, R: viewport.R, B: rowTop + pitch - u}
+		if !uikit.TrimToViewport(row, viewport) {
+			continue
 		}
 		a.drawFileRow(row, f)
 	}
+	a.ui.PopClip()
+	a.drawScrollbar(&a.files)
 }
 
 func (a *app) drawFileRow(r w32.Rect, f scanner.SavedFile) {

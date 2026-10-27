@@ -103,6 +103,11 @@ type app struct {
 	lastErr string
 	started time.Time
 
+	// regions/files are the scroll state of the two list views. They live on
+	// the UI thread only (paint records the viewport, wheel/drag consumes it).
+	regions scrollList
+	files   scrollList
+
 	// senderBusy guards the start/stop network operation, which runs off the
 	// message thread: binding a wildcard address can take seconds on some
 	// Windows setups (interface enumeration / firewall), and blocking the
@@ -417,6 +422,9 @@ func (a *app) statCard(r w32.Rect, caption, value string, accent w32.Color) {
 // ---------------------------------------------------------------- input
 
 func (a *app) onMouseMove(p w32.Point) {
+	if a.dragLists(p) {
+		w32.Invalidate(a.hwnd)
+	}
 	id := a.ui.HitTest(p.X, p.Y)
 	if id != a.ui.Hover() {
 		a.ui.SetHover(id)
@@ -425,11 +433,18 @@ func (a *app) onMouseMove(p w32.Point) {
 }
 
 func (a *app) onPress(p w32.Point) {
-	a.ui.Press(a.ui.HitTest(p.X, p.Y))
+	id := a.ui.HitTest(p.X, p.Y)
+	a.ui.Press(id)
+	// Pressing the empty part of a list starts a scroll drag. Controls win,
+	// so the buttons inside a row stay clickable.
+	if id == uikit.NoControl {
+		a.beginListDrag(p)
+	}
 	w32.Invalidate(a.hwnd)
 }
 
 func (a *app) onRelease(p w32.Point) {
+	a.endListDrag()
 	hit := a.ui.HitTest(p.X, p.Y)
 	armed := a.ui.Release()
 	// Only a press that began and ended on the same control is a click; this is
