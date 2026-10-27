@@ -304,8 +304,16 @@ func (a *app) drawRegionRow(r w32.Rect, idx int, s scanner.Snapshot) {
 	if detail == "" {
 		detail = "—"
 	}
+	detailColor := a.theme.TextDim
+	// Surface the newest diagnostic reason right where the user is looking.
+	// Without it the row says "0/64 块" forever with no hint that the frames are
+	// duplicates or that no QR is being found at all.
+	if s.LastIssue != "" && !s.Done {
+		detail += " · " + s.LastIssue
+		detailColor = a.theme.Warning
+	}
 	a.ui.Text(w32.Rect{L: r.L + pad, T: detailTop, R: r.R - pad, B: detailTop + a.px(16)},
-		a.ui.Ellipsize(detail, uikit.FontCaption, r.W()-pad*2), uikit.FontCaption, a.theme.TextDim, uikit.AlignLeft)
+		a.ui.Ellipsize(detail, uikit.FontCaption, r.W()-pad*2), uikit.FontCaption, detailColor, uikit.AlignLeft)
 
 	// Row actions stay visible even when idle, so the flow never dead-ends.
 	actions := []struct {
@@ -519,4 +527,106 @@ func (a *app) statusPill(s scanner.Snapshot) (string, w32.Color) {
 	default:
 		return "已停止", a.theme.TextFaint
 	}
+}
+
+// ---------------------------------------------------------------- diagnostics
+
+// drawDiagView renders the receiver's audit log. The point of this tab is to
+// answer "why does it fail" without leaving the app: a failure counter cannot
+// tell "no QR on screen" from "QR found but wrong protocol" from "frames arrive
+// but they are all duplicates".
+func (a *app) drawDiagView(r w32.Rect) {
+	u := a.theme.Unit
+	body, _ := a.headerArea(r, "诊断日志",
+		"逐条记录解码失败、帧头异常与停滞；传不动时先看这里，再看区域行上的提示")
+
+	path := a.scan.AuditPath()
+	fileErr := a.scan.AuditFileError()
+
+	info := w32.Rect{L: body.L, T: body.T, R: body.R, B: body.T + a.px(56)}
+	a.ui.Panel(info)
+	inner := info.Inset(u*5, u*3)
+	line := "日志文件：" + path
+	if path == "" {
+		line = "日志未落盘"
+		if fileErr != "" {
+			line += "（" + fileErr + "）"
+		}
+		line += "，仅本页显示最近记录"
+	}
+	a.ui.Text(w32.Rect{L: inner.L, T: inner.T, R: inner.R - a.px(190), B: inner.B},
+		a.ui.Ellipsize(line, uikit.FontBody, inner.W()-a.px(190)),
+		uikit.FontBody, colorFor(fileErr != "", a.theme.Danger, a.theme.TextDim), uikit.AlignLeft)
+	a.ui.Button(idOpenLogDir, w32.Rect{L: inner.R - a.px(180), T: inner.T, R: inner.R, B: inner.B},
+		"打开日志目录", uikit.ButtonNeutral, path == "")
+
+	list := w32.Rect{L: body.L, T: info.B + u*4, R: body.R, B: body.B}
+	a.ui.Panel(list)
+	li := list.Inset(u*5, u*4)
+
+	entries := a.scan.AuditEntries(200)
+	if len(entries) == 0 {
+		a.drawSteps(w32.Rect{L: li.L, T: li.T, R: li.R, B: li.B}, []string{
+			"还没有记录。开始一次传输后，这里会逐条出现解码与喷泉层面的结果",
+			"「二维码未检出」= 框选位置/对焦问题；「载荷不可识别」= 屏幕上的码不是本接收端支持的协议",
+			"「长时间没有新块」= 帧在来但都是重复的，通常是发送端暂停或区域拍到了静止画面",
+		})
+		return
+	}
+
+	// Newest first: the reason a transfer is stuck right now matters more than
+	// what happened five minutes ago.
+	pitch := a.px(46)
+	a.diag.layout(w32.Rect{L: li.L, T: li.T, R: li.R - a.px(10), B: li.B}, int32(len(entries))*pitch)
+
+	a.ui.PushClip(a.diag.viewport)
+	for i := 0; i < len(entries); i++ {
+		e := entries[len(entries)-1-i]
+		rowTop := a.diag.viewport.T + int32(i)*pitch - a.diag.offset
+		row := w32.Rect{L: a.diag.viewport.L, T: rowTop, R: a.diag.viewport.R, B: rowTop + pitch - u}
+		if !uikit.TrimToViewport(row, a.diag.viewport) {
+			continue
+		}
+		a.drawDiagRow(row, e)
+	}
+	a.ui.PopClip()
+	a.drawScrollbar(&a.diag)
+}
+
+// drawDiagRow renders one audit entry: timestamp and region on the left, the
+// short label in the level's colour, then the detail line underneath.
+func (a *app) drawDiagRow(r w32.Rect, e scanner.AuditEntry) {
+	u := a.theme.Unit
+	a.ui.Flat(r, w32.Mix(a.theme.CardTop, a.theme.Text, 0.03))
+	pad := u * 3
+
+	tone := a.theme.TextDim
+	switch e.Level {
+	case scanner.AuditError:
+		tone = a.theme.Danger
+	case scanner.AuditWarn:
+		tone = a.theme.Warning
+	}
+
+	meta := e.At.Format("15:04:05")
+	if e.Region > 0 {
+		meta += fmt.Sprintf("  区域%d", e.Region)
+	} else {
+		meta += "  全局"
+	}
+	metaW := a.px(112)
+	a.ui.Text(w32.Rect{L: r.L + pad, T: r.T + a.px(5), R: r.L + pad + metaW, B: r.T + a.px(21)},
+		meta, uikit.FontCaption, a.theme.TextFaint, uikit.AlignLeft)
+
+	label := e.Label
+	if e.Repeat > 1 {
+		label = fmt.Sprintf("%s ×%d", label, e.Repeat)
+	}
+	a.ui.Text(w32.Rect{L: r.L + pad + metaW, T: r.T + a.px(4), R: r.R - pad, B: r.T + a.px(22)},
+		a.ui.Ellipsize(label, uikit.FontEmphasis, r.W()-pad*2-metaW),
+		uikit.FontEmphasis, tone, uikit.AlignLeft)
+
+	a.ui.Text(w32.Rect{L: r.L + pad + metaW, T: r.T + a.px(22), R: r.R - pad, B: r.B},
+		a.ui.Ellipsize(e.Detail, uikit.FontCaption, r.W()-pad*2-metaW),
+		uikit.FontCaption, a.theme.TextDim, uikit.AlignLeft)
 }

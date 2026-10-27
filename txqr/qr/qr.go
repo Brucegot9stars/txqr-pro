@@ -181,19 +181,50 @@ func DecodeRaw(img image.Image) ([]byte, error) {
 	return result.GetRawBytes(), nil
 }
 
+// Attempt is one candidate the multi-scale search tried. It exists so a failed
+// decode can be explained instead of merely counted: "a QR was found but its
+// payload is not a frame" and "no QR was found at all" need completely
+// different fixes (wrong region vs. wrong protocol).
+type Attempt struct {
+	Label   string // e.g. "crop6%@1.0x", "bare", "up1.5x"
+	Err     error  // decoder error; nil when a symbol was decoded
+	Found   bool   // a QR symbol was decoded
+	Payload bool   // ...and its payload looked like a frame
+}
+
 // DecodeRawMultiScale decodes a QR trying cheap crops first, then scales.
 // Real screen captures almost always box in the sender's range frame plus
 // wide margins, so the bare image rarely decodes but a small edge-crop at the
 // original resolution succeeds in ~10ms — putting that path first is what
 // makes the desktop receiver fast. Upscales follow for very small codes.
 func DecodeRawMultiScale(img image.Image, scales []float64) ([]byte, error) {
-	b := img.Bounds()
+	raw, err, _ := DecodeRawMultiScaleVerbose(img, scales)
+	return raw, err
+}
 
-	tryCrop := func(cropPct, sc float64) []byte {
+// DecodeRawMultiScaleVerbose is DecodeRawMultiScale plus the list of attempts
+// it made, for the receiver's diagnostic log.
+func DecodeRawMultiScaleVerbose(img image.Image, scales []float64) ([]byte, error, []Attempt) {
+	b := img.Bounds()
+	var attempts []Attempt
+
+	record := func(label string, raw []byte, err error) ([]byte, bool) {
+		at := Attempt{Label: label, Err: err, Found: err == nil}
+		if at.Found {
+			at.Payload = ExtractFramePayload(raw) != nil
+		}
+		attempts = append(attempts, at)
+		if at.Found && at.Payload {
+			return raw, true
+		}
+		return nil, false
+	}
+
+	tryCrop := func(cropPct, sc float64) ([]byte, bool) {
 		dx := int(float64(b.Dx()) * cropPct)
 		dy := int(float64(b.Dy()) * cropPct)
 		if b.Dx()-2*dx < 60 || b.Dy()-2*dy < 60 {
-			return nil
+			return nil, false
 		}
 		cropped := image.NewRGBA(image.Rect(0, 0, b.Dx()-2*dx, b.Dy()-2*dy))
 		for y := 0; y < cropped.Bounds().Dy(); y++ {
@@ -207,35 +238,29 @@ func DecodeRawMultiScale(img image.Image, scales []float64) ([]byte, error) {
 			cand = scaleBilinear(cropped, int(float64(cw)*sc), int(float64(ch)*sc))
 		}
 		raw, err := DecodeRaw(cand)
-		if err != nil {
-			return nil
-		}
-		if ExtractFramePayload(raw) != nil {
-			return raw
-		}
-		return nil
+		return record(fmt.Sprintf("crop%d%%@%.1fx", int(cropPct*100), sc), raw, err)
 	}
 
 	// 1. cheap original-resolution crops (fast path for boxed-in frames)
 	for _, cropPct := range []float64{0.06, 0.03, 0.10} {
-		if p := tryCrop(cropPct, 1.0); p != nil {
-			return p, nil
+		if raw, ok := tryCrop(cropPct, 1.0); ok {
+			return raw, nil, attempts
 		}
 	}
 	// 2. bare image (tight, border-free boxes)
-	if raw, err := DecodeRaw(img); err == nil && ExtractFramePayload(raw) != nil {
-		return raw, nil
+	bareRaw, bareErr := DecodeRaw(img)
+	if raw, ok := record("bare", bareRaw, bareErr); ok {
+		return raw, nil, attempts
 	}
 	// 3. upscales for small codes
 	for _, cropPct := range []float64{0.06, 0.03} {
 		for _, sc := range []float64{1.5, 2.0} {
-			if p := tryCrop(cropPct, sc); p != nil {
-				return p, nil
+			if raw, ok := tryCrop(cropPct, sc); ok {
+				return raw, nil, attempts
 			}
 		}
 	}
 	// 4. coarse scales as a last resort
-	var lastErr error
 	for _, s := range scales {
 		if s == 1.0 {
 			continue
@@ -245,16 +270,25 @@ func DecodeRawMultiScale(img image.Image, scales []float64) ([]byte, error) {
 		if nw < 8 || nh < 8 {
 			continue
 		}
-		raw, err := DecodeRaw(scaleBilinear(img, nw, nh))
-		lastErr = err
-		if err == nil && ExtractFramePayload(raw) != nil {
-			return raw, nil
+		scaleRaw, scaleErr := DecodeRaw(scaleBilinear(img, nw, nh))
+		if raw, ok := record(fmt.Sprintf("scale%.1fx", s), scaleRaw, scaleErr); ok {
+			return raw, nil, attempts
 		}
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no payload at any scale")
+
+	err := fmt.Errorf("no payload at any scale")
+	for _, at := range attempts {
+		if at.Found && !at.Payload {
+			// A symbol was read, its bytes just were not a frame. That is the
+			// actionable case (wrong protocol on screen), so say so.
+			err = fmt.Errorf("QR decoded but payload is not a txqr/decimen frame")
+			break
+		}
+		if at.Err != nil {
+			err = fmt.Errorf("%s: %w", at.Label, at.Err)
+		}
 	}
-	return nil, lastErr
+	return nil, err, attempts
 }
 
 // bitReader reads MSB-first from a byte slice.

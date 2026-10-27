@@ -73,7 +73,7 @@ func main() {
 func renderSnapshot(path string, tab int, demo bool, w, h int32) error {
 	a := newApp(w32.Instance())
 	defer a.shutdown()
-	if tab >= 0 && tab <= 2 {
+	if tab >= 0 && tab <= 3 {
 		a.tab = tab
 	}
 	if demo {

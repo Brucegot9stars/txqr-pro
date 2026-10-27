@@ -95,6 +95,7 @@ type Manager struct {
 	saveFails        bool
 
 	saveDir string
+	audit   *Audit
 
 	decQueue  chan decJob
 	saveQueue chan saveJob
@@ -162,6 +163,14 @@ func New(capture CaptureFunc, opts Options) *Manager {
 		cancel:    cancel,
 	}
 	m.saveDir = m.resolveSaveDir(opts.SaveDir)
+	// The diagnostic log lives next to the received files (in a logs/ subdir) so
+	// it is findable without hunting through the OS temp dir. OpenAudit never
+	// fails: if the file cannot be created the receiver still runs and the ring
+	// buffer still answers "why did it fail".
+	m.audit = OpenAudit(filepath.Join(m.saveDir, "logs", "receiver.log"))
+	m.audit.Always(0, AuditInfo, "app.start", fmt.Sprintf(
+		"保存目录 %s；decode worker %d 个；日志 %s",
+		m.saveDir, decodeWorkers(), m.audit.Path()))
 
 	n := decodeWorkers()
 	m.wg.Add(n + 1) // n decode workers + the saver
@@ -220,6 +229,16 @@ func (m *Manager) resolveSaveDir(want string) string {
 // SaveDir reports where transfers land.
 func (m *Manager) SaveDir() string { return m.saveDir }
 
+// AuditPath reports where the diagnostic log is written ("" when file logging
+// is unavailable, for example on a read-only save dir).
+func (m *Manager) AuditPath() string { return m.audit.Path() }
+
+// AuditFileError explains why file logging is off, or "".
+func (m *Manager) AuditFileError() string { return m.audit.FileError() }
+
+// AuditEntries returns the newest diagnostic entries, oldest first.
+func (m *Manager) AuditEntries(n int) []AuditEntry { return m.audit.Entries(n) }
+
 // SetSaveDir switches the destination; existing files are untouched.
 func (m *Manager) SetSaveDir(dir string) {
 	if dir == "" {
@@ -276,7 +295,7 @@ func (m *Manager) AddRegion(r Rect) int {
 	defer m.mu.Unlock()
 	m.nextID++
 	id := m.nextID
-	st := &decodeState{}
+	st := &decodeState{id: id, audit: m.audit}
 	st.SaveFails.Set(m.saveFails)
 	reg := &region{
 		id:          id,
@@ -285,6 +304,9 @@ func (m *Manager) AddRegion(r Rect) int {
 		labelDetail: fmt.Sprintf("%dx%d", r.W(), r.H()),
 	}
 	m.regions = append(m.regions, reg)
+	m.audit.Always(id, AuditInfo, "region.start", fmt.Sprintf(
+		"新增扫描区域：%dx%d @ (%d,%d)-(%d,%d)",
+		r.W(), r.H(), r.L, r.T, r.R, r.B))
 	return id
 }
 
@@ -440,26 +462,27 @@ func (m *Manager) Snapshots() []Snapshot {
 	out := make([]Snapshot, 0, len(regions))
 	for _, r := range regions {
 		p, status, done := r.st.snapshot(byBlocks)
-		speed, avg, nbytes, frames, captured, failed, mode := r.st.stats()
+		speed, avg, nbytes, frames, captured, failed, mode, lastIssue := r.st.stats()
 		m.mu.Lock()
 		scanning := r.scanning
 		m.mu.Unlock()
 		s := Snapshot{
-			ID:       r.id,
-			Label:    fmt.Sprintf("区域 %d · %s", r.id, r.labelDetail),
-			W:        int(r.rect.W()),
-			H:        int(r.rect.H()),
-			Scanning: scanning,
-			Done:     done || r.done,
-			Progress: clampPct(p),
-			Status:   status,
-			Mode:     mode,
-			Speed:    speed,
-			AvgSpeed: avg,
-			Bytes:    nbytes,
-			Frames:   frames,
-			Captured: captured,
-			Failed:   failed,
+			ID:        r.id,
+			Label:     fmt.Sprintf("区域 %d · %s", r.id, r.labelDetail),
+			W:         int(r.rect.W()),
+			H:         int(r.rect.H()),
+			Scanning:  scanning,
+			Done:      done || r.done,
+			Progress:  clampPct(p),
+			Status:    status,
+			Mode:      mode,
+			LastIssue: lastIssue,
+			Speed:     speed,
+			AvgSpeed:  avg,
+			Bytes:     nbytes,
+			Frames:    frames,
+			Captured:  captured,
+			Failed:    failed,
 		}
 		out = append(out, s)
 	}
@@ -647,6 +670,11 @@ func (m *Manager) saver() {
 		}
 		if err != nil {
 			rec.Err = err.Error()
+			m.audit.Note(0, AuditError, "save.error",
+				fmt.Sprintf("写入 %s 失败：%v", path, err))
+		} else {
+			m.audit.Always(0, AuditInfo, "result.complete", fmt.Sprintf(
+				"已保存 %s（%d 字节）", rec.Name, rec.Size))
 		}
 		m.savedMu.Lock()
 		m.saved = append(m.saved, rec)
@@ -769,5 +797,7 @@ func (m *Manager) Close() error {
 	m.qMu.Unlock()
 
 	m.wg.Wait()
+	m.audit.Always(0, AuditInfo, "region.stop", "接收端退出")
+	m.audit.Close()
 	return nil
 }

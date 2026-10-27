@@ -55,12 +55,18 @@ const (
 	idNavSender uikit.ControlID = 100 + iota
 	idNavReceiver
 	idNavFiles
+	idNavDiag
 )
 
 // Sender view ids.
 const (
 	idSenderToggle uikit.ControlID = 200 + iota
 	idSenderOpenPage
+)
+
+// Diagnostics view ids.
+const (
+	idOpenLogDir uikit.ControlID = 400 + iota
 )
 
 // Receiver view ids.
@@ -107,6 +113,7 @@ type app struct {
 	// the UI thread only (paint records the viewport, wheel/drag consumes it).
 	regions scrollList
 	files   scrollList
+	diag    scrollList
 
 	// senderBusy guards the start/stop network operation, which runs off the
 	// message thread: binding a wildcard address can take seconds on some
@@ -343,6 +350,7 @@ func (a *app) drawNav(r w32.Rect) {
 		{idNavSender, "↑", "发送端"},
 		{idNavReceiver, "↓", "接收端"},
 		{idNavFiles, "≡", "已收文件"},
+		{idNavDiag, "◎", "诊断日志"},
 	} {
 		itemR := w32.Rect{L: r.L + u*2, T: y, R: r.R - u*2, B: y + a.px(42)}
 		a.ui.NavItem(item.id, itemR, item.glyph, item.label, a.tab == i)
@@ -382,8 +390,10 @@ func (a *app) drawContent(r w32.Rect) {
 		a.drawSenderView(r)
 	case 1:
 		a.drawReceiverView(r)
-	default:
+	case 2:
 		a.drawFilesView(r)
+	default:
+		a.drawDiagView(r)
 	}
 }
 
@@ -477,6 +487,8 @@ func (a *app) handleClick(id uikit.ControlID) {
 		a.tab = 1
 	case idNavFiles:
 		a.tab = 2
+	case idNavDiag:
+		a.tab = 3
 	case idSenderToggle:
 		a.toggleSender()
 	case idSenderOpenPage:
@@ -491,6 +503,12 @@ func (a *app) handleClick(id uikit.ControlID) {
 		a.scan.Clear()
 	case idReopenFolder:
 		a.openFolder(a.scan.SaveDir())
+	case idOpenLogDir:
+		if p := a.scan.AuditPath(); p != "" {
+			a.openFolder(filepath.Dir(p))
+		} else {
+			a.setError("日志未落盘：" + a.scan.AuditFileError())
+		}
 	case idToggleFails:
 		a.scan.SetSaveFails(!a.scan.SaveFails())
 	case idToggleProgressMode:

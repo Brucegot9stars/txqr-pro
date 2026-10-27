@@ -41,9 +41,10 @@
 `qrt-pro-launcher.exe`（管理前两者的外进程启动器）。三者只通过进程名互相识别，命名不一致的
 bug 正源于此。现在它们合并为**一个进程、一个窗口**：
 
-- 左侧导航栏切换「发送端 / 接收端 / 已收文件」，发送端与接收端可同时工作；
+- 左侧导航栏切换「发送端 / 接收端 / 已收文件 / 诊断日志」，发送端与接收端可同时工作；
 - 停止扫描从「遍历进程树」退化为一次方法调用；
-- 接收端支持多区域（多屏各扫一路）、实时预览、逐区域进度与统计。
+- 接收端支持多区域（多屏各扫一路）、实时预览、逐区域进度与统计；
+- **诊断日志**记录"为什么收不下来"：解码失败的原因、帧头异常、长时间收不到新块。
 
 ```sh
 cd txqr
@@ -53,7 +54,7 @@ go build -ldflags "-s -w -H windowsgui" -o qrt-pro.exe ./cmd/qrt-pro
 离屏出图（用于文档截图与布局回归，锁屏环境下同样可用）：
 
 ```sh
-qrt-pro.exe -snapshot shot.png -tab 1 -demo -w 1080 -h 720   # -tab: 0 发送端 1 接收端 2 已收文件
+qrt-pro.exe -snapshot shot.png -tab 1 -demo -w 1080 -h 720   # -tab: 0 发送端 1 接收端 2 已收文件 3 诊断日志
 ```
 
 启动后若窗口是一片空白，可以用绘制自检定位（GUI 程序没有控制台，这是唯一客观手段）：
@@ -99,6 +100,28 @@ go build -ldflags "-s -w" -o txqr-web.exe .     # 或使用 bin/ / dist/ 内已�
 
 默认端口 `:9000`，可用 `-addr :18888` 指定其他端口。
 
+## 诊断日志（收不下来时先看这里）
+
+传输「有时候能成、有时候一直失败」时，失败计数本身说明不了任何问题。桌面接收端把每个
+环节的结果写进日志，并同时显示在应用的「诊断日志」页：
+
+| 原因 id | 含义 | 通常是 |
+| --- | --- | --- |
+| `qr.notfound` | 10 次缩放/裁剪都没检出二维码 | 框选位置不对、屏幕没显示、码太小/太模糊 |
+| `qr.found-no-payload` | 检出二维码，但载荷不是本接收端的帧 | 屏幕上是 Color Matrix 帧（仅 Android 支持）或别人的二维码 |
+| `frame.header-invalid` | 帧头无法解析，日志里带前 40 字节的可打印形式 | 协议不匹配、帧被截断 |
+| `frame.session-mismatch` | 本帧的 chunk/总长与当前会话不一致 | 发送端换了文件；连续 15 帧后会重置并接管新会话 |
+| `frame.session-new` | 接手一次传输，记录 chunk/总长/块数/编码 | 正常，用来确认锁到了正确的流 |
+| `fountain.stalled` | 帧在来但都是重复的，5 秒没有新增块 | 发送端暂停/换文件，或区域拍到了静止画面 |
+| `save.error` | 写文件失败 | 磁盘满、目录无权限 |
+
+- 日志文件：`<接收目录>/logs/receiver.log`（默认 `%USERPROFILE%\Downloads\logs\receiver.log`），
+  超过 4 MB 自动轮转，保留一份 `.1`；写不进去时只在内存里留最近 400 条，页面顶部会说明原因。
+- 同一条原因每 3 秒最多写一行，行内带 `×N` 折叠计数——30 fps 下失败风暴也不会把日志写爆。
+- 判读顺序：先看 `qr.notfound`（拍不到）→ 再看 `found-no-payload`（拍到了但不是我们的帧）
+  → 再看 `fountain.stalled`（拍到了也对，但内容重复）。
+- 勾选接收端工具栏的「失败帧」还会把解不出的画面存成 PNG 到 `%TEMP%\qrt-debug`，用于核对框选。
+
 ## 接收端（`txqr-reader`）
 
 基于原 iOS 参考代码，改造为 **Android** 应用（Kotlin + Jetpack Compose）：
@@ -133,7 +156,7 @@ gradlew.bat :app:assembleDebug --no-daemon
 
 ## 版本
 
-当前版本：`v1.4.2`（见 Git tag）。Android 端 `versionCode=8` / `versionName=1.4.2`。
+当前版本：`v1.4.3`（见 Git tag）。Android 端 `versionCode=9` / `versionName=1.4.3`。
 
 v1.4.0 的主要变化：桌面端三个 exe 合并为统一的 `qrt-pro.exe`，接收端界面重做，并修复
 了代码审计发现的 30 项缺陷（详见 `docs/code-audit.md`）。
@@ -159,6 +182,16 @@ v1.4.2 是缺陷修复版本：
 - 顺带修掉两个被它暴露的底层缺陷：`RoundRectGradient` 用 `SelectClipRgn`（替换语义）
   会顶掉外层裁剪，改为 `ExtSelectClipRgn(RGN_AND)` 求交；裁剪区外的控件不再注册，
   滚出半个身位的按钮点不到。
+
+v1.4.3 新增接收端诊断日志，用来回答「有时候能传成、有时候一直失败」：
+
+- 新增「诊断日志」页：逐条记录解码失败、帧头异常、会话切换与停滞，带 `×N` 折叠计数，
+  并写到 `<接收目录>/logs/receiver.log`（4 MB 轮转）。判读方法见
+  [诊断日志](#诊断日志收不下来时先看这里)。
+- `qr` 包新增 `DecodeRawMultiScaleVerbose`：能区分「一次都没检出二维码」与
+  「检出了但载荷不是本接收端的帧」（后者通常是 Color Matrix 帧或别人的二维码）。
+- 顺带修掉两个真问题：异会话的帧不再喂给旧解码器（连续 15 帧不一致才判定换文件并重置）；
+  文件名帧不再被算作一个数据块（进度曾因此提前一格，且文件名恒为空）。见 `docs/code-audit.md` B21。
 
 ## License
 

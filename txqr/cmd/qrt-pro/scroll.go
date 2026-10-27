@@ -170,6 +170,10 @@ func (a *app) onWheel(delta int32, p w32.Point) {
 		if a.files.viewport.Contains(p.X, p.Y) {
 			changed = a.files.wheel(delta, a.px(56))
 		}
+	case 3:
+		if a.diag.viewport.Contains(p.X, p.Y) {
+			changed = a.diag.wheel(delta, a.px(46))
+		}
 	}
 	if changed {
 		w32.Invalidate(a.hwnd)
@@ -184,6 +188,8 @@ func (a *app) beginListDrag(p w32.Point) {
 		a.regions.beginDrag(p)
 	case 2:
 		a.files.beginDrag(p)
+	case 3:
+		a.diag.beginDrag(p)
 	}
 }
 
@@ -195,6 +201,8 @@ func (a *app) dragLists(p w32.Point) bool {
 		return a.regions.dragTo(p)
 	case 2:
 		return a.files.dragTo(p)
+	case 3:
+		return a.diag.dragTo(p)
 	}
 	return false
 }
@@ -203,4 +211,5 @@ func (a *app) dragLists(p w32.Point) bool {
 func (a *app) endListDrag() {
 	a.regions.endDrag()
 	a.files.endDrag()
+	a.diag.endDrag()
 }

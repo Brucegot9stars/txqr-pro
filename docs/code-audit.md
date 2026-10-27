@@ -3,7 +3,7 @@
 范围：`txqr/`（Go 桌面端）与 `txqr-reader/android/`（Kotlin 接收端）。
 目标：逻辑错误、边界条件遗漏、空指针风险、异常处理不完整、资源泄漏、协程/线程使用不当、线程安全。
 
-本报告按「严重程度 → 位置 → 问题 → 处置」记录。第一至第三节共 32 项，全部为 ✅（已修复）；第四节的 3 项收尾工作同样已完成。
+本报告按「严重程度 → 位置 → 问题 → 处置」记录。第一至第三节共 33 项，全部为 ✅（已修复）；第四节的 3 项收尾工作同样已完成。
 
 > **补记（编码方案与工作模式专项）**：针对五种喷泉码与两种工作模式做的专项验证又发现
 > 3 个跨端/静默损坏缺陷，均已修复，详见 **`docs/mode-and-codec-analysis.md` §4**：
@@ -362,6 +362,18 @@ for i, s := range snaps {
 上一格 → 135（正好一个行距），拖动上移 120 → 120，删掉一个区域后 → 自动 clamp 到 135。
 自检还抓到我写反的 `regionRowMetrics()` 返回值顺序（`_, pitch :=` 拿到的其实是行高，每格少滚 8px）。
 
+### B21 ✅ 文件名帧被当成一个数据块计数
+
+位置：`internal/scanner/decode.go`（`feedTxqrLocked`）
+
+发送端会先发一帧元数据 `-1/{chunk}/{total}/{codec}/name|{文件名}`。旧代码只判断
+`len(parts) >= 3` 且数值可解析，于是 blockCode=-1 的元数据帧也被算进 `txqrSeen`/`txqrGot`：
+进度条提前一个块、`已收 N/M 块` 多算 1，且文件名根本没被记录（桌面端 txqr 传输的
+`fileName` 恒为空）。加诊断日志时顺带发现。
+
+处置：`code < 0` 且 header 以 `/name` 结尾时按元数据帧处理——写入 `fileName`、记一条
+`frame.name` 日志、直接返回，不计入进度。`TestNameFrameIsMetadataNotProgress` 覆盖。
+
 ---
 
 ## 三、结构性整改（需求 1：整合到一个启动器）
@@ -437,3 +449,5 @@ for i, s := range snaps {
 | 真实窗口 DC 采样（`QRT_PAINT_CHECK`） | ✅ 修复前全 `rgb(255,255,255)`，修复后为主题色 |
 | 发送服务启停（`internal/sender/lifecycle_test.go`） | ✅ 5 个启停周期端口都真正释放（A8） |
 | 列表滚动（`cmd/qrt-pro/scroll_test.go`） | ✅ 6 个用例 + 真机 handler 自检（B20） |
+| 诊断日志（`internal/scanner/audit_test.go`） | ✅ 采样/轮转/环形缓冲 + 会话切换/停滞/文件名帧 |
+| 真机捕获日志 | ✅ 空白区域 2 秒 → 1 条 `qr.notfound`（折叠 60+ 次），含 gozxing 原始错误 |
