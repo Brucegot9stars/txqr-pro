@@ -36,6 +36,33 @@ func Encode(data string, size int, lvl RecoveryLevel) (image.Image, error) {
 	return qr.Image(size), nil
 }
 
+// eccMByteCapacity is the byte-mode capacity of each QR version at error
+// correction level M, indexed by version (0 unused). The receiver uses it to
+// turn "this frame carries N bytes" into "the symbol has M modules", which is
+// what lets it tell the user that a capture region is physically too small.
+var eccMByteCapacity = [41]int{0,
+	14, 26, 42, 62, 84, 106, 122, 152, 180, 213,
+	251, 287, 331, 362, 412, 450, 504, 560, 624, 666,
+	711, 779, 857, 911, 997, 1059, 1125, 1190, 1264, 1370,
+	1452, 1538, 1628, 1722, 1809, 1911, 1989, 2099, 2213, 2331,
+}
+
+// ModulesForBytes reports how many modules a QR symbol holding n payload bytes
+// occupies per side at error correction level M — the quiet zone included,
+// because that is what has to fit inside a capture region.
+//
+// It returns 0 when n exceeds what a QR symbol can hold. Levels other than M
+// change the answer by a version or two, which is within the tolerance of the
+// rough "is my region big enough" advice this feeds.
+func ModulesForBytes(n int) int {
+	for v := 1; v <= 40; v++ {
+		if n <= eccMByteCapacity[v] {
+			return 21 + 4*(v-1) + 8
+		}
+	}
+	return 0
+}
+
 // EncodeVersioned encodes data into a QR code with a forced version and mask.
 // Pinning the version keeps every code at identical geometry (required for
 // tiling a grid of same-size frames); pinning the mask skips the 8-way mask

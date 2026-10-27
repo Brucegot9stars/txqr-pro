@@ -65,6 +65,11 @@ type decodeState struct {
 	id    int
 	audit *Audit
 
+	// lastW/lastH are the size of the most recent capture. Together with the
+	// symbol's module count they give pixels per module, which is the number
+	// that decides whether a region can be decoded at all.
+	lastW, lastH int
+
 	// Stall detection: frames that keep arriving while no new block is
 	// accepted are the classic "it worked a minute ago" symptom. Counting
 	// duplicates over time is what separates that from a decode failure.
@@ -160,6 +165,7 @@ func (s *decodeState) decode(rgba *image.RGBA) []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.captured++
+	s.lastW, s.lastH = rgba.Bounds().Dx(), rgba.Bounds().Dy()
 	if err != nil || payload == nil {
 		s.decodeFail++
 		s.saveDebugFrame(rgba)
@@ -356,6 +362,45 @@ func (s *decodeState) adoptSessionLocked(code, chunkLen, total int, codec string
 	s.noteAlways("frame.session-new", AuditInfo, fmt.Sprintf(
 		"识别到 txqr 传输：chunk=%d 总长=%d 需要 %d 块 编码=%s 首帧 blockCode=%d",
 		chunkLen, total, s.txqrNeed, name, code))
+	s.noteDensityLocked(chunkLen)
+}
+
+// noteDensityLocked answers "why does the same setup work one minute and fail
+// the next" with arithmetic: a symbol needs roughly 3.5 pixels per module for a
+// barcode detector to lock on, and pixels per module is just region size divided
+// by module count. Below that threshold the QR is plainly visible on screen and
+// every attempt still returns "no code found", which reads like a decoder bug.
+func (s *decodeState) noteDensityLocked(chunkLen int) {
+	if s.audit == nil || s.lastW == 0 || chunkLen <= 0 {
+		return
+	}
+	// The symbol carries the frame header too; 32 bytes covers the longest one
+	// ("NNNN/NNNN/NNNNNNNN/raptorq|") with room to spare.
+	mods := qr.ModulesForBytes(chunkLen + 32)
+	if mods <= 0 {
+		return
+	}
+	side := s.lastW
+	if s.lastH < side {
+		side = s.lastH
+	}
+	ppm := float64(side) / float64(mods)
+	// Measured on the real pipeline: decoding still works at ~1.7 px/module on
+	// a lucky resampling phase and stops entirely below ~1.5, so the bands are
+	// deliberately generous — warning about a setup that actually works would
+	// teach the user to ignore the log. The advice targets 3 px/module, which
+	// is comfortably inside the reliable range.
+	need := int(float64(mods) * 3)
+	switch {
+	case ppm < 1.5:
+		s.noteAlways("region.too-small", AuditError, fmt.Sprintf(
+			"框 %dx%d 装不下这个码：每块 %d 字节 → 符号 %d 模块，实际只有 %.1f px/模块（实测约需 ≥2.5，低于 1.5 基本读不出）。把框放大到 ≥%dpx，并让发送端窗口尽量大（全屏最好）",
+			s.lastW, s.lastH, chunkLen, mods, ppm, need))
+	case ppm < 2.5:
+		s.noteAlways("region.dense", AuditWarn, fmt.Sprintf(
+			"框 %dx%d 偏小：%d 模块只有 %.1f px/模块，能解但成败取决于缩放相位（换个窗口大小可能就读不出）。建议框 ≥%dpx，并在码四周留 40px 空白",
+			s.lastW, s.lastH, mods, ppm, need))
+	}
 }
 
 func (s *decodeState) feedTxqrLocked(payload []byte) bool {

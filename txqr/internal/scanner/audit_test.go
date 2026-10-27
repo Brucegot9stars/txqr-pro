@@ -321,3 +321,50 @@ func TestStallIsReportedOncePerWindow(t *testing.T) {
 		t.Errorf("stall reported %d times for one window", stalled)
 	}
 }
+
+// TestDensityWarningExplainsATooSmallRegion covers the arithmetic that makes a
+// "sometimes it works" report actionable: a 2048-byte block at ECC M is a
+// 169-module symbol, so a 522 px region gives it under 3 px per module — the
+// code is visible on screen and every decode attempt still fails.
+func TestDensityWarningExplainsATooSmallRegion(t *testing.T) {
+	st, audit, _ := newAuditedState(t)
+
+	// Region far smaller than the symbol can possibly be (200 px for 177
+	// modules is 1.1 px/module, below the measured floor of ~1.5).
+	st.lastW, st.lastH = 200, 200
+	st.adoptSessionLocked(0, 2048, 36013, "raptorq")
+	entries := audit.Entries(0)
+	last := entries[len(entries)-1]
+	if last.Reason != "region.too-small" {
+		t.Fatalf("reason = %q, want region.too-small (entries: %v)", last.Reason, reasons(audit))
+	}
+	for _, want := range []string{"177 模块", "200", "1.5"} {
+		if !strings.Contains(last.Detail, want) {
+			t.Errorf("detail %q does not mention %q", last.Detail, want)
+		}
+	}
+}
+
+// TestDensityNoteStaysQuietWhenTheRegionIsBigEnough: the advice must not fire on
+// a healthy setup, or every capture spams the log with a warning nobody reads.
+func TestDensityNoteStaysQuietWhenTheRegionIsBigEnough(t *testing.T) {
+	st, audit, _ := newAuditedState(t)
+	st.lastW, st.lastH = 900, 900
+	st.adoptSessionLocked(0, 2048, 36013, "raptorq")
+	for _, e := range audit.Entries(0) {
+		if e.Reason == "region.too-small" || e.Reason == "region.dense" {
+			t.Fatalf("warned about density on a 900 px region: %s", e.Detail)
+		}
+	}
+
+	// 420 px for a 177-module symbol is 2.3 px/module: decodes, but only on a
+	// lucky phase, so it warns instead of failing.
+	st2, audit2, _ := newAuditedState(t)
+	st2.lastW, st2.lastH = 420, 420
+	st2.adoptSessionLocked(0, 2048, 36013, "raptorq")
+	entries := audit2.Entries(0)
+	last := entries[len(entries)-1]
+	if last.Reason != "region.dense" {
+		t.Fatalf("reason = %q, want region.dense", last.Reason)
+	}
+}

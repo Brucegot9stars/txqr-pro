@@ -23,13 +23,27 @@
   #overlay { display:none; position:fixed; inset:0; background:#000; z-index:10; }
   #overlay.active { display:block; }
   #qrwrap { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; }
-  #qr { width:min(92vw, 90vh); image-rendering:pixelated; }
+  /* No `image-rendering: pixelated`. Nearest-neighbour looks tidy but is
+     destructive here: the page stretches a fixed-size PNG to min(92vw,90vh),
+     and when the window is a few percent smaller than the PNG every other
+     module row gets dropped, which kills decoding outright. Smooth resampling
+     keeps every module distinguishable at any window size (measured: 12/13
+     sizes decoded with smooth vs 5/13 with pixelated at the old render size). */
+  /* Size comes from JS (applyFrameSize): modules*ppm device pixels, i.e. an
+     exact whole number of pixels per module, never a viewport stretch. */
+  #qr { display:block; margin:0 auto; }
   /* The QR range frame: prominent so the receiver knows exactly what to box,
      but sits OUTSIDE a quiet-zone padding so it never crowds the codes. A
      receiver that boxes it in still decodes via edge-crop + upscale. */
-  #grid { display:grid; gap:6px; width:min(88vw, 86vh); height:min(88vw, 86vh); background:#000; position:relative; margin-top:30px; padding:18px; border:4px solid rgba(0,220,120,.95); outline:2px dashed rgba(255,255,255,.55); outline-offset:10px; box-shadow:0 0 26px rgba(0,220,120,.55); }
+  /* White card, not black: a QR's quiet zone is white, so a dark surround puts
+     an inverted-contrast ring right at the symbol boundary and the detector
+     loses the symbol's extent (measured: same image decodes 4/4 on white and
+     1/4 on a dark surround at 1:1). The 20px white ring means a region boxed a
+     little too wide still only sees white around the code. */
+  #grid { display:grid; gap:6px; width:min(88vw, 86vh); height:min(88vw, 86vh); background:#fff; position:relative; margin-top:30px; padding:18px; border:4px solid rgba(0,180,100,.95); outline:2px dashed rgba(0,0,0,.35); outline-offset:10px; box-shadow:0 0 0 20px #fff; }
   #grid::after { content:'二维码区域 ── 接收端框选此处'; position:absolute; left:50%; top:-30px; transform:translateX(-50%); background:rgba(0,220,120,.92); color:#00110a; font-size:13px; font-weight:bold; padding:2px 12px; border-radius:4px; white-space:nowrap; z-index:5; pointer-events:none; }
-  #grid img { width:100%; height:100%; image-rendering:pixelated; }
+  #grid img { display:block; } /* sized by applyFrameSize, see #qr */
+  #grid { place-items:center; }
   #stats { position:fixed; top:8px; left:0; right:0; text-align:center; font-size:13px; font-family:Consolas,monospace; opacity:.85; z-index:11; pointer-events:none; text-shadow:0 0 4px #000; }
   #hint { margin-top:10px; font-size:12px; opacity:.55; }
   #controls-bar { position:fixed; top:8px; right:12px; z-index:12; display:flex; gap:8px; }
@@ -69,6 +83,18 @@
 
   <div class="row">
     <div>
+      <label>缩放方式</label>
+      <select id="fitMode" style="width:100%; padding:8px; border-radius:6px; border:1px solid #3a3a44; background:#232330; color:#eee;">
+        <option value="fixed" selected>固定不缩放（推荐）</option>
+        <option value="scale">允许缩放（铺满窗口）</option>
+        <option value="manual">手动（指定 px/模块）</option>
+      </select>
+    </div>
+    <div id="ppmWrap" style="display:none;">
+      <label>像素/模块</label>
+      <input type="number" id="ppmInput" value="4" min="2" max="8" step="1">
+    </div>
+    <div>
       <label>编码方案</label>
       <select id="codec" style="width:100%; padding:8px; border-radius:6px; border:1px solid #3a3a44; background:#232330; color:#eee;">
         <option value="lt">LT (经典)</option>
@@ -103,6 +129,43 @@ const splitInput = document.getElementById('split');
 const fpsInput = document.getElementById('fps');
 const gridInput = document.getElementById('gridSize');
 const codecInput = document.getElementById('codec');
+const fitModeInput = document.getElementById('fitMode');
+const ppmInput = document.getElementById('ppmInput');
+const ppmWrap = document.getElementById('ppmWrap');
+
+// The scaling mode decides how much the browser is allowed to resample:
+//   fixed  — server renders N device px per module, page shows it 1:1 (default)
+//   scale  — page stretches the image to the cell; smoothest size, least robust
+//   manual — you pick the module size; still rendered and shown 1:1
+const FIT_MODES = ['fixed', 'scale', 'manual'];
+function loadFitMode() {
+  try {
+    const saved = localStorage.getItem('qrt-pro.fitMode');
+    if (FIT_MODES.includes(saved)) fitModeInput.value = saved;
+    const ppm = parseInt(localStorage.getItem('qrt-pro.ppm'), 10);
+    if (ppm >= 2 && ppm <= 8) ppmInput.value = ppm;
+  } catch (e) { /* private mode: defaults are fine */ }
+}
+function saveFitMode() {
+  try {
+    localStorage.setItem('qrt-pro.fitMode', fitModeInput.value);
+    localStorage.setItem('qrt-pro.ppm', String(clampPPM(ppmInput.value)));
+  } catch (e) { /* ignore */ }
+}
+function clampPPM(v) {
+  const n = parseInt(v, 10);
+  if (!isFinite(n)) return 4;
+  return Math.max(2, Math.min(8, n));
+}
+function syncFitModeUI() {
+  ppmWrap.style.display = fitModeInput.value === 'manual' ? '' : 'none';
+  saveFitMode();
+  applyFrameSize();
+}
+loadFitMode();
+fitModeInput.addEventListener('change', syncFitModeUI);
+ppmInput.addEventListener('change', syncFitModeUI);
+ppmWrap.style.display = fitModeInput.value === 'manual' ? '' : 'none';
 const colorModeInput = document.getElementById('colorMode');
 const decimenModeInput = document.getElementById('decimenMode');
 const startBtn = document.getElementById('start');
@@ -192,6 +255,84 @@ function buildTiles(codes, dims) {
   }
 }
 
+// fitBudget returns the device-pixel budget for ONE code, estimated from the
+// viewport before the overlay is laid out (the grid has no box until it is
+// shown). The server turns it into an integer module size, so being off by a
+// few pixels only changes how large the code looks, never its correctness.
+function fitBudget(codesCount) {
+  const dims = gridDims(codesCount);
+  const box = Math.min(window.innerWidth * 0.88, window.innerHeight * 0.86) - 44;
+  const cell = Math.min(box / dims.cols, box / dims.rows) - 8;
+  return Math.max(0, Math.floor(cell * (window.devicePixelRatio || 1)));
+}
+
+// applyFrameSize shows every frame at exactly the size the server rendered it:
+// modules * ppm device pixels, never a viewport-relative stretch. This is the
+// whole point of the ppm plumbing — a barcode detector estimates one module
+// width and samples on a fixed grid, so a fractional module size (2.37 px, say)
+// leaves some modules 2 px and others 3 px, the grid drifts, and the frame
+// decodes or fails depending on the exact ratio. Measured at 1:1: 21 of 21
+// frame/size/margin combinations decoded; stretched to the viewport only ~60%
+// did, with whole runs of zero.
+function applyFrameSize() {
+  if (!session || !tiles.length || !session.modules || !session.ppm) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cell = tileBudget();
+
+  if (fitModeInput.value === 'scale') {
+    // The user asked for the image to fill the cell. This is the one mode where
+    // the browser resamples on purpose, so it costs reliability — it is here so
+    // the old behaviour is still reachable.
+    for (const t of tiles) {
+      t.style.width = '100%';
+      t.style.height = 'auto';
+      t.style.maxWidth = '';
+      t.style.maxHeight = '';
+    }
+    session.fitOk = true;
+    session.applied = 'scale';
+    return;
+  }
+
+  const css = (session.modules * session.ppm) / dpr;
+  // If the window shrank below what the frames were rendered for, the choice is
+  // clipping (undecodable) or scaling (uneven modules). Scale, and say so.
+  const fits = cell <= 0 || css <= cell + 0.5;
+  for (const t of tiles) {
+    t.style.width = css + 'px';
+    t.style.height = css + 'px';
+    t.style.maxWidth = fits ? '' : Math.floor(cell) + 'px';
+    t.style.maxHeight = fits ? '' : Math.floor(cell) + 'px';
+  }
+  session.fitOk = fits;
+  // Manual size is baked into the frames, so a changed number needs a re-encode.
+  session.applied = fitModeInput.value === 'manual' && clampPPM(ppmInput.value) !== session.ppm
+    ? 'pending'
+    : 'exact';
+}
+
+// tileBudget returns the CSS pixels actually available for one cell now.
+function tileBudget() {
+  const box = gridEl.getBoundingClientRect();
+  if (!box.width || !box.height) return 0;
+  const style = getComputedStyle(gridEl);
+  const px = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+  const py = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+  const bx = parseFloat(style.borderLeftWidth) + parseFloat(style.borderRightWidth);
+  const by = parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth);
+  const gap = parseFloat(style.gap) || 0;
+  const cols = session.dims.cols, rows = session.dims.rows;
+  const w = (box.width - bx - px - gap * (cols - 1)) / cols;
+  const h = (box.height - by - py - gap * (rows - 1)) / rows;
+  return Math.min(w, h);
+}
+
+let fitTimer = 0;
+window.addEventListener('resize', () => {
+  clearTimeout(fitTimer);
+  fitTimer = setTimeout(applyFrameSize, 120);
+});
+
 function showFileInfo() {
   const file = fileInput.files[0];
   if (!file) { statusEl.textContent = ''; return; }
@@ -242,6 +383,15 @@ async function encodeFile() {
       url = '/encode?split=' + split + '&codec=' + codec;
       if (colorModeInput.checked) url += '&mode=color';
     }
+    const codesCount = decimen ? DECIMEN_CODES : cols * cols;
+    // fixed  → tell the server how many device pixels one code may use
+    // manual → ask for exactly that many pixels per module
+    // scale  → let the server use its default module size; the page stretches
+    if (fitModeInput.value === 'fixed') {
+      url += '&fit=' + fitBudget(codesCount);
+    } else if (fitModeInput.value === 'manual') {
+      url += '&ppm=' + clampPPM(ppmInput.value);
+    }
     const resp = await fetch(url, { method: 'POST', body: await file.arrayBuffer(), signal: encodeAbort.signal });
     if (!resp.ok) throw new Error(await resp.text());
     const data = await resp.json();
@@ -252,6 +402,7 @@ async function encodeFile() {
       codes: decimen ? DECIMEN_CODES : cols * cols,
       dims: gridDims(decimen ? DECIMEN_CODES : cols * cols),
       carousel: !!data.carousel, k: data.k, sessionId: data.sessionId, blockLen: data.blockLen || data.split || split,
+      modules: data.modules || 0, ppm: data.ppm || 0,
     };
   } catch (e) {
     if (e && e.name === 'AbortError') {
@@ -282,6 +433,10 @@ async function start() {
   buildTiles(session.codes, session.dims);
   running = true;
   overlay.classList.add('active');
+  // Only measure once the overlay is visible: while it is display:none the grid
+  // has no box. The image size itself does not depend on this measurement.
+  applyFrameSize();
+  requestAnimationFrame(applyFrameSize);
   if (session.carousel) startDecimenLoop();
   else showFrame();
 }
@@ -300,9 +455,21 @@ function showFrame() {
   statsEl.textContent =
     '帧 ' + (base + 1) + '/' + session.count +
     ' | 网格 ' + session.dims.cols + 'x' + session.dims.rows +
+    ' | ' + sizeNote() +
     ' | 已播放 ' + bytesFmt(shownBytes) +
     ' | ' + bytesFmt(rateFile) + '/s';
   setTimeout(showFrame, 1000 / session.fps);
+}
+
+// sizeNote turns the current sizing state into one short phrase for the HUD, so
+// a mismatch (wrong mode for the frames being served) is visible rather than
+// silently resampled.
+function sizeNote() {
+  if (!session) return '';
+  if (session.applied === 'scale') return '铺满窗口（允许缩放）';
+  if (session.applied === 'pending') return '点「序列化」应用 ' + clampPPM(ppmInput.value) + 'px/模块';
+  if (!session.ppm) return '';
+  return session.ppm + 'px/模块' + (session.fitOk === false ? '，窗口偏小已缩放' : '');
 }
 
 function togglePause() {

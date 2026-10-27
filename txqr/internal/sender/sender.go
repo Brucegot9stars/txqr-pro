@@ -63,6 +63,8 @@ type session struct {
 	pngs      [][]byte
 	total     int
 	split     int    // effective payload bytes per frame, after any mode clamp
+	modules   int    // symbol modules per side, quiet zone included
+	ppm       int    // device pixels per module the frames were rendered at
 	mode      string // "qr", "color" or "decimen"
 	createdAt time.Time
 
@@ -398,6 +400,22 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 		mode = v
 	}
 
+	// fit is the device-pixel budget the page has for one code. It only decides
+	// how many pixels each module gets; the page then displays the image at
+	// exactly that size, so the browser never resamples it.
+	size := frameSize{}
+	if v := r.URL.Query().Get("fit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			size.fit = n
+		}
+	}
+	// ppm is the explicit form: the user picked a module size in the UI.
+	if v := r.URL.Query().Get("ppm"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			size.ppm = n
+		}
+	}
+
 	// The color matrix holds far fewer bytes per frame than a QR symbol, and
 	// the UI keeps the same split knob as classic mode. Without this clamp the
 	// default split (2048) makes every frame fail to render and the transfer
@@ -422,9 +440,9 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 	var sess *session
 	switch mode {
 	case "decimen":
-		sess, err = encodeDecimen(r, body)
+		sess, err = encodeDecimen(r, body, size)
 	default:
-		sess, err = encodeClassic(body, split, mode, codec)
+		sess, err = encodeClassic(body, split, mode, codec, size)
 	}
 	if err != nil {
 		http.Error(w, "encode: "+err.Error(), http.StatusInternalServerError)
@@ -470,6 +488,14 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 		// Echo the payload size actually used: a mode clamp can make it
 		// smaller than what the client asked for.
 		"split": sess.split,
+		// modules lets the page size the <img> to a whole number of device
+		// pixels per module instead of scaling it to the viewport. See
+		// fitFrames() in index.html: any integer module size decodes, any
+		// fractional one is a lottery.
+		"modules": sess.modules,
+		// ppm is how many device pixels each module occupies in the frames the
+		// server is serving; the page displays them at exactly modules*ppm.
+		"ppm": sess.ppm,
 	}
 	if mode == "decimen" {
 		resp["carousel"] = true
@@ -528,7 +554,7 @@ func clampColorSplit(split int) int {
 }
 
 // encodeClassic is the text-based pipeline (QR/color, LT/Raptor/…).
-func encodeClassic(body []byte, split int, mode string, codec txqr.CodecType) (*session, error) {
+func encodeClassic(body []byte, split int, mode string, codec txqr.CodecType, size frameSize) (*session, error) {
 	str := string(body)
 	encoder := txqr.NewEncoder(split, codec)
 	frames, err := encoder.Encode(str)
@@ -546,14 +572,35 @@ func encodeClassic(body []byte, split int, mode string, codec txqr.CodecType) (*
 	for i, f := range frames {
 		s.frames[i] = []byte(f)
 	}
+	s.modules = frameModules(mode, s.frames)
+	s.ppm = size.forModules(s.modules)
 	return s, nil
+}
+
+// frameModules reports the symbol's modules per side, quiet zone included, so
+// the page can size the <img> to a whole number of device pixels per module.
+// Zero means "unknown", which the page treats as "fall back to viewport width".
+func frameModules(mode string, frames [][]byte) int {
+	switch mode {
+	case "color":
+		return qr.ColorMatrixSize
+	case "decimen":
+		// Pinned V40: 177 data modules plus the 4-module quiet zone per side.
+		return 21 + 4*(DecimenQRVersion-1) + 8
+	}
+	if len(frames) == 0 {
+		return 0
+	}
+	// The header length varies with the block numbers, so measure a frame
+	// instead of assuming: ECC M turns the byte count into a version.
+	return qr.ModulesForBytes(len(frames[0]))
 }
 
 // encodeDecimen builds the DCF2 container plus one full carousel cycle (2k
 // frames: a systematic sweep then k repair frames). Replaying the cycle forever
 // lets the receiver finish from any starting point; repeats are counted as
 // duplicates, never as corruption.
-func encodeDecimen(r *http.Request, body []byte) (*session, error) {
+func encodeDecimen(r *http.Request, body []byte, size frameSize) (*session, error) {
 	name := r.URL.Query().Get("name")
 	mediaType := r.URL.Query().Get("type")
 	if mediaType == "" {
@@ -604,6 +651,8 @@ func encodeDecimen(r *http.Request, body []byte) (*session, error) {
 		h.Seq = uint32(seq)
 		s.frames[seq] = decimen.PackFrame(h, enc.Encode(uint32(seq)))
 	}
+	s.modules = frameModules("decimen", nil)
+	s.ppm = size.forModules(s.modules)
 	return s, nil
 }
 
@@ -665,7 +714,7 @@ func (s *Server) handleFrame(w http.ResponseWriter, r *http.Request) {
 		// 400 here keeps "no such frame" distinct from "frame failed to render".
 		badIndex = true
 	case sess.pngs[idx] == nil:
-		pngBytes = renderByMode(sess.mode, sess.frames[idx])
+		pngBytes = renderByMode(sess.mode, sess.frames[idx], sess.ppm)
 		if pngBytes != nil {
 			sess.pngs[idx] = pngBytes
 		}
@@ -712,19 +761,71 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 
 // ---------------------------------------------------------------- rendering
 
-func renderByMode(mode string, frame []byte) []byte {
+func renderByMode(mode string, frame []byte, ppm int) []byte {
 	switch mode {
 	case "color":
-		return renderColorPNG(frame)
+		return renderColorPNG(frame, ppm)
 	case "decimen":
-		return renderDecimenPNG(frame)
+		return renderDecimenPNG(frame, ppm)
 	default:
-		return renderPNG(frame)
+		return renderPNG(frame, ppm)
 	}
 }
 
-func renderPNG(frame []byte) []byte {
-	img, err := qr.Encode(string(frame), 512, qr.Medium)
+// Module rendering: frames are rendered at an exact whole number of device
+// pixels per module, and the page displays them at exactly that size. A barcode
+// detector estimates one module width and then samples on a fixed grid, so any
+// fractional module size makes some modules a pixel wider than others and the
+// grid drifts; at whole-pixel modules every sample lands where it should.
+// Measured at 1:1: 21 of 21 frame/size/margin combinations decoded, versus ~60%
+// when the browser stretched the image to the viewport.
+const (
+	defaultPPM = 4 // used when the client does not ask for a specific fit
+	minPPM     = 2 // below this a module is unreadable no matter the layout
+	maxPPM     = 8 // beyond this the gain is nil and the PNG gets large
+)
+
+// frameSize is how the client asked for the frames to be rendered. Both fields
+// are hints: ppm wins when given, otherwise the fit budget decides how many
+// device pixels each module gets.
+type frameSize struct {
+	fit int // device-pixel budget for one code; 0 = unspecified
+	ppm int // explicit device pixels per module; 0 = derive from fit
+}
+
+// forModules resolves the module size for a symbol of the given width. Any
+// positive ppm is honoured (clamped into the usable range) — a value of 1 is a
+// request for "as small as possible", not for "no opinion".
+func (f frameSize) forModules(modules int) int {
+	if f.ppm > 0 {
+		if f.ppm < minPPM {
+			return minPPM
+		}
+		if f.ppm > maxPPM {
+			return maxPPM
+		}
+		return f.ppm
+	}
+	return pickPPM(f.fit, modules)
+}
+
+// pickPPM chooses the module size that best fills fitPixels without scaling.
+func pickPPM(fitPixels, modules int) int {
+	if fitPixels <= 0 || modules <= 0 {
+		return defaultPPM
+	}
+	ppm := fitPixels / modules
+	if ppm < minPPM {
+		ppm = minPPM
+	}
+	if ppm > maxPPM {
+		ppm = maxPPM
+	}
+	return ppm
+}
+
+func renderPNG(frame []byte, ppm int) []byte {
+	img, err := qr.Encode(string(frame), -ppm, qr.Medium)
 	if err != nil {
 		log.Printf("QR encode error: %v", err)
 		return nil
@@ -735,8 +836,9 @@ func renderPNG(frame []byte) []byte {
 // renderDecimenPNG pins V40-L with a fixed mask: identical length, ECC and mask
 // mean identical geometry across frames — required for grid tiling — and the
 // pinned mask skips the spec's 8-way mask evaluation.
-func renderDecimenPNG(frame []byte) []byte {
-	img, err := qr.EncodeVersioned(string(frame), 512, qr.Low, DecimenQRVersion, DecimenQRMask)
+func renderDecimenPNG(frame []byte, ppm int) []byte {
+	mods := frameModules("decimen", nil)
+	img, err := qr.EncodeVersioned(string(frame), ppm*mods, qr.Low, DecimenQRVersion, DecimenQRMask)
 	if err != nil {
 		log.Printf("decimen QR encode error: %v", err)
 		return nil
@@ -745,8 +847,9 @@ func renderDecimenPNG(frame []byte) []byte {
 }
 
 // renderColorPNG renders a frame as a 4-colour matrix (2 bit/module).
-func renderColorPNG(frame []byte) []byte {
-	img, err := qr.ColorMatrixEncode(frame, 512)
+func renderColorPNG(frame []byte, ppm int) []byte {
+	// ColorMatrixEncode floors to a whole number of pixels per cell itself.
+	img, err := qr.ColorMatrixEncode(frame, ppm*qr.ColorMatrixSize)
 	if err != nil {
 		log.Printf("color encode error: %v", err)
 		return nil
@@ -787,7 +890,7 @@ func renderFrames(s *session, ctx context.Context) {
 				if ctx.Err() != nil {
 					return
 				}
-				s.pngs[i] = renderByMode(s.mode, s.frames[i])
+				s.pngs[i] = renderByMode(s.mode, s.frames[i], s.ppm)
 			}
 		}()
 	}

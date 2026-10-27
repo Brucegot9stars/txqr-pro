@@ -96,6 +96,8 @@ var reasonLabels = map[string]string{
 	"frame.session-switch":   "检测到新会话，已重置解码器",
 	"frame.session-new":      "识别到新传输（帧头）",
 	"frame.name":             "收到文件名帧",
+	"region.too-small":       "框太小，装不下这个码",
+	"region.dense":           "框偏小，解码会不稳定",
 	"frame.dropped":          "帧被解码器拒绝",
 	"fountain.stalled":       "长时间没有新块",
 	"save.error":             "写入文件失败",
