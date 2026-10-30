@@ -108,4 +108,24 @@ jobs:
       - name: Test release receiver
         run: |
           chmod +x ./gradlew
-          ./gradlew :app:testReleaseUnitTest --no-daemon
+          set +e
+          ./gradlew :app:testReleaseUnitTest --no-daemon --console=plain > "$RUNNER_TEMP/qrt-android-test.log" 2>&1
+          result=$?
+          cat "$RUNNER_TEMP/qrt-android-test.log"
+          if [ "$result" -ne 0 ]; then
+            python3 - <<'PY_DIAGNOSTIC'
+          import os
+          from pathlib import Path
+          lines = Path(os.environ['RUNNER_TEMP'], 'qrt-android-test.log').read_text(errors='replace').splitlines()
+          selected = set()
+          for index, line in enumerate(lines):
+              if any(marker in line for marker in ('e: ', 'error:', '* What went wrong:', 'FAILURE:', 'Execution failed', 'Could not', 'Exception')):
+                  selected.update(range(max(0, index - 1), min(len(lines), index + 12)))
+          if not selected:
+              selected.update(range(max(0, len(lines) - 80), len(lines)))
+          message = '\n'.join(lines[index] for index in sorted(selected))[-16000:]
+          escaped = message.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Android release unit test diagnostics::' + escaped)
+          PY_DIAGNOSTIC
+          fi
+          exit "$result"
