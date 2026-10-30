@@ -208,7 +208,9 @@ gradlew.bat :app:assembleDebug --no-daemon
 
 ## 版本
 
-当前版本：`v2.0.1`（见 Git tag）。Android 端 `versionCode=12` / `versionName=2.0.1`。
+当前版本：`v2.0.2`（见 Git tag）。Android 端 `versionCode=13` / `versionName=2.0.2`。
+
+v2.0.2 为 Windows 接收区域记住已验证的识别路径，失败时完整回退，并复用 QR 检测/回退的只读亮度数据，降低识别 CPU 与分配。详见 [本轮优化证据与 Horizon 验收方案](docs/performance-v2.0.2.md)。
 
 v2.0.1 修复播放帧率回归，取消接收端内存估算/累计帧数拒绝，减少重复截图识别及裁剪复制。性能证据及限制见 [性能修复记录](docs/performance-v2.0.1.md)。
 

@@ -131,9 +131,10 @@ type region struct {
 }
 
 type decJob struct {
-	r    *region
-	gen  int
-	rgba *image.RGBA
+	r      *region
+	gen    int
+	rgba   *image.RGBA
+	qrHint string
 }
 
 type saveJob struct {
@@ -656,10 +657,11 @@ func (m *Manager) decWorker() {
 		if stale {
 			continue // frame from a stopped or restarted scan
 		}
-		payload := job.r.st.decode(job.rgba)
+		payload, hint := job.r.st.decode(job.rgba)
 		if payload == nil {
 			continue
 		}
+		job.qrHint = hint
 		if result, ok := m.commitPayload(job, payload); ok {
 			m.submitSave(result)
 		}
@@ -672,6 +674,13 @@ func (m *Manager) commitPayload(job decJob, payload []byte) (saveJob, bool) {
 	defer m.mu.Unlock()
 	if job.r.serial != job.gen || !job.r.scanning || m.closing {
 		return saveJob{}, false
+	}
+	// Publish the hint only after the same generation check as the payload.
+	// Old workers cannot teach a restarted scan their previous geometry.
+	if job.qrHint != "" && job.rgba != nil {
+		job.r.st.mu.Lock()
+		job.r.st.qrHint, job.r.st.qrHintSize = job.qrHint, job.rgba.Bounds().Size()
+		job.r.st.mu.Unlock()
 	}
 	if !job.r.st.feedPayload(payload) || !job.r.doneOnce.CompareAndSwap(0, 1) {
 		return saveJob{}, false

@@ -93,8 +93,9 @@ func Decode(img image.Image) (string, error) {
 }
 
 // decodeOnce runs the QR reader, optionally with the pure-barcode fast path.
-func decodeOnce(img image.Image, pure bool) (*gozxing.Result, error) {
-	bitmap, err := gozxing.NewBinaryBitmap(gozxing.NewHybridBinarizer(luminanceSource(img)))
+func decodeOnce(source gozxing.LuminanceSource, pure bool) (*gozxing.Result, error) {
+	// Each attempt owns its mutable binary matrix. Only luminance is shared.
+	bitmap, err := gozxing.NewBinaryBitmap(gozxing.NewHybridBinarizer(source))
 	if err != nil {
 		return nil, err
 	}
@@ -220,10 +221,10 @@ func scaleForDecode(img image.Image) image.Image {
 // margin, edges and background); if that fails, the pure-barcode fast path is
 // tried, which assumes the image is exactly the code.
 func DecodeRaw(img image.Image) ([]byte, error) {
-	img = scaleForDecode(img)
-	result, err := decodeOnce(img, false)
+	source := luminanceSource(scaleForDecode(img))
+	result, err := decodeOnce(source, false)
 	if err != nil {
-		result, err = decodeOnce(img, true)
+		result, err = decodeOnce(source, true)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("gozxing: %v", err)
@@ -239,7 +240,7 @@ type Attempt struct {
 	Label   string // e.g. "crop6%@1.0x", "bare", "up1.5x"
 	Err     error  // decoder error; nil when a symbol was decoded
 	Found   bool   // a QR symbol was decoded
-	Payload bool   // ...and its payload looked like a frame
+	Payload bool   // ...and its payload passed the optional frame validator
 }
 
 // DecodeRawMultiScale decodes a QR trying cheap crops first, then scales.
@@ -255,13 +256,22 @@ func DecodeRawMultiScale(img image.Image, scales []float64) ([]byte, error) {
 // DecodeRawMultiScaleVerbose is DecodeRawMultiScale plus the list of attempts
 // it made, for the receiver's diagnostic log.
 func DecodeRawMultiScaleVerbose(img image.Image, scales []float64) ([]byte, error, []Attempt) {
+	return DecodeRawMultiScalePreferred(img, scales, "", nil)
+}
+
+// DecodeRawMultiScalePreferred tries a previous successful attempt first, then
+// all remaining candidates in the original order. Unknown labels are ignored.
+// valid optionally checks extracted payloads before accepting a candidate;
+// returning false keeps the search going, without changing receive state.
+func DecodeRawMultiScalePreferred(img image.Image, scales []float64, preferred string, valid func([]byte) bool) ([]byte, error, []Attempt) {
 	b := img.Bounds()
 	var attempts []Attempt
 
 	record := func(label string, raw []byte, err error) ([]byte, bool) {
 		at := Attempt{Label: label, Err: err, Found: err == nil}
 		if at.Found {
-			at.Payload = ExtractFramePayload(raw) != nil
+			payload := ExtractFramePayload(raw)
+			at.Payload = payload != nil && (valid == nil || valid(payload))
 		}
 		attempts = append(attempts, at)
 		if at.Found && at.Payload {
@@ -270,7 +280,36 @@ func DecodeRawMultiScaleVerbose(img image.Image, scales []float64) ([]byte, erro
 		return nil, false
 	}
 
-	tryCrop := func(cropPct, sc float64) ([]byte, bool) {
+	type candidate struct {
+		label       string
+		crop, scale float64
+	}
+	candidates := []candidate{
+		{"crop6%@1.0x", .06, 1}, {"crop3%@1.0x", .03, 1}, {"crop10%@1.0x", .10, 1},
+		{"bare", 0, 1},
+		{"crop6%@1.5x", .06, 1.5}, {"crop6%@2.0x", .06, 2},
+		{"crop3%@1.5x", .03, 1.5}, {"crop3%@2.0x", .03, 2},
+	}
+	for _, scale := range scales {
+		if scale != 1 {
+			candidates = append(candidates, candidate{fmt.Sprintf("scale%.1fx", scale), 0, scale})
+		}
+	}
+
+	try := func(c candidate) ([]byte, bool) {
+		cropPct, sc := c.crop, c.scale
+		if cropPct == 0 {
+			cand := img
+			if sc != 1 {
+				nw, nh := int(float64(b.Dx())*sc), int(float64(b.Dy())*sc)
+				if nw < 8 || nh < 8 {
+					return nil, false
+				}
+				cand = scaleBilinear(img, nw, nh)
+			}
+			raw, err := DecodeRaw(cand)
+			return record(c.label, raw, err)
+		}
 		dx := int(float64(b.Dx()) * cropPct)
 		dy := int(float64(b.Dy()) * cropPct)
 		if b.Dx()-2*dx < 60 || b.Dy()-2*dy < 60 {
@@ -295,40 +334,27 @@ func DecodeRawMultiScaleVerbose(img image.Image, scales []float64) ([]byte, erro
 			cand = scaleBilinear(cropped, int(float64(cw)*sc), int(float64(ch)*sc))
 		}
 		raw, err := DecodeRaw(cand)
-		return record(fmt.Sprintf("crop%d%%@%.1fx", int(cropPct*100), sc), raw, err)
+		return record(c.label, raw, err)
 	}
 
-	// 1. cheap original-resolution crops (fast path for boxed-in frames)
-	for _, cropPct := range []float64{0.06, 0.03, 0.10} {
-		if raw, ok := tryCrop(cropPct, 1.0); ok {
-			return raw, nil, attempts
-		}
-	}
-	// 2. bare image (tight, border-free boxes)
-	bareRaw, bareErr := DecodeRaw(img)
-	if raw, ok := record("bare", bareRaw, bareErr); ok {
-		return raw, nil, attempts
-	}
-	// 3. upscales for small codes
-	for _, cropPct := range []float64{0.06, 0.03} {
-		for _, sc := range []float64{1.5, 2.0} {
-			if raw, ok := tryCrop(cropPct, sc); ok {
+	preferredIndex := -1
+	if preferred != "" {
+		for i, c := range candidates {
+			if c.label != preferred {
+				continue
+			}
+			preferredIndex = i
+			if raw, ok := try(c); ok {
 				return raw, nil, attempts
 			}
+			break
 		}
 	}
-	// 4. coarse scales as a last resort
-	for _, s := range scales {
-		if s == 1.0 {
+	for i, c := range candidates {
+		if i == preferredIndex {
 			continue
 		}
-		w, h := b.Dx(), b.Dy()
-		nw, nh := int(float64(w)*s), int(float64(h)*s)
-		if nw < 8 || nh < 8 {
-			continue
-		}
-		scaleRaw, scaleErr := DecodeRaw(scaleBilinear(img, nw, nh))
-		if raw, ok := record(fmt.Sprintf("scale%.1fx", s), scaleRaw, scaleErr); ok {
+		if raw, ok := try(c); ok {
 			return raw, nil, attempts
 		}
 	}

@@ -72,6 +72,8 @@ type decodeState struct {
 	// symbol's module count they give pixels per module, which is the number
 	// that decides whether a region can be decoded at all.
 	lastW, lastH int
+	qrHint       string
+	qrHintSize   image.Point
 
 	// Stall detection: frames that keep arriving while no new block is
 	// accepted are the classic "it worked a minute ago" symptom. Counting
@@ -160,15 +162,20 @@ func (s *decodeState) reset() {
 	s.result = nil
 	s.fileName = ""
 	s.mode = ""
+	s.qrHint, s.qrHintSize = "", image.Point{}
 }
 
 // decode runs gozxing on a frame and updates counters. Each region owns its own
 // decodeState, so several capture workers may be inside this at once for
 // different regions without colliding.
-func (s *decodeState) decode(rgba *image.RGBA) []byte {
-	// try native, then smaller, then larger — a real capture can have the QR at
-	// any relative size inside the boxed region
-	raw, err, attempts := qr.DecodeRawMultiScaleVerbose(rgba, []float64{1.0, 0.6, 1.7})
+func (s *decodeState) decode(rgba *image.RGBA) ([]byte, string) {
+	s.mu.Lock()
+	preferred := s.qrHint
+	if s.qrHintSize != rgba.Bounds().Size() {
+		preferred = ""
+	}
+	s.mu.Unlock()
+	raw, err, attempts := qr.DecodeRawMultiScalePreferred(rgba, []float64{1.0, 0.6, 1.7}, preferred, validQRFrame)
 	payload := qr.ExtractFramePayload(raw)
 
 	s.mu.Lock()
@@ -179,9 +186,19 @@ func (s *decodeState) decode(rgba *image.RGBA) []byte {
 		s.decodeFail++
 		s.saveDebugFrame(rgba)
 		s.noteDecodeFailureLocked(rgba, err, attempts)
-		return nil
+		return nil, ""
 	}
-	return payload
+	return payload, attempts[len(attempts)-1].Label
+}
+
+// A visually readable QR is not necessarily a valid transfer packet. Do not
+// learn its geometry or stop the search until protocol validation succeeds.
+func validQRFrame(payload []byte) bool {
+	if len(payload) >= 2 && payload[0] == 0xD1 && payload[1] == 0x0D {
+		return decimen.ParseFrame(payload) != nil
+	}
+	_, err := txqr.ParseFrame(string(payload))
+	return err == nil
 }
 
 // noteDecodeFailureLocked explains a failed capture. "No QR at all" and "a QR
@@ -209,7 +226,7 @@ func (s *decodeState) noteDecodeFailureLocked(rgba *image.RGBA, err error, attem
 	}
 	if found > 0 && withPayload == 0 {
 		s.note("qr.found-no-payload", AuditWarn, fmt.Sprintf(
-			"框 %dx%d：%d/%d 次尝试检出了二维码，但载荷不是 txqr/decimen 帧（可能是 Color Matrix 帧——桌面端不支持——或屏幕上的其它二维码）",
+			"框 %dx%d：%d/%d 次尝试检出了二维码，但载荷未通过 txqr/decimen 帧验证（可能是校验失败、其它协议或错误区域；桌面端不支持 Color Matrix）",
 			b.Dx(), b.Dy(), found, len(attempts)))
 		return
 	}

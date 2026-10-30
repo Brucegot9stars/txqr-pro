@@ -12,8 +12,8 @@ android {
         applicationId = "com.qrtpro.reader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 12
-        versionName = "2.0.1"
+        versionCode = 13
+        versionName = "2.0.2"
     }
 
     buildTypes {
