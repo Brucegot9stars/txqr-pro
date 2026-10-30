@@ -208,7 +208,9 @@ gradlew.bat :app:assembleDebug --no-daemon
 
 ## 版本
 
-当前版本：`v2.0.3`（见 Git tag）。Android 端 `versionCode=14` / `versionName=2.0.3`。
+当前版本：`v2.0.4`（见 Git tag）。Android 端 `versionCode=15` / `versionName=2.0.4`。
+
+v2.0.4 将二维码准备方式改为「预生成全部二维码」开关：开启时先准备整轮，关闭（默认）时首批缓冲后边生成边播放；选择在下次序列化生效。
 
 v2.0.3 在 Windows、网页和 Android 显示版本与限制，提前校验源块数/二维码容量；发送端支持首批缓冲后播放或先准备整轮，记录错误和阶段耗时。详见 [发送端优化及使用说明](docs/sender-v2.0.3.md)。
 

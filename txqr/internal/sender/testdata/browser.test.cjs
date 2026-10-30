@@ -41,10 +41,15 @@ const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
    } finally {fixtureActive--;}
  };
  </script>`;
- const config={version:'2.0.3',maxUploadBytes:64*1024*1024,maxSourceBlocks:8192,maxChunkBytes:2933,qrFrameBytes:2331,colorFrameBytes:1587,colorSplitBytes:1426,decimenBlockBytes:2933,workerMemoryBytes:512*1024*1024,pngCacheBytes:128*1024*1024,sessionCacheBytes:256*1024*1024,maxSessions:4,encodeTimeoutSeconds:300};
+ const config={version:'2.0.4',maxUploadBytes:64*1024*1024,maxSourceBlocks:8192,maxChunkBytes:2933,qrFrameBytes:2331,colorFrameBytes:1587,colorSplitBytes:1426,decimenBlockBytes:2933,workerMemoryBytes:512*1024*1024,pngCacheBytes:128*1024*1024,sessionCacheBytes:256*1024*1024,maxSessions:4,encodeTimeoutSeconds:300};
  let html=fs.readFileSync(path.join(__dirname,'..','index.html'),'utf8').replace('/*APP_CONFIG*/ {}',JSON.stringify(config)).replace('<head>','<head>'+setup);
  await cdp('Page.setDocumentContent',{frameId:frameTree.frame.id,html},sessionId);
- assert((await evaluate('document.getElementById("version").textContent')).includes('2.0.3'),'missing displayed version');
+ assert((await evaluate('document.getElementById("version").textContent')).includes('2.0.4'),'missing displayed version');
+ assert(await evaluate('prepareInput.type === "checkbox" && prepareInput.getAttribute("role") === "switch" && !prepareInput.checked'),'pre-generation switch should default off');
+ await evaluate('prepareInput.click()');
+ assert(await evaluate('prepareInput.checked'),'pre-generation switch did not turn on');
+ await evaluate('prepareInput.click()');
+ assert(await evaluate('!prepareInput.checked'),'pre-generation switch did not turn off');
  await evaluate(`fileInput.files=(()=>{const transfer=new DataTransfer();transfer.items.add(new File([new Uint8Array(25585664)],'large.bin'));return transfer.files})();fileInput.dispatchEvent(new Event('change'))`);
  await sleep(50);
  assert(await evaluate('startBtn.disabled && document.getElementById("selection-error").textContent.includes("无法仅靠增大分片")'),'24.4 MiB was not explained before encoding');

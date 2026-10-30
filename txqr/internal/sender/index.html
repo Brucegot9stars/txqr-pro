@@ -16,6 +16,12 @@
   .row > div { flex:1; }
   input[type=number] { width:100%; padding:8px; border-radius:6px; border:1px solid #3a3a44; background:#232330; color:#eee; }
   select { width:100%; padding:8px; border-radius:6px; border:1px solid #3a3a44; background:#232330; color:#eee; }
+  .toggle { display:flex; align-items:center; gap:10px; cursor:pointer; opacity:1; }
+  .toggle input { appearance:none; flex-shrink:0; width:42px; height:24px; margin:0; border:1px solid #687080; border-radius:12px; background:#3a3a44; cursor:pointer; position:relative; }
+  .toggle input::before { content:''; position:absolute; width:18px; height:18px; top:2px; left:2px; border-radius:50%; background:#fff; }
+  .toggle input:checked { background:#2f81f7; border-color:#2f81f7; }
+  .toggle input:checked::before { transform:translateX(18px); }
+  .toggle input:focus-visible { outline:2px solid #9ab8e8; outline-offset:3px; }
   button { margin-top:22px; width:100%; padding:12px; font-size:16px; border:none; border-radius:8px; background:#2f81f7; color:#fff; cursor:pointer; }
   button:disabled { opacity:.5; cursor:default; }
   #status { margin-top:14px; font-size:13px; opacity:.7; min-height:18px; }
@@ -113,12 +119,8 @@
     </div>
   </div>
 
-  <label>二维码准备方式</label>
-  <select id="prepareMode">
-    <option value="progressive">快速开始（首批缓冲，后续提前生成）</option>
-    <option value="all">先准备整轮（等待较长，播放时占用较低）</option>
-  </select>
-  <p style="font-size:12px;opacity:.7;">若机器生成速度跟不上播放，可选「先准备整轮」。两种方式均受缓存上限约束。</p>
+  <label class="toggle"><input type="checkbox" id="preGenerate" role="switch" aria-describedby="prepare-help">预生成全部二维码</label>
+  <p id="prepare-help" style="font-size:12px;opacity:.7;">开启：先生成整轮再播放，等待较长、播放时占用较低。关闭：先准备首批，边生成边播放。对下次序列化生效，两种方式均受缓存上限约束。</p>
   <div id="limits" aria-live="polite"></div>
   <div id="selection-error" role="alert"></div>
   <button id="start">序列化</button>
@@ -151,7 +153,7 @@ const splitInput = document.getElementById('split');
 const fpsInput = document.getElementById('fps');
 const gridInput = document.getElementById('gridSize');
 const codecInput = document.getElementById('codec');
-const prepareInput = document.getElementById('prepareMode');
+const prepareInput = document.getElementById('preGenerate');
 const fitModeInput = document.getElementById('fitMode');
 const ppmInput = document.getElementById('ppmInput');
 const ppmWrap = document.getElementById('ppmWrap');
@@ -496,12 +498,13 @@ async function encodeFile(generation) {
   const cols = decimen ? DECIMEN_CODES : Math.max(1, Math.min(4, parseInt(gridInput.value, 10) || 1));
   const split = parseInt(splitInput.value, 10) || 1024;
   const codec = codecInput.value;
+  const prepareMode = prepareInput.checked ? 'all' : 'progressive';
   startBtn.disabled = false;
   startBtn.textContent = '取消序列化';
   encoding = true;
   const controller = new AbortController();
   encodeAbort = controller;
-  statusEl.textContent = prepareInput.value === 'all' ? '编码并准备整轮二维码...（可取消）' : '编码并准备首批二维码...（可取消；其余帧会提前生成）';
+  statusEl.textContent = prepareMode === 'all' ? '编码并准备整轮二维码...（可取消）' : '编码并准备首批二维码...（可取消；其余帧会提前生成）';
   try {
     let url;
     if (decimen) {
@@ -521,7 +524,7 @@ async function encodeFile(generation) {
     } else if (fitModeInput.value === 'manual') {
       url += '&ppm=' + clampPPM(ppmInput.value);
     }
-    url += '&prepare=' + encodeURIComponent(prepareInput.value);
+    url += '&prepare=' + encodeURIComponent(prepareMode);
     const resp = await fetch(url, { method: 'POST', body: await file.arrayBuffer(), signal: controller.signal });
     if (!resp.ok) throw new Error(await resp.text());
     const data = await resp.json();
