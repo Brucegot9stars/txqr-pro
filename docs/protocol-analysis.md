@@ -1,5 +1,8 @@
 # decimen 协议逐字节分析（开发需求文档）
 
+> 历史分析快照：经典帧、资源边界和播放调度已更新；当前行为请参阅 [QRT2 协议](protocol-v2.md) 与 [修复记录](fix-results-20261029.md)。本文中的速率估算不代表当前端到端 Goodput。decimen 的 D1 0D 线格式保持不变。
+
+
 > 摘要：仿 decimen：20字节帧头、systematic-carousel喷泉码、DCF2容器、标准QR网格、高速流水线。
 
 ## 1. 目标与范围

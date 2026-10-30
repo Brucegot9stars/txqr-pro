@@ -213,6 +213,7 @@ private fun ScannerOverlay(
                 )
             }
             ScanState.COMPLETED -> {
+                if(uiState.error!=null) Text(uiState.error,color=Color.Red)
                 CompletedPanel(
                     totalSize = uiState.totalSize,
                     totalTime = uiState.totalTime,
@@ -230,6 +231,14 @@ private fun ScannerOverlay(
                     contentAlignment = Alignment.Center
                 ) {
                     CircularProgressIndicator()
+                }
+            }
+            ScanState.FAILED -> {
+                Surface(color=Color.Black.copy(alpha=0.8f), modifier=Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text(uiState.error ?: "接收失败，请重新扫描",color=Color.White)
+                        Button(onClick=onRestart) { Text("重新扫描") }
+                    }
                 }
             }
             ScanState.IDLE -> {}

@@ -2,9 +2,15 @@ package txqr
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
-	"math/rand"
+	"math"
+	mathrand "math/rand"
 	"strings"
+	"unicode/utf8"
 
 	fountain "github.com/google/gofountain"
 )
@@ -27,6 +33,8 @@ type Encoder struct {
 	redundancyFactor float64
 	codec            CodecType
 	fileName         string
+	sessionID        string
+	digest           [sha256.Size]byte
 }
 
 // NewEncoder creates and inits a new encoder for the given chunk length and codec.
@@ -58,6 +66,15 @@ func (e *Encoder) SetRedundancyFactor(rf float64) {
 // Encode encodes data and splits it into chunks to be
 // further converted to QR code frames.
 func (e *Encoder) Encode(str string) ([]string, error) {
+	return e.EncodeContext(context.Background(), str)
+}
+
+// EncodeContext observes cancellation around library calls and while packing
+// frames. A running gofountain library call itself cannot be interrupted.
+func (e *Encoder) EncodeContext(ctx context.Context, str string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	data := []byte(str)
 	total := len(data)
 
@@ -65,38 +82,46 @@ func (e *Encoder) Encode(str string) ([]string, error) {
 		return nil, fmt.Errorf("empty data")
 	}
 
-	var ret []string
-	if e.fileName != "" {
-		ret = append(ret, e.nameFrame(total))
+	if e.chunkLen <= 0 || e.chunkLen > MaxChunkBytes || !validCodec(e.codec) ||
+		math.IsNaN(e.redundancyFactor) || math.IsInf(e.redundancyFactor, 0) ||
+		e.redundancyFactor < 1 || e.redundancyFactor > 4 {
+		return nil, fmt.Errorf("invalid encoding parameters")
 	}
+	effective := e.codec
+	numChunks := numberOfChunks(total, e.chunkLen)
+	if effective == CodecRaptor && numChunks < 4 {
+		effective = CodecLT
+	}
+	if err := validateParameters(total, e.chunkLen, effective); err != nil {
+		return nil, err
+	}
+	var session [16]byte
+	if _, err := rand.Read(session[:]); err != nil {
+		return nil, fmt.Errorf("create session: %w", err)
+	}
+	e.sessionID = hex.EncodeToString(session[:])
+	e.digest = sha256.Sum256(data)
 
 	// RaptorQ uses a separate encoding path
 	if e.codec == CodecRaptorQ {
-		frames, err := raptorQEncode(data, e.chunkLen, total)
+		frames, err := e.raptorQEncode(ctx, data, total)
 		if err != nil {
 			return nil, err
 		}
-		return append(ret, frames...), nil
+		return e.withNameFrame(frames, total, CodecRaptorQ), nil
 	}
 
 	// All gofountain-based codecs (LT, Binary, Raptor, Online)
-	if total < e.chunkLen {
-		return append(ret, e.frame(0, total, data, "")), nil
+	if total <= e.chunkLen {
+		return e.withNameFrame([]string{e.frame(0, total, data, "")}, total, CodecLT), nil
 	}
-
-	numChunks := numberOfChunks(total, e.chunkLen)
 
 	// gofountain's Raptor (R10/RFC 5053) codec only supports K in
 	// [4, 8192]. Messages with fewer than 4 source blocks can't use the
 	// Raptor pre-code (it panics for K < 4), and RFC 5052 decoders -
 	// including the Android receiver - also require K >= 4. Fall back to
-	// plain LT for such tiny messages so the sender never emits invalid
-	// Raptor frames. The fallback frame has no codec tag, so the receiver
-	// initializes an LT decoder and decodes it transparently.
-	effective := e.codec
-	if e.codec == CodecRaptor && numChunks < 4 {
-		effective = CodecLT
-	}
+	// plain LT for such tiny messages. The explicit LT tag makes receivers
+	// rebuild the matching decoder.
 
 	codec := e.createGofountainCodec(numChunks, effective)
 
@@ -111,6 +136,9 @@ func (e *Encoder) Encode(str string) ([]string, error) {
 	// Verify the round trip locally and silently degrade to LT when Raptor
 	// can't decode its own encoding, so the sender never emits frames that
 	// the receiver would decode as corrupt data.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if effective == CodecRaptor && !raptorRoundTrip(codec, data, lubyBlocks) {
 		effective = CodecLT
 		codec = e.createGofountainCodec(numChunks, CodecLT)
@@ -119,10 +147,14 @@ func (e *Encoder) Encode(str string) ([]string, error) {
 		lubyBlocks = fountain.EncodeLTBlocks(msg, idsToEncode, codec)
 	}
 
+	var ret []string
 	for _, block := range lubyBlocks {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		ret = append(ret, e.frame(block.BlockCode, total, block.Data, codecName(effective)))
 	}
-	return ret, nil
+	return e.withNameFrame(ret, total, effective), nil
 }
 
 // raptorRoundTrip verifies gofountain's Raptor codec can reproduce original
@@ -148,10 +180,26 @@ func raptorRoundTrip(codec fountain.Codec, data []byte, blocks []fountain.LTBloc
 }
 
 // nameFrame builds the metadata frame carrying the original file name.
-// Format: -1/{chunkLen}/{total}/{codec}/name|{fileName}
-func (e *Encoder) nameFrame(total int) string {
+// Metadata shares the verified transfer header and CRC with data frames.
+func (e *Encoder) nameFrame(total int, ct CodecType) string {
 	name := strings.ReplaceAll(strings.ReplaceAll(e.fileName, "/", "_"), "|", "_")
-	return fmt.Sprintf("-1/%d/%d/%s/name|%s", e.chunkLen, total, string(e.codec), name)
+	runes := []rune(name)
+	if len(runes) > 120 {
+		name = string(runes[:120])
+	}
+	for len(name) > MaxFileNameBytes {
+		_, n := utf8.DecodeLastRuneInString(name)
+		name = name[:len(name)-n]
+	}
+	return (&Frame{Session: e.sessionID, SHA256: e.digest, BlockCode: -1, ChunkLen: e.chunkLen,
+		Total: total, Codec: ct, Name: true, Payload: []byte(name)}).pack()
+}
+
+func (e *Encoder) withNameFrame(frames []string, total int, ct CodecType) []string {
+	if e.fileName == "" {
+		return frames
+	}
+	return append([]string{e.nameFrame(total, ct)}, frames...)
 }
 
 func (e *Encoder) createGofountainCodec(numChunks int, ct CodecType) fountain.Codec {
@@ -164,13 +212,12 @@ func (e *Encoder) createGofountainCodec(numChunks int, ct CodecType) fountain.Co
 		return fountain.NewOnlineCodec(numChunks, onlineEpsilon, onlineQuality, onlineSeed)
 	default:
 		return fountain.NewLubyCodec(numChunks,
-			rand.New(fountain.NewMersenneTwister(200)),
+			mathrand.New(fountain.NewMersenneTwister(200)),
 			solitonDistribution(numChunks))
 	}
 }
 
-// codecName returns the on-the-wire codec tag for a frame, or "" for the
-// implicit LT default (which produces the shorter 3-part header).
+// codecName preserves the internal empty-string LT identifier; packing writes lt.
 func codecName(ct CodecType) string {
 	if ct == CodecLT {
 		return ""
@@ -179,10 +226,18 @@ func codecName(ct CodecType) string {
 }
 
 func (e *Encoder) frame(blockCode int64, total int, data []byte, codec string) string {
-	if codec == "" {
-		return fmt.Sprintf("%d/%d/%d|%s", blockCode, e.chunkLen, total, string(data))
+	// gofountain keeps trailing zero padding virtual. Put it on the wire so
+	// all nonempty symbols have the declared semi-equal partition size.
+	if codec != string(CodecRaptorQ) && len(data) > 0 {
+		size := numberOfChunks(total, numberOfChunks(total, e.chunkLen))
+		if len(data) < size {
+			padded := make([]byte, size)
+			copy(padded, data)
+			data = padded
+		}
 	}
-	return fmt.Sprintf("%d/%d/%d/%s|%s", blockCode, e.chunkLen, total, codec, string(data))
+	return (&Frame{Session: e.sessionID, SHA256: e.digest, BlockCode: blockCode,
+		ChunkLen: e.chunkLen, Total: total, Codec: ParseCodec(codec), Payload: data}).pack()
 }
 
 func numberOfChunks(length, chunkLen int) int {

@@ -1258,7 +1258,12 @@ func Capture(r Rect) (*image.RGBA, []byte, error) {
 	}
 	defer bmp.Close()
 	mem.Select(bmp.Handle())
-	procBitBlt.Call(mem.Handle(), 0, 0, uintptr(w), uintptr(h), screen, uintptr(r.L), uintptr(r.T), SrcCopy)
+	defer mem.Restore()
+	if ok, _, _ := procBitBlt.Call(mem.Handle(), 0, 0, uintptr(w), uintptr(h), screen, uintptr(r.L), uintptr(r.T), SrcCopy); ok == 0 {
+		return nil, nil, fmt.Errorf("BitBlt failed")
+	}
+	// GetDIBits and DeleteObject both require the bitmap to be deselected.
+	mem.Restore()
 
 	buf := make([]byte, int(w)*int(h)*4)
 	bi := bitmapInfo{bmiHeader: bitmapInfoHeader{
@@ -1269,7 +1274,7 @@ func Capture(r Rect) (*image.RGBA, []byte, error) {
 		biBitCount: 32,
 	}}
 	if n, _, _ := procGetDIBits.Call(mem.Handle(), bmp.Handle(), 0, uintptr(h),
-		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&bi)), DibRGBColors); n == 0 {
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&bi)), DibRGBColors); n != uintptr(h) {
 		return nil, nil, fmt.Errorf("GetDIBits failed")
 	}
 	rgba := image.NewRGBA(image.Rect(0, 0, int(w), int(h)))

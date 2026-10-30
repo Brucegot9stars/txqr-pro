@@ -210,8 +210,8 @@ func TestEncodeReportsModuleCount(t *testing.T) {
 		path string
 		want int
 	}{
-		{"classic 2048", "/encode?split=2048&codec=raptorq", 177},
-		{"classic 1024", "/encode?split=1024&codec=raptorq", qr.ModulesForBytes(1024 + 24)},
+		{"classic 2048", "/encode?split=2048&codec=raptorq", 181},
+		{"classic 1024", "/encode?split=1024&codec=raptorq", 137},
 		{"color", "/encode?split=1200&codec=raptorq&mode=color", qr.ColorMatrixSize},
 	} {
 		resp, err := http.Post(srv.url(tc.path), "application/octet-stream", bytes.NewReader(body))
@@ -327,6 +327,9 @@ func TestExplicitPPMOverridesFit(t *testing.T) {
 		}
 		img, err := png.Decode(fr.Body)
 		fr.Body.Close()
+		srv.mu.Lock()
+		delete(srv.sessions, out.ID)
+		srv.mu.Unlock()
 		if err != nil {
 			t.Fatalf("%s: decode png: %v", tc.query, err)
 		}

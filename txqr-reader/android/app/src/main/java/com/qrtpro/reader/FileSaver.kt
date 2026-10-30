@@ -5,7 +5,8 @@ import android.content.Context
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
-import android.widget.Toast
+import java.io.File
+import java.io.FileOutputStream
 
 object FileSaver {
 
@@ -25,15 +26,24 @@ object FileSaver {
                     put(MediaStore.Downloads.DISPLAY_NAME, fileName)
                     put(MediaStore.Downloads.MIME_TYPE, detectMimeType(fileName))
                     put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                    put(MediaStore.Downloads.IS_PENDING,1)
                 }
 
                 val resolver = context.contentResolver
                 val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
                     ?: throw Exception("Failed to create MediaStore entry")
 
-                val stream = resolver.openOutputStream(uri)
-                    ?: throw Exception("Failed to open output stream")
-                stream.use { it.write(data) }
+                try {
+                    val stream = resolver.openOutputStream(uri)
+                        ?: throw Exception("Failed to open output stream")
+                    stream.use { it.write(data) }
+                    check(resolver.update(uri,ContentValues().apply { put(MediaStore.Downloads.IS_PENDING,0) },null,null)==1) {
+                        "Failed to publish download"
+                    }
+                } catch (e: Exception) {
+                    resolver.delete(uri,null,null)
+                    throw e
+                }
             } else {
                 val downloadsDir = Environment.getExternalStoragePublicDirectory(
                     Environment.DIRECTORY_DOWNLOADS
@@ -49,12 +59,28 @@ object FileSaver {
                 if (!target.path.startsWith(expected.path + java.io.File.separator)) {
                     throw Exception("Invalid file name")
                 }
-                file.writeBytes(data)
+                // Write completely before publishing; move without REPLACE_EXISTING
+                // preserves previous downloads and works on emulated storage.
+                val temp = File.createTempFile(".qrt-", ".part",downloadsDir)
+                try {
+                    FileOutputStream(temp).use { it.write(data); it.fd.sync() }
+                    var published = false
+                    for (index in 1..1000) {
+                        val candidate = if (index==1) file else File(downloadsDir,
+                            file.nameWithoutExtension + " ($index)" + file.extension.let { if(it.isBlank()) "" else ".$it" })
+                        try {
+                            java.nio.file.Files.move(temp.toPath(),candidate.toPath())
+                            published = true
+                            break
+                        } catch(_: java.nio.file.FileAlreadyExistsException) {
+                            // Try the next available name.
+                        }
+                    }
+                    check(published) { "Too many files with the same name" }
+                } finally { temp.delete() }
             }
-            Toast.makeText(context, "Saved: $fileName", Toast.LENGTH_LONG).show()
             true
         } catch (e: Exception) {
-            Toast.makeText(context, "Save failed: ${e.message}", Toast.LENGTH_LONG).show()
             false
         }
     }

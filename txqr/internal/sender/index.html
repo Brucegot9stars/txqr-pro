@@ -77,7 +77,7 @@
     </div>
   </div>
 
-  <label style="margin-top:14px; display:inline-flex; align-items:center; gap:8px;"><input type="checkbox" id="colorMode" style="width:auto;"> Color Matrix 模式（2 位/模块，每帧上限 <span id="colorCap">1539</span> B，split 会自动收敛）</label>
+  <label style="margin-top:14px; display:inline-flex; align-items:center; gap:8px;"><input type="checkbox" id="colorMode" style="width:auto;"> Color Matrix 模式（2 位/模块，每帧上限 <span id="colorCap">1426</span> B，split 会自动收敛）</label>
 
   <label style="margin-top:14px; display:inline-flex; align-items:center; gap:8px;"><input type="checkbox" id="decimenMode" style="width:auto;"> Decimen 模式（DCF2 + 喷泉码，V40-L / mask 4 / ECC L）</label>
 
@@ -204,7 +204,7 @@ applyDecimenMode();
 // Color Matrix frames hold far fewer bytes than a QR symbol, so a split that
 // is fine for QR silently renders nothing here. The server clamps it anyway;
 // showing the cap up front saves a "why is nothing happening" round trip.
-const COLOR_SPLIT_CAP = 1539;
+const COLOR_SPLIT_CAP = 1426;
 colorModeInput.addEventListener('change', () => {
   if (colorModeInput.checked) {
     decimenModeInput.checked = false;
@@ -215,17 +215,44 @@ colorModeInput.addEventListener('change', () => {
 });
 
 let session = null;   // current encoded session, null if none
+let playbackRAF = null;
+let playbackGeneration = 0;
+let playbackCells = [];
+let cellCursor = 0;
+let presentedFrames = 0;
+function releaseFrame(frame) {
+  if (frame && frame.url) { URL.revokeObjectURL(frame.url); frame.url = null; }
+}
+function releaseTiles() {
+  for (const tile of tiles) {
+    if (tile.qrtURL) URL.revokeObjectURL(tile.qrtURL);
+    tile.qrtURL = null;
+  }
+}
+function clearPlayback() {
+  playbackGeneration++;
+  if (playbackRAF !== null) cancelAnimationFrame(playbackRAF);
+  playbackRAF = null;
+  for (const cell of playbackCells) {
+    if (cell.pending) {
+      cell.pending.controller.abort();
+      releaseFrame(cell.pending);
+      if (cell.pending.image) cell.pending.image.removeAttribute('src');
+    }
+    releaseFrame(cell.ready);
+  }
+  playbackCells = [];
+}
 let running = false;  // overlay active and playing
 let paused = false;
+let encodeGeneration = 0;
 let encoding = false; // a serialization request is in flight
 let encodeAbort = null; // AbortController for the in-flight serialization
 let fileMD5 = '';     // MD5 of the currently selected file
-let base = 0;         // index of the first frame on screen
-let shownBytes = 0;
 let startTime = 0;
 let tiles = [];
 let seqCursor = 0;    // carousel stream position (one seq per cell flip)
-let cellNextAt = [];  // per-cell next flip time for staggered phases
+  // per-cell next flip time for staggered phases
 
 function bytesFmt(n) {
   if (n >= 1048576) return (n / 1048576).toFixed(2) + ' MB';
@@ -243,6 +270,7 @@ function gridDims(n) {
 // buildTiles creates one tile per code, laid out per gridDims (1 → 1×1,
 // 2 → 1×2, 4 → 2×2). Classic mode passes cols*cols, decimen passes its code count.
 function buildTiles(codes, dims) {
+  releaseTiles();
   gridEl.innerHTML = '';
   gridEl.style.gridTemplateColumns = 'repeat(' + dims.cols + ', 1fr)';
   gridEl.style.gridTemplateRows = 'repeat(' + dims.rows + ', 1fr)';
@@ -359,19 +387,21 @@ async function updateFileMD5() {
   } catch (e) { /* network hiccup: leave MD5 empty */ }
 }
 
-async function encodeFile() {
+async function encodeFile(generation) {
   const file = fileInput.files[0];
   if (!file) { statusEl.textContent = '请先选择文件'; return null; }
+  if (file.size === 0 || file.size > 64 * 1024 * 1024) { statusEl.textContent = '请选择非空且不超过 64 MiB 的文件'; return null; }
   const decimen = decimenModeInput.checked;
   // Decimen uses fixed reference parameters; only classic mode reads the knobs.
-  const fps = decimen ? DECIMEN_FPS : (parseFloat(fpsInput.value) || 15);
-  const cols = decimen ? DECIMEN_CODES : (parseInt(gridInput.value, 10) || 1);
+  const fps = decimen ? DECIMEN_FPS : Math.max(1, Math.min(120, parseFloat(fpsInput.value) || 30));
+  const cols = decimen ? DECIMEN_CODES : Math.max(1, Math.min(4, parseInt(gridInput.value, 10) || 1));
   const split = parseInt(splitInput.value, 10) || 1024;
   const codec = codecInput.value;
   startBtn.disabled = false;
   startBtn.textContent = '取消序列化';
   encoding = true;
-  encodeAbort = new AbortController();
+  const controller = new AbortController();
+  encodeAbort = controller;
   statusEl.textContent = '编码中...（点击「取消序列化」可中止）';
   try {
     let url;
@@ -380,7 +410,7 @@ async function encodeFile() {
         + '&name=' + encodeURIComponent(file.name)
         + '&type=' + encodeURIComponent(file.type || 'application/octet-stream');
     } else {
-      url = '/encode?split=' + split + '&codec=' + codec;
+      url = '/encode?split=' + split + '&codec=' + codec + '&name=' + encodeURIComponent(file.name);
       if (colorModeInput.checked) url += '&mode=color';
     }
     const codesCount = decimen ? DECIMEN_CODES : cols * cols;
@@ -392,9 +422,13 @@ async function encodeFile() {
     } else if (fitModeInput.value === 'manual') {
       url += '&ppm=' + clampPPM(ppmInput.value);
     }
-    const resp = await fetch(url, { method: 'POST', body: await file.arrayBuffer(), signal: encodeAbort.signal });
+    const resp = await fetch(url, { method: 'POST', body: await file.arrayBuffer(), signal: controller.signal });
     if (!resp.ok) throw new Error(await resp.text());
     const data = await resp.json();
+    if (generation !== encodeGeneration) {
+      fetch('/cancel/' + data.id,{method:'DELETE'}).catch(() => {});
+      return null;
+    }
     statusEl.textContent = '编码完成：' + bytesFmt(file.size) + ' · MD5: ' + (data.md5 || '');
     return {
       id: data.id, count: data.count, total: data.total,
@@ -405,6 +439,7 @@ async function encodeFile() {
       modules: data.modules || 0, ppm: data.ppm || 0,
     };
   } catch (e) {
+    if (generation !== encodeGeneration) return null;
     if (e && e.name === 'AbortError') {
       statusEl.textContent = '已取消序列化';
       return null;
@@ -412,20 +447,27 @@ async function encodeFile() {
     statusEl.textContent = '编码失败: ' + e.message;
     return null;
   } finally {
-    encoding = false;
-    encodeAbort = null;
-    startBtn.disabled = false;
-    startBtn.textContent = '序列化';
+    if (generation === encodeGeneration) {
+      encoding = false;
+      encodeAbort = null;
+      startBtn.disabled = false;
+      startBtn.textContent = '序列化';
+    }
   }
 }
 
 async function start() {
+  const generation = ++encodeGeneration;
+  clearPlayback();
+  running = false;
   // re-encode always, so params/file changes take effect and stale session is dropped
   if (session) await cancelSession();
-  session = await encodeFile();
+  if (generation !== encodeGeneration) return;
+  const nextSession = await encodeFile(generation);
+  if (generation !== encodeGeneration) return;
+  session = nextSession;
   if (!session) return;
-  base = 0;
-  shownBytes = 0;
+  presentedFrames = 0;
   seqCursor = 0;
   startTime = performance.now();
   paused = false;
@@ -441,24 +483,96 @@ async function start() {
   else showFrame();
 }
 
-function showFrame() {
-  if (!running || paused) return;
-  const n = session.codes;
-  for (let i = 0; i < n; i++) {
-    const frameIdx = (base + i) % session.count;
-    tiles[i].src = '/frame/' + session.id + '/' + frameIdx;
+// Both modes use decoded images and one presentation scheduler. No visible
+// <img> is pointed at an unfinished request, and at most one next image per
+// cell can be loading/ready. A slow fetch keeps the previous frame on screen.
+function showFrame() { startPlayback(); }
+function startDecimenLoop() { startPlayback(); }
+
+function startPlayback() {
+  clearPlayback();
+  if (!running || paused || !session) return;
+  const generation = playbackGeneration;
+  const now = performance.now();
+  const phase = session.carousel ? 1000 / session.fps / session.codes : 0;
+  cellCursor = 0;
+  playbackCells = tiles.map((_, index) => ({index, nextAt: now + index * phase,
+    pending: null, ready: null, retryAt: 0, failures: 0}));
+  for (const cell of playbackCells) prefetchFrame(cell, generation);
+  playbackRAF = requestAnimationFrame(time => playbackTick(time, generation));
+}
+
+async function prefetchFrame(cell, generation) {
+  if (cell.pending || cell.ready || generation !== playbackGeneration) return;
+  const frameIndex = seqCursor++ % session.count;
+  const pending = {controller: new AbortController(), image: null, url: null};
+  cell.pending = pending;
+  try {
+    const response = await fetch('/frame/' + session.id + '/' + frameIndex,
+      {signal: pending.controller.signal, cache: 'no-store'});
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const blob = await response.blob();
+    if (generation !== playbackGeneration) return;
+    const image = new Image();
+    pending.image = image;
+    pending.url = URL.createObjectURL(blob);
+    image.src = pending.url;
+    await image.decode();
+    if (generation !== playbackGeneration) return;
+    cell.ready = {image, url: pending.url, frameIndex};
+    pending.url = null; // ready now owns the URL
+    cell.failures = 0;
+  } catch (error) {
+    if (generation === playbackGeneration && error.name !== 'AbortError') {
+      cell.failures++;
+      cell.retryAt = performance.now() + Math.min(3000, 250 * 2 ** Math.min(4, cell.failures - 1));
+      statsEl.textContent = '取帧失败，正在重试：' + error.message;
+    }
+  } finally {
+    releaseFrame(pending);
+    if (cell.pending === pending) cell.pending = null;
   }
-  base = (base + n) % session.count;
-  const elapsed = (performance.now() - startTime) / 1000;
-  shownBytes += session.split * n;
-  const rateFile = shownBytes / elapsed;
-  statsEl.textContent =
-    '帧 ' + (base + 1) + '/' + session.count +
-    ' | 网格 ' + session.dims.cols + 'x' + session.dims.rows +
-    ' | ' + sizeNote() +
-    ' | 已播放 ' + bytesFmt(shownBytes) +
-    ' | ' + bytesFmt(rateFile) + '/s';
-  setTimeout(showFrame, 1000 / session.fps);
+}
+
+function playbackTick(now, generation) {
+  if (generation !== playbackGeneration || !running || paused || !session) return;
+  playbackRAF = null;
+  const count = playbackCells.length;
+  let changed = 0;
+  for (let step = 0; step < count; step++) {
+    const index = (cellCursor + step) % count;
+    const cell = playbackCells[index];
+    if (!cell.pending && !cell.ready && now >= cell.retryAt) prefetchFrame(cell, generation);
+    if (!cell.ready || now < cell.nextAt) continue;
+    const ready = cell.ready;
+    const previous = tiles[index];
+    ready.image.alt = 'QR';
+    ready.image.style.cssText = previous.style.cssText;
+    ready.image.qrtURL = ready.url;
+    previous.replaceWith(ready.image);
+    if (previous.qrtURL) URL.revokeObjectURL(previous.qrtURL);
+    tiles[index] = ready.image;
+    cell.ready = null;
+    cell.nextAt = now + 1000 / session.fps;
+    presentedFrames++;
+    changed++;
+    prefetchFrame(cell, generation);
+    if (session.carousel) {
+      // A refresh can show only one phase. Rotate fairly and never flip both
+      // carousel cells in the same refresh, even after a stall or slow load.
+      cellCursor = (index + 1) % count;
+      break;
+    }
+  }
+  if (changed) {
+    const elapsed = Math.max(0.001, (performance.now() - startTime) / 1000);
+    statsEl.textContent = '已显示 ' + presentedFrames + ' 帧'
+      + ' | 网格 ' + session.dims.cols + 'x' + session.dims.rows
+      + ' | ' + sizeNote()
+      + ' | 平均显示 ' + (presentedFrames / elapsed).toFixed(1) + ' 帧/s'
+      + (session.carousel ? ' | K=' + session.k : '');
+  }
+  playbackRAF = requestAnimationFrame(time => playbackTick(time, generation));
 }
 
 // sizeNote turns the current sizing state into one short phrase for the HUD, so
@@ -474,6 +588,7 @@ function sizeNote() {
 
 function togglePause() {
   if (!running) return;
+  clearPlayback();
   paused = !paused;
   pauseBtn.textContent = paused ? '继续' : '暂停';
   if (!paused) {
@@ -482,56 +597,14 @@ function togglePause() {
   }
 }
 
-// Decimen stream loop: an endless carousel over the pre-rendered cycle.
-// Cells flip on staggered phases (cell j flips at j/N of the frame interval)
-// so a camera exposure that straddles a flip catches at most ONE code mid-
-// transition — with simultaneous flips the same exposure would lose them all.
-function startDecimenLoop() {
-  if (!session) return;
-  const n = session.codes;
-  const interval = 1000 / session.fps;
-  const sub = interval / n;
-  const now = performance.now();
-  cellNextAt = [];
-  for (let j = 0; j < n; j++) cellNextAt[j] = now + j * sub;
-  requestAnimationFrame(decimenTick);
-}
-
-function decimenTick(now) {
-  if (!running || paused || !session || !session.carousel) return;
-  const n = session.codes;
-  const interval = 1000 / session.fps;
-  const sub = interval / n;
-  let flipped = false;
-  for (let j = 0; j < n; j++) {
-    if (now < cellNextAt[j]) continue;
-    const seq = seqCursor++;
-    tiles[j].src = '/frame/' + session.id + '/' + (seq % session.count);
-    cellNextAt[j] += interval;
-    if (cellNextAt[j] <= now) cellNextAt[j] = now + sub; // catch up after a stall
-    flipped = true;
-  }
-  if (flipped) {
-    const elapsed = (performance.now() - startTime) / 1000;
-    shownBytes += session.blockLen * n;
-    const rateFile = shownBytes / elapsed;
-    statsEl.textContent =
-      '帧 ' + seqCursor +
-      ' | 网格 ' + session.dims.cols + 'x' + session.dims.rows +
-      ' | K=' + session.k + ' | ' + session.blockLen + 'B/帧' +
-      ' | 已播放 ' + bytesFmt(shownBytes) +
-      ' | ' + bytesFmt(rateFile) + '/s' +
-      ' | session ' + session.sessionId;
-  }
-  requestAnimationFrame(decimenTick);
-}
-
 function stop() {
   if (!running && !session) return;
+  clearPlayback();
   running = false;
   paused = false;
   pauseBtn.textContent = '暂停';
   overlay.classList.remove('active');
+  releaseTiles();
   gridEl.innerHTML = '';
   tiles = [];
   startBtn.textContent = '继续序列化';
@@ -547,16 +620,19 @@ async function cancelSession() {
 }
 
 async function cancel() {
+  const generation = ++encodeGeneration;
+  encoding = false;
   if (encodeAbort) encodeAbort.abort(); // abort any in-flight serialization
+  clearPlayback();
   running = false;
   paused = false;
   pauseBtn.textContent = '暂停';
   overlay.classList.remove('active');
+  releaseTiles();
   gridEl.innerHTML = '';
   tiles = [];
   await cancelSession();
-  base = 0;
-  shownBytes = 0;
+  if (generation !== encodeGeneration) return;
   startBtn.textContent = '序列化';
   showFileInfo();
 }

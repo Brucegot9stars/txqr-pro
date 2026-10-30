@@ -3,8 +3,9 @@ package com.qrtpro.reader.decoder
 import org.junit.Assert.assertArrayEquals
 import org.junit.Before
 import org.junit.Test
-import java.io.File
-import java.nio.file.Files
+import javax.imageio.ImageIO
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 
 class ColorMatrixDecoderTest {
 
@@ -15,16 +16,14 @@ class ColorMatrixDecoderTest {
 
     @Before
     fun setup() {
-        val tmp = File(System.getProperty("java.io.tmpdir"))
-        val bin = tmp.listFiles { f -> f.name == "rgba.bin" }?.firstOrNull()
-            ?: throw IllegalStateException("rgba.bin not found in ${tmp.absolutePath}")
-        val pay = tmp.listFiles { f -> f.name == "payload.bin" }?.firstOrNull()
-            ?: throw IllegalStateException("payload.bin not found")
-        rgba = Files.readAllBytes(bin.toPath())
-        payload = Files.readAllBytes(pay.toPath())
-        val side = kotlin.math.sqrt((rgba.size / 4).toDouble()).toInt()
-        width = side
-        height = side
+        val image=ImageIO.read(requireNotNull(javaClass.getResourceAsStream("/regression/color.png")))
+        width=image.width; height=image.height
+        rgba=ByteArray(width*height*4)
+        for(y in 0 until height) for(x in 0 until width) {
+            val rgb=image.getRGB(x,y); val at=(y*width+x)*4
+            rgba[at]=(rgb shr 16).toByte(); rgba[at+1]=(rgb shr 8).toByte(); rgba[at+2]=rgb.toByte(); rgba[at+3]=(-1).toByte()
+        }
+        payload=requireNotNull(javaClass.getResourceAsStream("/regression/color-payload.bin")).use{it.readBytes()}
     }
 
     private fun sampler() = { x: Int, y: Int ->
@@ -43,7 +42,7 @@ class ColorMatrixDecoderTest {
     @Test
     fun maximalPayloadSize() {
         val capacity = ColorMatrixDecoder.MAX_PAYLOAD_BYTES
-        assert(capacity == 1932) { "expected 1932, got $capacity" }
+        assertEquals(1587,capacity)
     }
 
     @Test
@@ -54,6 +53,6 @@ class ColorMatrixDecoderTest {
         } catch (e: ColorMatrixDecodeException) {
             true
         }
-        assert(threw) { "expected ColorMatrixDecodeException" }
+        assertTrue("expected ColorMatrixDecodeException",threw)
     }
 }

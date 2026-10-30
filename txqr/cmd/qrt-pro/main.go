@@ -4,10 +4,9 @@
 //
 // Previous releases shipped three binaries — 序列化工具.exe (sender),
 // qrt-pro-receiver-desktop-*.exe (receiver) and qrt-pro-launcher.exe (a process
-// manager for the other two). They were separate processes talking only through
-// process names, which is where the naming bugs came from. Running everything
-// in one process removes that coupling: stopping a scan is a method call, not a
-// process tree walk, and there is exactly one message loop to keep alive.
+// manager for the other two). The UI and services now share one main process
+// and one message loop. Encoding uses a temporary, memory-limited child of the
+// same executable, connected by pipes; it has no UI or network listener.
 //
 //	go build -ldflags "-s -w -H windowsgui" ./cmd/qrt-pro
 package main

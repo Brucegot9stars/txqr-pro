@@ -936,7 +936,9 @@ private fun findRawParams(k: Int): IntArray {
 }
 
 private fun calcParams(dataSize: Int, symbolSz: Int): RaptorQParams {
-    val k = (dataSize + symbolSz - 1) / symbolSz
+    require(dataSize in 1..TransferFrame.MAX_TRANSFER_BYTES && symbolSz in 1..TransferFrame.MAX_CHUNK_BYTES)
+    val k = numberOfChunks(dataSize, symbolSz)
+    require(k in 1..TransferFrame.MAX_SOURCE_BLOCKS)
     val raw = findRawParams(k)
     val l = raw[0] + raw[2] + raw[3]
     val b = raw[4] - raw[2]
@@ -952,12 +954,12 @@ private fun calcParams(dataSize: Int, symbolSz: Int): RaptorQParams {
 class RaptorQCodec(val symbolSize: Int, val dataSize: Int) {
     internal val params: RaptorQParams = calcParams(dataSize, symbolSize)
 
-    fun newDecoder(): RaptorQDecoder {
-        return RaptorQDecoder(this)
+    fun newDecoder(memoryBudget: Long = decoderWorkingBudget()): RaptorQDecoder {
+        return RaptorQDecoder(this, memoryBudget)
     }
 }
 
-class RaptorQDecoder(private val codec: RaptorQCodec) {
+class RaptorQDecoder(private val codec: RaptorQCodec, private val memoryBudget: Long = decoderWorkingBudget()) {
     private val symbolSz: Int = codec.symbolSize
     private val dataSz: Int = codec.dataSize
     private val params: RaptorQParams = codec.params
@@ -970,6 +972,7 @@ class RaptorQDecoder(private val codec: RaptorQCodec) {
 
     fun addBlocks(blocks: List<LTBlock>): Boolean {
         for (block in blocks) {
+            require(block.blockCode in 0..TransferFrame.MAX_BLOCK_CODE && block.data.size == symbolSz)
             val id = block.blockCode.toInt()
             val data = block.data
             if (id < params.K) {
@@ -981,6 +984,7 @@ class RaptorQDecoder(private val codec: RaptorQCodec) {
             } else {
                 val k = id + params.KPadded - params.K
                 if (!slowIDs.contains(k)) {
+                    if (fastSymbols.size.toLong() + (slowNum + 1L) * symbolSz > memoryBudget / 2) throw DecodeResourceLimit()
                     slowIDs.add(k)
                     slowSymbols.add(data.copyOf(symbolSz))
                     slowNum++
@@ -990,10 +994,17 @@ class RaptorQDecoder(private val codec: RaptorQCodec) {
         return fastNum + slowNum >= params.K
     }
 
+    fun estimatedDecodeBytes(): Long {
+        if (fastNum == params.K) return 4L * dataSz
+        val rows = maxOf(params.K + slowNum, params.KPadded).toLong() + params.S + params.H
+        return 16L * params.L * params.L + 8L * rows * symbolSz + 4L * dataSz
+    }
+
     fun decode(): ByteArray? {
         if (fastNum + slowNum < params.K) {
             return null
         }
+        if (estimatedDecodeBytes() > memoryBudget) throw DecodeResourceLimit()
         if (fastNum == params.K) {
             return fastSymbols.copyOfRange(0, dataSz)
         }

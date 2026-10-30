@@ -1,6 +1,9 @@
 package scanner
 
 import (
+	"fmt"
+	"github.com/divan/txqr"
+	"github.com/divan/txqr/qr"
 	"os"
 	"path/filepath"
 	"strings"
@@ -223,7 +226,11 @@ func has(t *testing.T, a *Audit, reason string) {
 func TestFrameFromAnotherSessionIsRejectedThenAdopted(t *testing.T) {
 	st, audit, _ := newAuditedState(t)
 
-	first := "0/1024/4096|" + strings.Repeat("a", 16)
+	firstFrames, err := txqr.NewEncoder(1024, txqr.CodecRaptorQ).Encode(strings.Repeat("a", 4096))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := firstFrames[0]
 	if st.feedPayload([]byte(first)) {
 		t.Fatal("a single frame must not complete a transfer")
 	}
@@ -234,7 +241,11 @@ func TestFrameFromAnotherSessionIsRejectedThenAdopted(t *testing.T) {
 	has(t, audit, "frame.session-new")
 
 	// A frame from a different file: same region, different total.
-	foreign := "0/1024/65536|" + strings.Repeat("b", 16)
+	foreignFrames, err := txqr.NewEncoder(1024, txqr.CodecRaptorQ).Encode(strings.Repeat("b", 65536))
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := foreignFrames[0]
 	for i := 1; i < sessionSwitchAfter; i++ {
 		if st.feedPayload([]byte(foreign)) {
 			t.Fatal("foreign frame completed the transfer")
@@ -258,10 +269,16 @@ func TestFrameFromAnotherSessionIsRejectedThenAdopted(t *testing.T) {
 // received block, or the row shows progress one block ahead of reality.
 func TestNameFrameIsMetadataNotProgress(t *testing.T) {
 	st, audit, _ := newAuditedState(t)
-	st.feedPayload([]byte("0/1024/4096|" + strings.Repeat("a", 16)))
+	enc := txqr.NewEncoder(1024, txqr.CodecRaptorQ)
+	enc.SetFileName("报告 2026.pdf")
+	frames, err := enc.Encode(strings.Repeat("a", 4096))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.feedPayload([]byte(frames[1]))
 	before := st.txqrGot
 
-	st.feedPayload([]byte("-1/1024/4096/name|报告 2026.pdf"))
+	st.feedPayload([]byte(frames[0]))
 
 	if st.txqrGot != before {
 		t.Errorf("name frame counted as a block: %d → %d", before, st.txqrGot)
@@ -301,7 +318,11 @@ func TestInvalidHeaderIsExplained(t *testing.T) {
 func TestStallIsReportedOncePerWindow(t *testing.T) {
 	st, audit, _ := newAuditedState(t)
 
-	frame := []byte("0/1024/4096|" + strings.Repeat("a", 16))
+	frames, err := txqr.NewEncoder(1024, txqr.CodecRaptorQ).Encode(strings.Repeat("a", 4096))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := []byte(frames[0])
 	st.feedPayload(frame) // first block
 	// Pretend the last gain was long ago, then feed duplicates.
 	st.lastGain = st.lastGain.Add(-6 * time.Second)
@@ -338,7 +359,7 @@ func TestDensityWarningExplainsATooSmallRegion(t *testing.T) {
 	if last.Reason != "region.too-small" {
 		t.Fatalf("reason = %q, want region.too-small (entries: %v)", last.Reason, reasons(audit))
 	}
-	for _, want := range []string{"177 模块", "200", "1.5"} {
+	for _, want := range []string{fmt.Sprintf("%d 模块", qr.ModulesForBytes(2048+txqr.MaxFrameOverhead)), "200", "1.5"} {
 		if !strings.Contains(last.Detail, want) {
 			t.Errorf("detail %q does not mention %q", last.Detail, want)
 		}

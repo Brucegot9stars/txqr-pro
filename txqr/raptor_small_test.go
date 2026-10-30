@@ -20,8 +20,8 @@ func TestRaptorSmallKFallsBackToLT(t *testing.T) {
 		if len(chunks) == 0 {
 			t.Fatalf("size=%d: no frames", sz)
 		}
-		// Fallback frames must be LT (3-part header, no codec tag).
-		if strings.Contains(chunks[0], "/raptor|") {
+		// Fallback frames explicitly identify LT in the verified header.
+		if f, err := ParseFrame(chunks[0]); err != nil || f.Codec != CodecLT {
 			t.Fatalf("size=%d: expected LT fallback, got raptor frame %q", sz, chunks[0])
 		}
 		d := NewDecoder()
@@ -49,7 +49,7 @@ func TestRaptorNormalKKeepsRaptor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	if len(chunks) == 0 || !strings.Contains(chunks[0], "/raptor|") {
+	if f, err := ParseFrame(chunks[0]); err != nil || f.Codec != CodecRaptor {
 		t.Fatalf("expected raptor frame, got %q", chunks[0])
 	}
 	d := NewDecoder()
@@ -73,7 +73,7 @@ func TestRaptorNonMultipleFallsBackToLT(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	if len(chunks) == 0 || strings.Contains(chunks[0], "/raptor|") {
+	if f, err := ParseFrame(chunks[0]); err != nil || f.Codec != CodecLT {
 		t.Fatalf("expected LT fallback frame, got %q", chunks[0])
 	}
 	d := NewDecoder()

@@ -5,7 +5,9 @@
 - **发送端** —— 基于 [divan/txqr](https://github.com/divan/txqr)（Go），源码仓库 <https://github.com/divan/txqr>（本目录下 `txqr/`）
 - **接收端** —— 基于 [divan/txqr-reader](https://github.com/divan/txqr-reader)，源码仓库 <https://github.com/divan/txqr-reader>（本目录下 `txqr-reader/`）
 
-采用 Luby 喷泉码纠错，通过动态二维码把任意二进制文件从一台屏幕发送到手机端接收 App。
+支持 LT、Binary、Raptor、RaptorQ、Online 及 decimen 模式，通过动态二维码把二进制文件从屏幕传到接收端。
+
+当前经典 QR / Color 模式使用 QRT2 校验协议，**发送端和接收端需要同时更新**，不接收旧经典帧。详见 [协议与运行上限](docs/protocol-v2.md) 和 [修复及验证记录](docs/fix-results-20261029.md)。
 
 ## 目录结构
 
@@ -39,7 +41,7 @@
 
 以前需要三个 exe：`序列化工具.exe`（发送端）、`qrt-pro-receiver-desktop-*.exe`（接收端）、
 `qrt-pro-launcher.exe`（管理前两者的外进程启动器）。三者只通过进程名互相识别，命名不一致的
-bug 正源于此。现在它们合并为**一个进程、一个窗口**：
+bug 正源于此。现在 UI 与收发服务合并为**一个主进程、一个窗口**；编码及 PNG 生成由同一可执行文件启动短期受限 worker，不需要另装程序或网络通信：
 
 - 左侧导航栏切换「发送端 / 接收端 / 已收文件 / 诊断日志」，发送端与接收端可同时工作；
 - 发送端的码画在**白底卡片**上，尺寸按「整数个设备像素/模块」由服务端渲染、页面 1:1 显示，
@@ -206,7 +208,9 @@ gradlew.bat :app:assembleDebug --no-daemon
 
 ## 版本
 
-当前版本：`v1.4.4`（见 Git tag）。Android 端 `versionCode=10` / `versionName=1.4.4`。
+当前版本：`v2.0.0`（见 Git tag）。Android 端 `versionCode=11` / `versionName=2.0.0`。
+
+v2.0.0 引入 QRT2 会话与完整性校验，修复已知 F01–F24，并加入受限编码 worker、后台接收及解码后呈现。**经典 QR / Color 收发两端必须同时更新**；不兼容旧经典帧，decimen 线格式保持不变。详见 [修复记录](docs/fix-results-20261029.md) 与 [协议及运行上限](docs/protocol-v2.md)。
 
 v1.4.0 的主要变化：桌面端三个 exe 合并为统一的 `qrt-pro.exe`，接收端界面重做，并修复
 了代码审计发现的 30 项缺陷（详见 `docs/code-audit.md`）。
@@ -221,7 +225,7 @@ v1.4.1 是缺陷修复版本：
 - **Online 编码参数不在线上格式里**：发送端改 ε/quality 会让接收端解出错误数据，
   已将参数固化为两端共用的常量。
 - **Color Matrix 模式默认发不出去**：默认 `split=2048` 超过矩阵容量 1587 B，
-  每帧渲染失败；已自动钳制到 1539 并回传有效值。
+  每帧渲染失败；该版本自动钳制到 1539。当前 QRT2 预留校验头后为 1426，并回传有效值。
 - 新增 `docs/mode-and-codec-analysis.md`：五种编码方案与两种工作模式的原理、实测与结论。
 
 v1.4.2 是缺陷修复版本：

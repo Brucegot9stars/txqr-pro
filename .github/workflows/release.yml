@@ -18,7 +18,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: txqr/go.mod
           cache-dependency-path: txqr/go.sum
 
       # One binary now hosts both the sender and the receiver: the old
@@ -61,7 +61,7 @@ jobs:
         working-directory: txqr-reader/android
         run: |
           chmod +x ./gradlew
-          ./gradlew :app:assembleRelease --no-daemon
+          ./gradlew :app:testReleaseUnitTest :app:assembleRelease --no-daemon
 
       - name: Stage release APK with version name
         working-directory: txqr-reader/android
@@ -81,6 +81,7 @@ jobs:
         with:
           # A silently missing asset is worse than a red build: catch it here.
           fail_on_unmatched_files: true
+          body_path: docs/releases/${{ github.ref_name }}.md
           files: |
             dist/qrt-pro-windows-amd64-${{ github.ref_name }}.exe
             dist/qrt-pro-sender-windows-amd64-${{ github.ref_name }}.exe

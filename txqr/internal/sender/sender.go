@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/divan/txqr"
@@ -55,18 +56,21 @@ const (
 // DefaultMaxUpload caps request bodies. Without a cap a client can pin the
 // whole machine's memory with one POST (the classic pipeline also copies the
 // body into a string, roughly doubling the transient footprint).
-const DefaultMaxUpload = 256 << 20
+const DefaultMaxUpload = txqr.MaxTransferBytes
 
 // session is one encoded transfer waiting to be played out frame by frame.
 type session struct {
-	frames    [][]byte
-	pngs      [][]byte
-	total     int
-	split     int    // effective payload bytes per frame, after any mode clamp
-	modules   int    // symbol modules per side, quiet zone included
-	ppm       int    // device pixels per module the frames were rendered at
-	mode      string // "qr", "color" or "decimen"
-	createdAt time.Time
+	frames         [][]byte
+	pngs           [][]byte
+	total          int
+	split          int    // effective payload bytes per frame, after any mode clamp
+	modules        int    // symbol modules per side, quiet zone included
+	ppm            int    // device pixels per module the frames were rendered at
+	mode           string // "qr", "color" or "decimen"
+	createdAt      time.Time
+	lastUsed       time.Time
+	renderBudget   int64
+	renderExceeded atomic.Bool
 
 	// decimen mode: fountain metadata echoed to the UI
 	carousel  bool
@@ -111,16 +115,18 @@ type Server struct {
 	mux      *http.ServeMux
 	// done belongs to the current run: Start replaces it, so a stop/start
 	// cycle never reuses (and re-closes) a channel that is already closed.
-	done      chan struct{}
-	maxUpload int64
+	done       chan struct{}
+	maxUpload  int64
+	encodeSlot chan struct{}
 }
 
 // New builds a Server with no network activity.
 func New() *Server {
 	s := &Server{
-		sessions:  map[string]*session{},
-		done:      make(chan struct{}),
-		maxUpload: DefaultMaxUpload,
+		sessions:   map[string]*session{},
+		done:       make(chan struct{}),
+		maxUpload:  DefaultMaxUpload,
+		encodeSlot: make(chan struct{}, 1),
 	}
 	// Before the first Start nothing runs, so Done() must report that instead
 	// of blocking a caller that selects on it.
@@ -361,7 +367,11 @@ func (s *Server) cleanup(done <-chan struct{}) {
 		case <-t.C:
 			s.mu.Lock()
 			for k, v := range s.sessions {
-				if time.Since(v.createdAt) > 30*time.Minute {
+				last := v.lastUsed
+				if last.IsZero() {
+					last = v.createdAt
+				}
+				if time.Since(last) > 30*time.Minute {
 					delete(s.sessions, k)
 				}
 			}
@@ -388,10 +398,36 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	select {
+	case s.encodeSlot <- struct{}{}:
+		defer func() { <-s.encodeSlot }()
+	default:
+		http.Error(w, "another encode is in progress", http.StatusTooManyRequests)
+		return
+	}
+	s.mu.Lock()
+	sessionsFull := len(s.sessions) >= 4
+	var retained int64
+	for _, existing := range s.sessions {
+		for _, f := range existing.frames {
+			retained += int64(len(f))
+		}
+		for _, p := range existing.pngs {
+			retained += int64(len(p))
+		}
+	}
+	s.mu.Unlock()
+	if sessionsFull || retained >= 256<<20 {
+		http.Error(w, "cancel an existing transfer before encoding another", http.StatusTooManyRequests)
+		return
+	}
 	split := 1024
 	if v := r.URL.Query().Get("split"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= txqr.MaxChunkBytes {
 			split = n
+		} else {
+			http.Error(w, "invalid split", http.StatusBadRequest)
+			return
 		}
 	}
 
@@ -424,7 +460,12 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 		split = clampColorSplit(split)
 	}
 
-	codec := txqr.ParseCodec(r.URL.Query().Get("codec"))
+	codecTag := r.URL.Query().Get("codec")
+	codec := txqr.ParseCodec(codecTag)
+	if codecTag != "" && codecTag != "lt" && string(codec) != codecTag {
+		http.Error(w, "invalid codec", http.StatusBadRequest)
+		return
+	}
 
 	body, err := s.readBody(w, r)
 	if err != nil {
@@ -437,33 +478,23 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 
 	sum := md5.Sum(body)
 
-	var sess *session
-	switch mode {
-	case "decimen":
-		sess, err = encodeDecimen(r, body, size)
-	default:
-		sess, err = encodeClassic(body, split, mode, codec, size)
-	}
+	sess, err := encodeIsolated(r.Context(), workerRequest{
+		Mode: mode, Codec: codec, Name: r.URL.Query().Get("name"), MediaType: r.URL.Query().Get("type"),
+		Split: split, Fit: size.fit, PPM: size.ppm, Size: len(body), MemoryBytes: workerMemoryBytes, CacheBytes: maxSessionBytes - retained,
+	}, body, nil)
 	if err != nil {
-		http.Error(w, "encode: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	sess.name = r.URL.Query().Get("name")
-	sess.size = len(body)
-
-	// Render every frame up front across all cores; the play loop then serves
-	// pre-baked PNGs. The client's context aborts the render on cancel.
-	renderFrames(sess, r.Context())
-	if renderFailed(sess) {
 		if r.Context().Err() != nil {
-			return // client aborted; nothing usable to report
+			return
 		}
-		http.Error(w, "encode: QR render failed", http.StatusInternalServerError)
+		http.Error(w, "encode: "+err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
 	if r.Context().Err() != nil {
-		return // dropped mid-flight: don't publish the partial session
+		return
 	}
+	sess.name = r.URL.Query().Get("name")
+	sess.lastUsed = time.Now()
+	sess.size = len(body)
 
 	id := newID()
 	s.mu.Lock()
@@ -513,7 +544,10 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 // actionable) from a broken pipe or cancel (400). Also writing its own error
 // response lets callers keep a single-exit read path.
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.maxUpload))
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(time.Now().Add(30 * time.Second))
+	defer controller.SetReadDeadline(time.Time{})
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, min(s.maxUpload, int64(txqr.MaxTransferBytes))))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
@@ -534,10 +568,10 @@ func truncateName(s string, n int) string {
 	return s[:n] + "…"
 }
 
-// colorFrameOverhead is the longest "blockCode/chunkLen/total/codec|" header
-// the classic pipeline can prepend. It is reserved out of the matrix capacity
+// colorFrameOverhead reserves the maximum QRT2 header and its separator.
+// It is reserved out of the matrix capacity
 // so a color frame can never exceed what ColorMatrixEncode accepts.
-const colorFrameOverhead = 48
+const colorFrameOverhead = txqr.MaxFrameOverhead + 1
 
 // clampColorSplit caps the payload size to what one color matrix frame can
 // carry. The sender renders "header|payload" as a whole frame, so the header
@@ -554,10 +588,17 @@ func clampColorSplit(split int) int {
 }
 
 // encodeClassic is the text-based pipeline (QR/color, LT/Raptor/…).
-func encodeClassic(body []byte, split int, mode string, codec txqr.CodecType, size frameSize) (*session, error) {
+func encodeClassic(body []byte, split int, mode string, codec txqr.CodecType, size frameSize, names ...string) (*session, error) {
+	return encodeClassicContext(context.Background(), body, split, mode, codec, size, names...)
+}
+
+func encodeClassicContext(ctx context.Context, body []byte, split int, mode string, codec txqr.CodecType, size frameSize, names ...string) (*session, error) {
 	str := string(body)
 	encoder := txqr.NewEncoder(split, codec)
-	frames, err := encoder.Encode(str)
+	if len(names) > 0 {
+		encoder.SetFileName(names[0])
+	}
+	frames, err := encoder.EncodeContext(ctx, str)
 	if err != nil {
 		return nil, err
 	}
@@ -591,9 +632,15 @@ func frameModules(mode string, frames [][]byte) int {
 	if len(frames) == 0 {
 		return 0
 	}
-	// The header length varies with the block numbers, so measure a frame
-	// instead of assuming: ECC M turns the byte count into a version.
-	return qr.ModulesForBytes(len(frames[0]))
+	// Header digit counts and metadata length vary; force every symbol to
+	// the largest version required by any frame in this session.
+	maxLen := 0
+	for _, frame := range frames {
+		if len(frame) > maxLen {
+			maxLen = len(frame)
+		}
+	}
+	return qr.ModulesForBytes(maxLen)
 }
 
 // encodeDecimen builds the DCF2 container plus one full carousel cycle (2k
@@ -647,6 +694,9 @@ func encodeDecimen(r *http.Request, body []byte, size frameSize) (*session, erro
 		blockLen:  DecimenBlockLen,
 	}
 	for seq := 0; seq < cycle; seq++ {
+		if err := r.Context().Err(); err != nil {
+			return nil, err
+		}
 		h := hdr
 		h.Seq = uint32(seq)
 		s.frames[seq] = decimen.PackFrame(h, enc.Encode(uint32(seq)))
@@ -679,6 +729,13 @@ func randUint16() uint16 {
 func (s *Server) handleMD5(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	select {
+	case s.encodeSlot <- struct{}{}:
+		defer func() { <-s.encodeSlot }()
+	default:
+		http.Error(w, "another upload is in progress", http.StatusTooManyRequests)
 		return
 	}
 	body, err := s.readBody(w, r)
@@ -714,11 +771,13 @@ func (s *Server) handleFrame(w http.ResponseWriter, r *http.Request) {
 		// 400 here keeps "no such frame" distinct from "frame failed to render".
 		badIndex = true
 	case sess.pngs[idx] == nil:
-		pngBytes = renderByMode(sess.mode, sess.frames[idx], sess.ppm)
+		sess.lastUsed = time.Now()
+		pngBytes = renderByMode(sess.mode, sess.frames[idx], sess.ppm, sess.modules)
 		if pngBytes != nil {
 			sess.pngs[idx] = pngBytes
 		}
 	default:
+		sess.lastUsed = time.Now()
 		pngBytes = sess.pngs[idx]
 	}
 	s.mu.Unlock()
@@ -761,13 +820,21 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 
 // ---------------------------------------------------------------- rendering
 
-func renderByMode(mode string, frame []byte, ppm int) []byte {
+func renderByMode(mode string, frame []byte, ppm int, modules ...int) []byte {
 	switch mode {
 	case "color":
 		return renderColorPNG(frame, ppm)
 	case "decimen":
 		return renderDecimenPNG(frame, ppm)
 	default:
+		if len(modules) > 0 && modules[0] > 0 {
+			mods := modules[0]
+			img, err := qr.EncodeVersioned(string(frame), ppm*mods, qr.Medium, (mods-25)/4, -1)
+			if err != nil {
+				return nil
+			}
+			return encodePNG(img)
+		}
 		return renderPNG(frame, ppm)
 	}
 }
@@ -873,13 +940,14 @@ func renderFrames(s *session, ctx context.Context) {
 	if n == 0 {
 		return
 	}
-	workers := runtime.GOMAXPROCS(0)
+	workers := min(8, runtime.GOMAXPROCS(0))
 	if workers < 1 {
 		workers = 1
 	}
 	if workers > n {
 		workers = n
 	}
+	var renderedBytes atomic.Int64
 	jobs := make(chan int, workers)
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -887,10 +955,15 @@ func renderFrames(s *session, ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				if ctx.Err() != nil {
-					return
+				if ctx.Err() != nil || s.renderExceeded.Load() {
+					continue
 				}
-				s.pngs[i] = renderByMode(s.mode, s.frames[i], s.ppm)
+				png := renderByMode(s.mode, s.frames[i], s.ppm, s.modules)
+				if s.renderBudget > 0 && renderedBytes.Add(int64(len(png))) > s.renderBudget {
+					s.renderExceeded.Store(true)
+					continue
+				}
+				s.pngs[i] = png
 			}
 		}()
 	}

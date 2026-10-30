@@ -12,13 +12,12 @@ package scanner
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"image"
 	"image/png"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,11 +31,15 @@ import (
 // Every field is reachable only with mu held, except SaveFails, which is written
 // from the UI thread and read by workers — hence its own atomic.
 type decodeState struct {
-	mu sync.Mutex
+	mu               sync.Mutex
+	decimenCandidate decimen.Header
 
-	decimenDec *decimen.LTDecoder
-	decimenHdr decimen.Header
-	txqrDec    *txqr.Decoder
+	decimenDec    *decimen.LTDecoder
+	decimenHdr    decimen.Header
+	txqrDec       *txqr.Decoder
+	txqrManifest  *txqr.Frame
+	txqrCandidate *txqr.Frame
+	failed        string
 
 	startTime  time.Time
 	endTime    time.Time // frozen when the transfer completes (avg speed stays stable)
@@ -54,7 +57,7 @@ type decodeState struct {
 
 	speedWnd []speedSample // sliding window of (time, effective bytes)
 
-	// txqr progress bookkeeping (txqr.Decoder.Read() is unimplemented → 0)
+	// Unique frame counters used for progress; completion is verified separately.
 	txqrTotal int
 	txqrChunk int
 	txqrNeed  int
@@ -136,7 +139,13 @@ func (s *decodeState) reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.decimenDec = nil
+	s.decimenCandidate = decimen.Header{}
 	s.txqrDec = nil
+	s.txqrManifest, s.txqrCandidate = nil, nil
+	s.failed = ""
+	s.mismatch, s.noGain = 0, 0
+	s.lastGain = time.Time{}
+	s.lastIssue = ""
 	s.startTime = time.Time{}
 	s.endTime = time.Time{}
 	s.lastTime = time.Time{}
@@ -242,8 +251,8 @@ func (s *decodeState) feedPayload(payload []byte) bool {
 	if s.completed {
 		return true
 	}
-	if s.startTime.IsZero() {
-		s.startTime = time.Now()
+	if s.failed != "" {
+		return false
 	}
 	s.lastTime = time.Now()
 
@@ -255,6 +264,9 @@ func (s *decodeState) feedPayload(payload []byte) bool {
 
 func (s *decodeState) feedDecimenLocked(frame []byte) bool {
 	f := decimen.ParseFrame(frame)
+	if s.mode == "txqr" {
+		return false
+	}
 	if f == nil {
 		// The magic matched (feedPayload checked) but the length does not, which
 		// means the capture caught a partially rendered or partially read frame.
@@ -263,7 +275,26 @@ func (s *decodeState) feedDecimenLocked(frame []byte) bool {
 			len(frame), hexPrefix(frame, 24)))
 		return false
 	}
-	if s.decimenDec == nil || !sameHeader(s.decimenHdr, f.Header) {
+	if s.decimenDec != nil && !sameHeader(s.decimenHdr, f.Header) {
+		if !sameHeader(s.decimenCandidate, f.Header) {
+			s.mismatch = 0
+		}
+		s.decimenCandidate = f.Header
+		s.mismatch++
+		if s.mismatch < sessionSwitchAfter {
+			return false
+		}
+		s.decimenDec = nil
+		s.bytes = 0
+		s.speedWnd = nil
+		s.frames = 0
+		s.noteAlways("frame.session-switch", AuditInfo, "连续收到新的 decimen 会话，已重置解码状态")
+	} else {
+		s.mismatch = 0
+	}
+
+	if s.decimenDec == nil {
+		s.startTime = time.Now()
 		detail := fmt.Sprintf("decimen 传输：session=%d k=%d blockLen=%d 总长=%d",
 			f.Header.SessionId, f.Header.K, f.Header.BlockLen, f.Header.TotalLen)
 		if s.decimenDec != nil {
@@ -292,6 +323,11 @@ func (s *decodeState) feedDecimenLocked(frame []byte) bool {
 	}
 	if s.decimenDec.IsComplete() {
 		container := s.decimenDec.Assemble()
+		if decimen.Fnv1a(container) != s.decimenHdr.PayloadFnv {
+			s.failed = "Decimen 容器校验失败，请停止后重新扫描"
+			s.noteAlways("frame.dropped", AuditError, s.failed)
+			return false
+		}
 		if file, err := decimen.UnpackContainer(container); err == nil {
 			if shaMatches(container, file.Bytes) {
 				s.completed = true
@@ -303,9 +339,12 @@ func (s *decodeState) feedDecimenLocked(frame []byte) bool {
 					file.Name, len(file.Bytes), s.frames, s.endTime.Sub(s.startTime).Seconds()))
 				return true
 			}
-			s.note("frame.dropped", AuditError,
-				"decimen 容器组装完成但 SHA-256 校验失败——收到的数据有误，请重新扫描")
+			s.failed = "Decimen SHA-256 校验失败，请停止后重新扫描"
+			s.noteAlways("frame.dropped", AuditError, s.failed)
 			return false
+		} else {
+			s.failed = "Decimen 容器无效，请停止后重新扫描"
+			s.noteAlways("frame.dropped", AuditError, s.failed)
 		}
 	}
 	return false
@@ -328,23 +367,6 @@ func (s *decodeState) noteStallLocked(progress string) {
 }
 
 // splitFrameHeader parses "blockCode/chunkLen/total[/codec]".
-func splitFrameHeader(h string) (code, chunkLen, total int, codec string, ok bool) {
-	parts := strings.Split(h, "/")
-	if len(parts) < 3 {
-		return 0, 0, 0, "", false
-	}
-	c, err1 := strconv.Atoi(parts[0])
-	cl, err2 := strconv.Atoi(parts[1])
-	t, err3 := strconv.Atoi(parts[2])
-	if err1 != nil || err2 != nil || err3 != nil || cl <= 0 || t <= 0 {
-		return 0, 0, 0, "", false
-	}
-	if len(parts) >= 4 {
-		codec = parts[3]
-	}
-	return c, cl, t, codec, true
-}
-
 // adoptSessionLocked records the header of the transfer this region is now
 // following. The log line is the single most useful record when a transfer
 // "sometimes works": it says which total/chunk/codec the receiver locked onto.
@@ -374,9 +396,8 @@ func (s *decodeState) noteDensityLocked(chunkLen int) {
 	if s.audit == nil || s.lastW == 0 || chunkLen <= 0 {
 		return
 	}
-	// The symbol carries the frame header too; 32 bytes covers the longest one
-	// ("NNNN/NNNN/NNNNNNNN/raptorq|") with room to spare.
-	mods := qr.ModulesForBytes(chunkLen + 32)
+	// Reserve the verified header as well as its encoded data bytes.
+	mods := qr.ModulesForBytes(chunkLen + txqr.MaxFrameOverhead)
 	if mods <= 0 {
 		return
 	}
@@ -404,72 +425,68 @@ func (s *decodeState) noteDensityLocked(chunkLen int) {
 }
 
 func (s *decodeState) feedTxqrLocked(payload []byte) bool {
-	if s.txqrDec == nil {
-		s.txqrDec = txqr.NewDecoder()
-	}
-	s.mode = "txqr"
-	s.frames++
-
-	chunk := string(payload)
-	idx := strings.IndexByte(chunk, '|')
-	if idx <= 0 {
-		s.note("frame.header-invalid", AuditWarn, fmt.Sprintf(
-			"帧头缺少 '|' 分隔符：长度 %d，前 40 字节 %s",
-			len(payload), printablePrefix(payload, 40)))
+	if s.mode == "decimen" {
 		return false
 	}
-	code, chunkLen, total, codec, ok := splitFrameHeader(chunk[:idx])
-	if !ok {
-		s.note("frame.header-invalid", AuditWarn, fmt.Sprintf(
-			"帧头 %q 无法解析（期望 blockCode/chunkLen/total[/codec]），前 40 字节 %s",
-			truncateForLog(chunk[:idx], 40), printablePrefix(payload, 40)))
+	packet := string(payload)
+	f, err := txqr.ParseFrame(packet)
+	if err != nil {
+		s.note("frame.header-invalid", AuditWarn, fmt.Sprintf("无效或未校验的帧（期望 QRT2 及分隔符 |）：%s，前缀 %s", err, printablePrefix(payload, 40)))
 		return false
 	}
-	if code < 0 {
-		// Metadata frame: "-1/{chunk}/{total}/{codec}/name|{fileName}". It
-		// carries no block, so counting it as progress would show the transfer
-		// one block further along than it is.
-		if strings.HasSuffix(chunk[:idx], "/name") {
-			s.fileName = chunk[idx+1:]
-			s.noteAlways("frame.name", AuditInfo, "文件名帧："+s.fileName)
-			return false
+	if s.txqrManifest != nil && !s.txqrManifest.SameTransfer(f) {
+		if s.txqrCandidate == nil || !s.txqrCandidate.SameTransfer(f) {
+			s.mismatch = 0
 		}
-		s.note("frame.header-invalid", AuditWarn, "未知的负 blockCode："+chunk[:idx])
-		return false
-	}
-
-	switch {
-	case s.txqrChunk == 0:
-		s.adoptSessionLocked(code, chunkLen, total, codec)
-	case chunkLen != s.txqrChunk || total != s.txqrTotal:
-		// A frame built for a different total/chunk cannot help this decoder:
-		// it was created for the old session. Skipping keeps a stale frame on
-		// screen from poisoning a working run.
+		s.txqrCandidate = f
 		s.mismatch++
-		s.note("frame.session-mismatch", AuditWarn, fmt.Sprintf(
-			"本帧 chunk=%d 总长=%d，当前会话 chunk=%d 总长=%d（连续第 %d 帧）",
-			chunkLen, total, s.txqrChunk, s.txqrTotal, s.mismatch))
+		s.note("frame.session-mismatch", AuditWarn, "已拒绝其他会话的帧")
 		if s.mismatch < sessionSwitchAfter {
 			return false
 		}
-		s.noteAlways("frame.session-switch", AuditInfo, fmt.Sprintf(
-			"连续 %d 帧与当前会话不一致，判定换了文件：重置解码器，改用 chunk=%d 总长=%d",
-			s.mismatch, chunkLen, total))
-		s.txqrDec = txqr.NewDecoder()
-		s.txqrSeen = nil
-		s.txqrGot = 0
-		s.adoptSessionLocked(code, chunkLen, total, codec)
-	default:
+		s.noteAlways("frame.session-switch", AuditInfo, "连续收到新会话，已清空旧解码状态")
+		s.txqrDec, s.txqrManifest, s.txqrSeen = nil, nil, nil
+		s.txqrGot, s.bytes = 0, 0
+		s.speedWnd = nil
+		s.fileName = ""
+		s.startTime = time.Now()
+	} else {
 		s.mismatch = 0
+		s.txqrCandidate = nil
 	}
-
+	if s.txqrDec == nil {
+		if s.startTime.IsZero() {
+			s.startTime = time.Now()
+		}
+		s.txqrDec = txqr.NewDecoder()
+		s.txqrManifest = f
+		s.adoptSessionLocked(int(f.BlockCode), f.ChunkLen, f.Total, string(f.Codec))
+	}
+	s.mode = "txqr"
+	s.frames++
+	if err := s.txqrDec.Decode(packet); err != nil {
+		s.note("frame.dropped", AuditWarn, "解码器拒绝该帧："+err.Error())
+		if errors.Is(err, txqr.ErrIntegrity) {
+			s.failed = "SHA-256 校验失败，请重新扫描"
+		}
+		if errors.Is(err, txqr.ErrDecodeBudget) {
+			s.failed = "超过接收内存预算，请减小文件、增大分片或更换编码模式后重扫"
+		}
+		return false
+	}
+	s.fileName = s.txqrDec.FileName()
+	if f.Name {
+		s.noteAlways("frame.name", AuditInfo, "文件名帧："+s.fileName)
+		return false
+	}
 	if s.txqrSeen == nil {
 		s.txqrSeen = map[int]struct{}{}
 	}
+	code := int(f.BlockCode)
 	if _, dup := s.txqrSeen[code]; !dup {
 		s.txqrSeen[code] = struct{}{}
 		s.txqrGot++
-		s.bytes += int64(len(payload))
+		s.bytes += int64(len(f.Payload))
 		s.pushSpeedSample()
 		s.lastGain = time.Now()
 		s.noGain = 0
@@ -477,20 +494,11 @@ func (s *decodeState) feedTxqrLocked(payload []byte) bool {
 		s.noGain++
 		s.noteStallLocked(fmt.Sprintf("已收 %d/%d 块", s.txqrGot, s.txqrNeed))
 	}
-
-	if err := s.txqrDec.Decode(chunk); err != nil {
-		s.note("frame.dropped", AuditWarn, "解码器拒绝该帧："+err.Error())
-	}
 	if s.txqrDec.IsCompleted() {
+		s.result = s.txqrDec.DataBytes()
 		s.completed = true
 		s.endTime = time.Now()
-		s.result = s.txqrDec.DataBytes()
-		if s.fileName == "" {
-			s.fileName = ""
-		}
-		s.noteAlways("result.complete", AuditInfo, fmt.Sprintf(
-			"txqr 传输完成：%d 字节，%d 帧 / 需要 %d 块，用时 %.1fs",
-			len(s.result), s.frames, s.txqrNeed, s.endTime.Sub(s.startTime).Seconds()))
+		s.noteAlways("result.complete", AuditInfo, fmt.Sprintf("SHA-256 已验证：%d 字节，%d 帧", len(s.result), s.frames))
 		return true
 	}
 	return false
@@ -546,6 +554,9 @@ type Snapshot struct {
 func (s *decodeState) snapshot(byBlocks bool) (progress int, status string, done bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failed != "" {
+		return 0, s.failed, false
+	}
 	if s.completed {
 		return 100, "平均 " + FmtBytes(s.avgSpeedBps()) + "/s", true
 	}
@@ -625,9 +636,8 @@ func (s *decodeState) currentSpeedBps() int64 {
 	return s.avgSpeedBps()
 }
 
-// avgSpeedBps is the whole-transfer effective-data rate: total deduplicated
-// parsed bytes over the entire session. Uses the frozen endTime once complete,
-// so the "done" figure stays stable.
+// avgSpeedBps shows unique encoded bytes while receiving. On verified
+// completion it uses original-file bytes and the frozen end time (goodput).
 func (s *decodeState) avgSpeedBps() int64 {
 	if s.bytes <= 0 {
 		return 0
@@ -640,7 +650,11 @@ func (s *decodeState) avgSpeedBps() int64 {
 	if elapsed <= 0 {
 		return 0
 	}
-	return int64(float64(s.bytes) / elapsed.Seconds())
+	n := s.bytes
+	if s.completed {
+		n = int64(len(s.result))
+	}
+	return int64(float64(n) / elapsed.Seconds())
 }
 
 // pushSpeedSample records cumulative effective bytes; it trims the window

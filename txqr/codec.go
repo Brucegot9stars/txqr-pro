@@ -1,6 +1,7 @@
 package txqr
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 
@@ -64,7 +65,8 @@ func isGofountainCodec(ct CodecType) bool {
 
 // raptorQEncode encodes data using RaptorQ and returns frames.
 // symbolSize is the fixed size of each RaptorQ symbol (typically = split).
-func raptorQEncode(data []byte, split int, total int) ([]string, error) {
+func (e *Encoder) raptorQEncode(ctx context.Context, data []byte, total int) ([]string, error) {
+	split := e.chunkLen
 	rq := raptorq.NewRaptorQ(uint32(split))
 	enc, err := rq.CreateEncoder(data)
 	if err != nil {
@@ -73,23 +75,25 @@ func raptorQEncode(data []byte, split int, total int) ([]string, error) {
 
 	K := int(enc.BaseSymbolsNum())
 	// Generate systematic symbols (IDs 0..K-1) + repair symbols
-	// Total frames = K * redundancyFactor (repair symbols start at ID K)
-	numRepair := int(float64(K) * 1.05) // ~5% overhead for RaptorQ
+	// A systematic sweep plus approximately 1.05K repair symbols.
+	numRepair := int(float64(K) * 1.05)
 	frames := make([]string, 0, K+numRepair)
 
 	// Systematic symbols
 	for i := 0; i < K; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		sym := enc.GenSymbol(uint32(i))
-		frames = append(frames, raptorQFrame(i, split, total, sym))
+		frames = append(frames, e.frame(int64(i), total, sym, "raptorq"))
 	}
 	// Repair symbols
 	for i := 0; i < numRepair; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		sym := enc.GenSymbol(uint32(K + i))
-		frames = append(frames, raptorQFrame(K+i, split, total, sym))
+		frames = append(frames, e.frame(int64(K+i), total, sym, "raptorq"))
 	}
 	return frames, nil
-}
-
-func raptorQFrame(blockCode int, chunkLen, total int, data []byte) string {
-	return fmt.Sprintf("%d/%d/%d/raptorq|%s", blockCode, chunkLen, total, string(data))
 }

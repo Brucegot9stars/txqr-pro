@@ -3,7 +3,6 @@ package txqr
 import (
 	"fmt"
 	"math/rand"
-	"strings"
 	"testing"
 	"time"
 )
@@ -159,10 +158,14 @@ func BenchmarkTXQREncode(b *testing.B) {
 
 	for _, test := range tests {
 		b.Run(fmt.Sprintf("%d, %d", test.length, test.chunkSz), func(b *testing.B) {
-			str := strings.Repeat("hello, world!", test.length)
+			str := newTestData(test.length)
 			enc := NewEncoder(test.chunkSz, CodecLT)
+			b.SetBytes(int64(len(str)))
+			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				_, _ = enc.Encode(str)
+				if _, err := enc.Encode(str); err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}
@@ -182,19 +185,24 @@ func BenchmarkTXQRDecode(b *testing.B) {
 
 	for _, test := range tests {
 		b.Run(fmt.Sprintf("%d, %d", test.length, test.chunkSz), func(b *testing.B) {
-			str := strings.Repeat("hello, world!", test.length)
+			str := newTestData(test.length)
 			enc := NewEncoder(test.chunkSz, CodecLT)
 			chunks, err := enc.Encode(str)
 			if err != nil {
 				b.Fatalf("Encode failed: %v", err)
 			}
-			dec := NewDecoder()
+			b.SetBytes(int64(len(str)))
+			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
+				dec := NewDecoder()
 				for _, chunk := range chunks {
 					err = dec.Decode(chunk)
 					if err != nil {
 						b.Fatalf("Decode failed: %v", err)
 					}
+				}
+				if !dec.IsCompleted() || dec.Data() != str {
+					b.Fatal("invalid recovery")
 				}
 			}
 		})
@@ -215,13 +223,15 @@ func BenchmarkTXQRErasures(b *testing.B) {
 
 	for _, test := range tests {
 		b.Run(fmt.Sprintf("%d, %d", test.length, test.chunkSz), func(b *testing.B) {
-			str := strings.Repeat("hello, world!", test.length)
+			str := newTestData(test.length)
 			enc := NewEncoder(test.chunkSz, CodecLT)
 			chunks, err := enc.Encode(str)
 			if err != nil {
 				b.Fatalf("Encode failed: %v", err)
 			}
 
+			b.SetBytes(int64(len(str)))
+			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				dec := NewDecoder()
 				for !dec.IsCompleted() {

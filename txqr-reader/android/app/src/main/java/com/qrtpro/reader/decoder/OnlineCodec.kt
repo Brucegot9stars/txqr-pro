@@ -32,7 +32,9 @@ class OnlineCodec(
             val rho = 1 - (1 + 1.0 / f) / (1 + eps)
             cdf[1] = rho
             for (i in 2..f) {
-                val rhoI = (1 - rho) * f / ((f - 1) * i * (i - 1))
+                // Keep the same floating-point operation order as Go. Int
+                // multiplication overflows in the tail of this distribution.
+                val rhoI = (1 - rho) * f / ((f - 1).toDouble() * (i - 1).toDouble() * i.toDouble())
                 cdf[i] = cdf[i - 1] + rhoI
             }
             return cdf
