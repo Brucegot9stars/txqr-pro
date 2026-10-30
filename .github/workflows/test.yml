@@ -87,6 +87,16 @@ jobs:
       - name: Test with race detector
         run: go test -race -short . ./internal/scanner/... ./internal/sender/... ./decimen/... ./qr/... -timeout 300s
 
+      - name: Set up Node for playback regressions
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Test playback and actual presentation cadence
+        run: |
+          node internal/sender/testdata/playback.test.cjs
+          node internal/sender/testdata/throughput.test.cjs
+
   android:
     runs-on: ubuntu-latest
     defaults:

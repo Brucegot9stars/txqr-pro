@@ -2,7 +2,6 @@ package txqr
 
 import (
 	"crypto/sha256"
-	"errors"
 	"fmt"
 
 	fountain "github.com/google/gofountain"
@@ -57,22 +56,6 @@ func (d *Decoder) Decode(packet string) error {
 		return nil
 	}
 	if d.manifest == nil {
-		// Bound the dense worst case before creating library matrices. This is a
-		// conservative admission estimate for one decoder, not a process RSS limit.
-		k := int64(numberOfChunks(f.Total, f.ChunkLen))
-		width, cellBytes := k, int64(8)
-		switch f.Codec {
-		case CodecOnline:
-			width += (33*k + 1999) / 2000 // ceil(.55 * 3 * .01 * K)
-		case CodecRaptor:
-			width += 512 // reserve precode rows
-		case CodecRaptorQ:
-			width += 512
-			cellBytes = 16 // inactivation and temporary dense matrices
-		}
-		if cellBytes*width*width+8*int64(f.Total) > 256<<20 {
-			return ErrDecodeBudget
-		}
 		d.manifest = f
 		d.total, d.chunkLen, d.codecType = f.Total, f.ChunkLen, f.Codec
 	}
@@ -82,9 +65,6 @@ func (d *Decoder) Decode(packet string) error {
 	}
 	if _, ok := d.seen[f.BlockCode]; ok {
 		return nil
-	}
-	if len(d.seen) >= 4*numberOfChunks(d.total, d.chunkLen)+256 {
-		return errors.New("transfer frame budget exceeded")
 	}
 	if d.fd == nil && d.raptorQDec == nil {
 		if d.codecType == CodecRaptorQ {

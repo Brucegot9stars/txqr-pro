@@ -1,13 +1,6 @@
 package com.qrtpro.reader.decoder
 
-class SparseMatrix(val size: Int, private val memoryBudget: Long = decoderWorkingBudget() / 2) {
-    private var retained = 0L
-    private fun store(row: Int, indices: IntArray, block: Block) {
-        val old = (coeff[row]?.size?.toLong() ?: 0L) * 4 + (v[row]?.data?.size ?: 0)
-        val next = retained - old + indices.size.toLong() * 4 + block.data.size
-        if (next > memoryBudget) throw DecodeResourceLimit()
-        coeff[row] = indices; v[row] = block; retained = next
-    }
+class SparseMatrix(val size: Int) {
     val coeff = arrayOfNulls<IntArray>(size)
     val v = arrayOfNulls<Block>(size)
 
@@ -19,7 +12,8 @@ class SparseMatrix(val size: Int, private val memoryBudget: Long = decoderWorkin
             val existing = coeff[pivot] ?: break
             if (comps.size < existing.size) {
                 val old = v[pivot]!!
-                store(pivot, comps, block)
+                coeff[pivot] = comps
+                v[pivot] = block
                 comps = existing
                 block = old
             }
@@ -27,7 +21,8 @@ class SparseMatrix(val size: Int, private val memoryBudget: Long = decoderWorkin
             comps = xorIndices(comps, coeff[pivot]!!)
         }
         if (comps.isNotEmpty()) {
-            store(comps[0], comps, block)
+            coeff[comps[0]] = comps
+            v[comps[0]] = block
         }
     }
 
@@ -57,12 +52,12 @@ class SparseMatrix(val size: Int, private val memoryBudget: Long = decoderWorkin
                 val cj = coeff[j] ?: continue
                 for (k in 1 until cj.size) {
                     if (cj[k] == ci[0]) {
-                        store(j, cj, v[j]!!.xor(v[i]!!))
+                        v[j] = v[j]!!.xor(v[i]!!)
                         break
                     }
                 }
             }
-            store(i, intArrayOf(ci[0]), v[i]!!)
+            coeff[i] = intArrayOf(ci[0])
         }
     }
 

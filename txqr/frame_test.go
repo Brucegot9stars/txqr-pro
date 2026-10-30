@@ -3,6 +3,7 @@ package txqr
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"strings"
 	"testing"
@@ -147,19 +148,51 @@ func TestCanceledEncodeDoesNotProduceFrames(t *testing.T) {
 	}
 }
 
-func TestReceiverBudgetRejectsBeforeLibraryAllocation(t *testing.T) {
-	f := &Frame{Session: strings.Repeat("0", 32), BlockCode: 0, ChunkLen: 8,
-		Total: 8192 * 8, Codec: CodecBinary, Payload: make([]byte, 8)}
-	packet := f.pack()
-	if _, err := ParseFrame(packet); err != nil {
+func TestReceiverAcceptsLargeRaptorQSession(t *testing.T) {
+	f := &Frame{Session: strings.Repeat("0", 32), BlockCode: 0, ChunkLen: 2048,
+		Total: 8 << 20, Codec: CodecRaptorQ, Payload: make([]byte, 2048)}
+	d := NewDecoder()
+	if err := d.Decode(f.pack()); err != nil {
 		t.Fatal(err)
 	}
-	d := NewDecoder()
-	if !errors.Is(d.Decode(packet), ErrDecodeBudget) {
-		t.Fatal("decoder budget not enforced")
+	if d.Total() != 8<<20 || d.Read() != 2048 || d.IsCompleted() {
+		t.Fatal("large session was not accepted")
 	}
-	if d.Total() != 0 || d.Read() != 0 || d.IsCompleted() {
-		t.Fatal("oversize decoder initialized")
+}
+
+func TestReceiverDoesNotRejectLongRedundantSequence(t *testing.T) {
+	source := []byte("AB")
+	f := &Frame{Session: strings.Repeat("0", 32), SHA256: sha256.Sum256(source), ChunkLen: 1, Total: 2, Codec: CodecLT}
+	codec := gofountainCodec(2, CodecLT)
+	d := NewDecoder()
+	count := 0
+	var other int64
+	for id := int64(0); count < 300; id++ {
+		picks := codec.PickIndices(id)
+		if len(picks) != 1 {
+			continue
+		}
+		if picks[0] == 1 {
+			other = id
+			continue
+		}
+		f.BlockCode = id
+		f.Payload = source[:1]
+		if err := d.Decode(f.pack()); err != nil {
+			t.Fatal(err)
+		}
+		count++
+	}
+	if d.IsCompleted() {
+		t.Fatal("one source cannot complete a two-source file")
+	}
+	f.BlockCode = other
+	f.Payload = source[1:]
+	if err := d.Decode(f.pack()); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(d.DataBytes(), source) {
+		t.Fatal("long redundant sequence failed recovery")
 	}
 }
 

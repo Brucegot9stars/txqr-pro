@@ -50,14 +50,13 @@ const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
  `);
  await sleep(650);
  const state=await evaluate(`({presented:presentedFrames,peak:fixturePeak,images:fixturePaints,visible:tiles.every(t=>t.complete&&t.naturalWidth===384)})`);
- assert(state.presented>=4,'slow loading never presented frames');assert(state.peak<=2,'unbounded prefetch');assert(state.visible);assert(state.images.every(i=>i.ready&&i.width===384),'undecoded image inserted');
- for(let i=1;i<state.images.length;i++)assert(state.images[i].time-state.images[i-1].time>1,'simultaneous carousel replacements');
+ assert(state.presented>=4,'slow loading never presented frames');assert(state.peak<=6,'unbounded prefetch');assert(state.visible);assert(state.images.every(i=>i.ready&&i.width===384),'undecoded image inserted');
  const before=await evaluate('togglePause();presentedFrames');await sleep(180);assert.equal(await evaluate('presentedFrames'),before,'paused presentation continued');
  assert((await evaluate('fixtureURLs.size'))<=2,'pause retained next-image URLs');
  await evaluate('togglePause()');await sleep(400);assert((await evaluate('presentedFrames'))>before);
  await evaluate('fixtureFail=true');await sleep(400);assert(await evaluate('tiles.every(t=>t.complete&&t.naturalWidth===384)'),'failure blanked current frame');
  await evaluate('cancel()');await sleep(80);assert.equal(await evaluate('fixtureURLs.size'),0,'URLs leaked after cancel');assert.equal(await evaluate('fixtureActive'),0);
- console.log('PASS: real Chrome decoding/presentation, bounded slow loads, carousel phases, pause/resume, failures, URL cleanup');
+ console.log('PASS: real Chrome decoding/presentation, bounded slow loads, parallel carousel, pause/resume, failures, URL cleanup');
 })().catch(error=>{console.error(error);process.exitCode=1;}).finally(async()=>{
  await Promise.race([cdp('Browser.close').catch(()=>{}),sleep(1000)]);child.kill();
  await new Promise(resolve=>{if(child.exitCode!==null)resolve();else {child.once('exit',resolve);setTimeout(()=>{child.kill('SIGKILL');resolve();},1000).unref();}});

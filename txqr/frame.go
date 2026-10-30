@@ -27,7 +27,6 @@ const (
 var (
 	ErrSessionMismatch = errors.New("frame belongs to a different transfer")
 	ErrIntegrity       = errors.New("recovered file failed SHA-256 verification")
-	ErrDecodeBudget    = errors.New("transfer exceeds receiver working-memory budget")
 )
 
 // Frame contains a fully validated wire packet. CRC covers every header field

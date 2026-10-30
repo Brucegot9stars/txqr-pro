@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -37,7 +38,8 @@ func (r Rect) H() int32 {
 }
 
 // CaptureFunc grabs a screen rectangle and returns both an RGBA image for
-// decoding and the raw BGRA bytes for the preview pane.
+// decoding and the raw BGRA bytes for the preview pane. Returned buffers must
+// remain immutable: decode workers and the preview consume them asynchronously.
 type CaptureFunc func(r Rect) (*image.RGBA, []byte, error)
 
 // FrameInterval is the capture cadence (~60 fps). A frame that overruns simply
@@ -583,6 +585,7 @@ func (m *Manager) runCapture(r *region, gen int, ctx context.Context) {
 	defer m.wg.Done()
 	ticker := time.NewTicker(FrameInterval)
 	defer ticker.Stop()
+	var previous *image.RGBA
 	for {
 		select {
 		case <-ctx.Done():
@@ -611,21 +614,31 @@ func (m *Manager) runCapture(r *region, gen int, ctx context.Context) {
 			m.previewID = r.id
 			m.previewMu.Unlock()
 		}
-		m.submitDecode(decJob{r: r, gen: gen, rgba: rgba})
+		// Screen capture normally runs faster than presentation. Identical
+		// pixels cannot add a fountain equation, so avoid decoding them again.
+		// Remember only accepted jobs: a full queue must allow a later retry.
+		if rgba != nil && (previous == nil || rgba.Rect != previous.Rect ||
+			rgba.Stride != previous.Stride || !bytes.Equal(rgba.Pix, previous.Pix)) {
+			if m.submitDecode(decJob{r: r, gen: gen, rgba: rgba}) {
+				previous = rgba
+			}
+		}
 		m.notifyUpdate()
 	}
 }
 
 // submitDecode never blocks the capture loop and never panics on shutdown.
-func (m *Manager) submitDecode(j decJob) {
+func (m *Manager) submitDecode(j decJob) bool {
 	m.qMu.RLock()
 	defer m.qMu.RUnlock()
 	if m.closed {
-		return
+		return false
 	}
 	select {
 	case m.decQueue <- j:
+		return true
 	default: // every worker busy: drop this frame
+		return false
 	}
 }
 

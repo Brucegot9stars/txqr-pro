@@ -23,7 +23,7 @@ import java.util.zip.GZIPOutputStream
  * 12  u32  totalLen   (DCF2 container length)
  * 16  u32  payloadFnv (FNV-1a of the whole container)
  */
-class DecimenDecoder(private val memoryBudget: Long = decoderWorkingBudget()) {
+class DecimenDecoder {
     data class FrameHeader(
         val sessionId: Int,
         val seq: Long,
@@ -95,14 +95,12 @@ class DecimenDecoder(private val memoryBudget: Long = decoderWorkingBudget()) {
     fun addFrame(bytes: ByteArray): Boolean {
         if (failure != null || completed) return completed
         val h = parseFrame(bytes) ?: return completed
-        if (h.totalLen * 4 > memoryBudget) { failure = DecodeResourceLimit().message; return false }
         if (header == null) {
             initStream(h)
         } else if (!sameStream(header!!, h)) {
             return false // only an explicit rescan may adopt a different transfer
         }
 
-        if (seen.size >= 4*k+256) { failure = "传输帧数超过资源上限，请重新扫描"; return false }
         if (!seen.add(h.seq)) {
             framesDup++
             return completed
@@ -265,7 +263,6 @@ class DecimenDecoder(private val memoryBudget: Long = decoderWorkingBudget()) {
         ) {
             throw IllegalStateException("container length mismatch")
         }
-        if (fileLen * 4 + container.size.toLong() * 2 > memoryBudget) throw DecodeResourceLimit()
         val name = safeFileName(String(container, 49, nameLen, Charsets.UTF_8))
         val type = String(container, 49 + nameLen, typeLen, Charsets.UTF_8)
         val transmitted = container.copyOfRange(dataOffset, container.size)

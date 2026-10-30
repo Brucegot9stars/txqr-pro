@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"bytes"
+	"context"
 	"image"
 	"image/draw"
 	"os"
@@ -15,6 +16,59 @@ import (
 	"github.com/divan/txqr/decimen"
 	"github.com/divan/txqr/qr"
 )
+
+func TestCaptureSkipsIdenticalPixels(t *testing.T) {
+	a := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	b := image.NewRGBA(a.Rect)
+	b.Pix[0] = 1
+	captured := make(chan struct{}, 1)
+	calls := 0
+	m := &Manager{decQueue: make(chan decJob, 16)}
+	m.capture = func(Rect) (*image.RGBA, []byte, error) {
+		calls++
+		if calls == 8 {
+			captured <- struct{}{}
+		}
+		// Return separate images with identical pixels, as GDI capture does.
+		out := image.NewRGBA(a.Rect)
+		if calls <= 3 {
+			copy(out.Pix, a.Pix)
+		} else {
+			copy(out.Pix, b.Pix)
+		}
+		return out, nil, nil
+	}
+	r := &region{scanning: true, rect: Rect{R: 1, B: 1}}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.wg.Add(1)
+	go m.runCapture(r, 0, ctx)
+	select {
+	case <-captured:
+	case <-time.After(3 * time.Second):
+		t.Error("capture did not advance")
+	}
+	cancel()
+	m.wg.Wait()
+	if got := len(m.decQueue); got != 2 {
+		t.Fatalf("queued %d frames, want the two distinct images", got)
+	}
+}
+
+func TestSubmitDecodeReportsQueueFullAndClosed(t *testing.T) {
+	m := &Manager{decQueue: make(chan decJob, 1)}
+	if !m.submitDecode(decJob{}) || m.submitDecode(decJob{}) {
+		t.Fatal("queue admission was not reported correctly")
+	}
+	<-m.decQueue
+	if !m.submitDecode(decJob{}) {
+		t.Fatal("dropped frame could not be retried")
+	}
+	m.closed = true
+	close(m.decQueue)
+	if m.submitDecode(decJob{}) {
+		t.Fatal("accepted a frame after shutdown")
+	}
+}
 
 func toRGBA(img image.Image) *image.RGBA {
 	b := image.NewRGBA(img.Bounds())

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"image"
+	"image/draw"
 
 	"github.com/makiuchi-d/gozxing"
 	zqrcode "github.com/makiuchi-d/gozxing/qrcode"
@@ -93,7 +94,7 @@ func Decode(img image.Image) (string, error) {
 
 // decodeOnce runs the QR reader, optionally with the pure-barcode fast path.
 func decodeOnce(img image.Image, pure bool) (*gozxing.Result, error) {
-	bitmap, err := gozxing.NewBinaryBitmapFromImage(img)
+	bitmap, err := gozxing.NewBinaryBitmap(gozxing.NewHybridBinarizer(luminanceSource(img)))
 	if err != nil {
 		return nil, err
 	}
@@ -109,6 +110,28 @@ func decodeOnce(img image.Image, pure bool) (*gozxing.Result, error) {
 		hints[gozxing.DecodeHintType_TRY_HARDER] = true
 	}
 	return zqrcode.NewQRCodeReader().Decode(bitmap, hints)
+}
+
+// The library's generic RGBA conversion boxes one color value per pixel.
+// Convert captures through their pixel buffer first, preserving its exact
+// green-weighted luminance and white-background alpha arithmetic. Gray's
+// single-byte color values avoid those per-pixel heap allocations.
+func luminanceSource(img image.Image) gozxing.LuminanceSource {
+	if rgba, ok := img.(*image.RGBA); ok {
+		bounds := rgba.Bounds()
+		gray := image.NewGray(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+		for y := 0; y < bounds.Dy(); y++ {
+			row := rgba.Pix[rgba.PixOffset(bounds.Min.X, bounds.Min.Y+y):]
+			for x := 0; x < bounds.Dx(); x++ {
+				p := row[x*4 : x*4+4]
+				lum := (uint32(p[0]) + 2*uint32(p[1]) + uint32(p[2])) / 4
+				alpha := uint32(p[3])
+				gray.Pix[y*gray.Stride+x] = byte((lum*alpha + (255-alpha)*255) / 255)
+			}
+		}
+		img = gray
+	}
+	return gozxing.NewLuminanceSourceFromImage(img)
 }
 
 // ScaleBilinear resizes an image with bilinear interpolation (exported for
@@ -253,13 +276,20 @@ func DecodeRawMultiScaleVerbose(img image.Image, scales []float64) ([]byte, erro
 		if b.Dx()-2*dx < 60 || b.Dy()-2*dy < 60 {
 			return nil, false
 		}
-		cropped := image.NewRGBA(image.Rect(0, 0, b.Dx()-2*dx, b.Dy()-2*dy))
-		for y := 0; y < cropped.Bounds().Dy(); y++ {
-			for x := 0; x < cropped.Bounds().Dx(); x++ {
-				cropped.Set(x, y, img.At(b.Min.X+x+dx, b.Min.Y+y+dy))
-			}
+		rect := image.Rect(b.Min.X+dx, b.Min.Y+dy, b.Max.X-dx, b.Max.Y-dy)
+		// Captures remain immutable during decode, so standard image types can
+		// share their pixels. The QR reader honours nonzero image origins.
+		var cropped image.Image
+		if source, ok := img.(interface {
+			SubImage(image.Rectangle) image.Image
+		}); ok {
+			cropped = source.SubImage(rect)
+		} else {
+			copy := image.NewRGBA(image.Rect(0, 0, rect.Dx(), rect.Dy()))
+			draw.Draw(copy, copy.Bounds(), img, rect.Min, draw.Src)
+			cropped = copy
 		}
-		cand := image.Image(cropped)
+		cand := cropped
 		if sc != 1.0 {
 			cw, ch := cropped.Bounds().Dx(), cropped.Bounds().Dy()
 			cand = scaleBilinear(cropped, int(float64(cw)*sc), int(float64(ch)*sc))

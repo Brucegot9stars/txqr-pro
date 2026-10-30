@@ -469,9 +469,6 @@ func (s *decodeState) feedTxqrLocked(payload []byte) bool {
 		if errors.Is(err, txqr.ErrIntegrity) {
 			s.failed = "SHA-256 校验失败，请重新扫描"
 		}
-		if errors.Is(err, txqr.ErrDecodeBudget) {
-			s.failed = "超过接收内存预算，请减小文件、增大分片或更换编码模式后重扫"
-		}
 		return false
 	}
 	s.fileName = s.txqrDec.FileName()

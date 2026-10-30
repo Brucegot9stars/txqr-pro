@@ -8,12 +8,12 @@ function extract(name) {
   return (page.slice(start-6,start)==='async '?'async ':'')+page.slice(start,end);
 }
 const flush=async()=>{for(let i=0;i<12;i++)await Promise.resolve();};
-function player(carousel=false,autoDecode=true) {
+function player(carousel=false,autoDecode=true,codes=2) {
   let nextID=0,now=0;const rafs=new Map(),requests=[],decodes=[],visible=[],liveURLs=new Set();
   function replacement(image){visible.push({image,at:now});}
   class FakeImage {
     constructor(){this.style={cssText:''};}
-    decode(){return autoDecode?Promise.resolve():new Promise(resolve=>decodes.push(resolve));}
+    decode(){return typeof autoDecode==='function'?autoDecode():(autoDecode?Promise.resolve():new Promise(resolve=>decodes.push(resolve)));}
     removeAttribute(){}
     replaceWith(image){replacement(image);}
   }
@@ -25,14 +25,15 @@ function player(carousel=false,autoDecode=true) {
       requests.push({url,signal:options.signal,resolve,reject});
       options.signal.addEventListener('abort',()=>reject(Object.assign(new Error('aborted'),{name:'AbortError'})));
     });},
-    tiles:[new FakeImage(),new FakeImage()],
+    tiles:Array.from({length:codes},()=>new FakeImage()),
   });
   vm.runInContext(`
-    let playbackRAF=null,playbackGeneration=0,playbackCells=[],cellCursor=0,presentedFrames=0;
+    const PREFETCH_DEPTH=3,PRESENTATION_TOLERANCE_MS=0.75;
+    let playbackRAF=null,playbackGeneration=0,playbackCells=[],playbackEpoch=null,presentedFrames=0;
     let running=true,paused=false,seqCursor=0,startTime=0;
-    let session={carousel:${carousel},codes:2,count:16,fps:30,dims:{cols:2,rows:1}};
+    let session={carousel:${carousel},codes:${codes},count:16,fps:30,dims:{cols:${codes},rows:1}};
     function sizeNote(){return ''}
-    ${['releaseFrame','releaseTiles','clearPlayback','showFrame','startDecimenLoop','startPlayback','prefetchFrame','playbackTick','togglePause'].map(extract).join('\n')}
+    ${['releaseFrame','releaseTiles','clearPlayback','showFrame','startDecimenLoop','startPlayback','fillPrefetch','prefetchFrame','playbackTick','togglePause'].map(extract).join('\n')}
     startPlayback();
   `,context);
   return {context,rafs,requests,decodes,visible,liveURLs,
@@ -47,14 +48,14 @@ async function tests() {
     for(let i=0;i<100;i++) {
       vm.runInContext('togglePause()',p.context);assert.equal(p.rafs.size,0);
       vm.runInContext('togglePause()',p.context);assert.equal(p.rafs.size,1);
-      assert.equal(p.requests.filter(r=>!r.signal.aborted).length,2,'unbounded fetches');
+      assert.equal(p.requests.filter(r=>!r.signal.aborted).length,6,'unbounded fetches');
     }
     p.clear();await flush();assert.equal(p.liveURLs.size,0);
   }
   {
     const p=player(false,false);
     for(let t=0;t<100;t++)p.tick(t);
-    assert.equal(p.requests.length,2,'slow fetch accumulated requests');assert.equal(p.visible.length,0);
+    assert.equal(p.requests.length,6,'slow fetch accumulated requests');assert.equal(p.visible.length,0);
     p.ready(0);await flush();p.tick(101);assert.equal(p.visible.length,0,'undecoded image presented');
     p.decodes[0]();await flush();p.tick(102);assert.equal(p.visible.length,1);
     p.ready(2);await flush();p.decodes[1]();await flush();
@@ -63,7 +64,7 @@ async function tests() {
   }
   {
     const p=player(true);p.ready(0);p.ready(1);await flush();p.tick(100);
-    assert.equal(p.visible.length,1,'carousel flipped multiple cells in one refresh');
+    assert.equal(p.visible.length,1,'carousel phase start changed');
     p.tick(117);assert.equal(p.visible.length,2,'carousel cell starved');p.clear();await flush();
   }
   {
@@ -72,8 +73,8 @@ async function tests() {
   }
   {
     const p=player();p.requests[0].resolve({ok:false,status:500});await flush();
-    p.tick(100);assert.equal(p.requests.length,2,'error caused a retry storm');
-    p.tick(251);assert.equal(p.requests.length,3);assert.equal(p.visible.length,0);p.clear();await flush();
+    p.tick(100);assert.equal(p.requests.length,6,'error caused a retry storm');
+    p.tick(251);assert.equal(p.requests.length,7);assert.equal(p.visible.length,0);p.clear();await flush();
   }
   const pending=new Map();let builds=0;
   const context=vm.createContext({pending,performance:{now:()=>1000},pauseBtn:{},overlay:{classList:{add(){}}},
@@ -90,4 +91,5 @@ async function tests() {
   assert.equal(vm.runInContext('session.id',context),'new');assert.equal(builds,1);
   console.log('PASS: bounded loading, decode-before-present, exposure, fair carousel, cancellation, retries, pause/resume, stale responses');
 }
-tests().catch(error=>{console.error(error);process.exitCode=1;});
+module.exports={player,flush};
+if(require.main===module)tests().catch(error=>{console.error(error);process.exitCode=1;});

@@ -325,7 +325,7 @@ func (d *LTDecoder) xorInto(dst, src []uint32) {
 // AddFrame feeds one decoded frame payload. Returns true when the transfer
 // just completed.
 func (d *LTDecoder) AddFrame(seq uint32, block []byte) bool {
-	if len(block) != d.BlockLen || d.IsComplete() || len(d.seen) >= 4*d.K+256 {
+	if len(block) != d.BlockLen || d.IsComplete() {
 		return false
 	}
 	if _, dup := d.seen[seq]; dup {

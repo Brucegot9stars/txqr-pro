@@ -4,9 +4,52 @@ import (
 	"bytes"
 	"image"
 	"image/color"
+	"image/draw"
+	"math/rand"
 	"strings"
 	"testing"
+
+	"github.com/makiuchi-d/gozxing"
 )
+
+// imageOnly exercises the fallback for image implementations without SubImage.
+type imageOnly struct{ image.Image }
+
+func TestCaptureLuminanceMatchesLibrary(t *testing.T) {
+	canvas := image.NewRGBA(image.Rect(-13, 17, 89, 128))
+	rand.New(rand.NewSource(42)).Read(canvas.Pix)
+	// All alpha values, strided subimages and a nonzero origin must retain the
+	// library's luminance exactly, including fully transparent pixels.
+	for alpha := 0; alpha < 256; alpha++ {
+		canvas.Pix[alpha*4+3] = byte(alpha)
+	}
+	for _, img := range []image.Image{canvas, canvas.SubImage(image.Rect(-7, 18, 60, 91)), imageOnly{canvas}} {
+		want := gozxing.NewLuminanceSourceFromImage(img).GetMatrix()
+		got := luminanceSource(img).GetMatrix()
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%T: luminance conversion changed", img)
+		}
+	}
+}
+
+func TestMultiscaleNonzeroOriginAndGenericImage(t *testing.T) {
+	payload := "1/2048/4096|" + strings.Repeat("binary payload ", 30)
+	symbol, err := Encode(payload, 512, Medium)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canvas := image.NewRGBA(image.Rect(17, 29, 529, 541))
+	draw.Draw(canvas, canvas.Bounds(), symbol, symbol.Bounds().Min, draw.Src)
+	for _, img := range []image.Image{canvas, imageOnly{canvas}} {
+		raw, err, _ := DecodeRawMultiScaleVerbose(img, []float64{1, .6, 1.7})
+		if err != nil {
+			t.Fatalf("%T: %v", img, err)
+		}
+		if got := string(ExtractFramePayload(raw)); got != payload {
+			t.Fatalf("%T: decoded payload changed", img)
+		}
+	}
+}
 
 // TestVerboseDecodeMatchesPlainAndExplains attempts to pin both halves of the
 // contract: the verbose variant must return exactly what the plain one does

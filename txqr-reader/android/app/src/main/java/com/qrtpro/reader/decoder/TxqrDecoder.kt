@@ -3,7 +3,7 @@ package com.qrtpro.reader.decoder
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 
-class TxqrDecoder(private val memoryBudget: Long = decoderWorkingBudget()) {
+class TxqrDecoder {
     private var activeCodec: CodecType = CodecType.LT
     private var lubyCodec: LubyCodec? = null
     private var lubyDecoder: LubyDecoder? = null
@@ -36,73 +36,63 @@ class TxqrDecoder(private val memoryBudget: Long = decoderWorkingBudget()) {
 
     fun decodeFrame(frameBytes: ByteArray) {
         val frame = TransferFrame.parse(frameBytes) ?: return
-        try {
-            synchronized(lock) {
-                if (completed || lastError != null) return
-                if (manifest?.sameTransfer(frame) == false) return
-                if (frame.total.toLong() * 4 > memoryBudget) throw DecodeResourceLimit()
-                if (manifest == null) {
-                    manifest = frame
-                    totalSize = frame.total
-                    chunkLen = frame.chunkLen
-                    activeCodec = frame.codec
-                    numChunks = numberOfChunks(totalSize, chunkLen)
-                    neededBlocks = numChunks
-                }
-                if (frame.isName) {
-                    storedFileName = String(frame.payload, Charsets.UTF_8)
-                    return
-                }
-                if (frame.blockCode in seenBlockCodes) return
-                if (seenBlockCodes.size >= 4 * numChunks + 256) {
-                    lastError = "传输帧数超过资源上限，请重新扫描"
-                    return
-                }
-                if (lubyDecoder == null && binaryDecoder == null && raptorDecoder == null && raptorQDecoder == null && onlineDecoder == null) {
-                    when (activeCodec) {
-                        CodecType.LT -> lubyDecoder = LubyCodec(numChunks).newDecoder(totalSize)
-                        CodecType.BINARY -> binaryDecoder = BinaryCodec(numChunks).newDecoder(totalSize)
-                        CodecType.RAPTOR -> raptorDecoder = RaptorCodec(numChunks, 4).newDecoder(totalSize)
-                        CodecType.RAPTORQ -> raptorQDecoder = RaptorQCodec(chunkLen, totalSize).newDecoder(memoryBudget)
-                        CodecType.ONLINE -> onlineDecoder = OnlineCodec(numChunks, 0.01, 3, 42).newDecoder(totalSize)
-                    }
-                }
-                val now = System.nanoTime() / 1_000_000
-                if (startTime == 0L) startTime = now
-                if (lastChunkTime != 0L) readInterval = now - lastChunkTime
-                lastChunkTime = now
-                val block = listOf(LTBlock(frame.blockCode, frame.payload))
-                val ready = when (activeCodec) {
-                    CodecType.LT -> lubyDecoder!!.addBlocks(block)
-                    CodecType.BINARY -> binaryDecoder!!.addBlocks(block)
-                    CodecType.RAPTOR -> raptorDecoder!!.addBlocks(block)
-                    CodecType.RAPTORQ -> raptorQDecoder!!.addBlocks(block)
-                    CodecType.ONLINE -> onlineDecoder!!.addBlocks(block)
-                }
-                seenBlockCodes.add(frame.blockCode)
-                sourceBytesRead += frame.payload.size
-                recordSpeedSample(now)
-                if (!ready) return
-                if (raptorQDecoder?.estimatedDecodeBytes()?.let { it > memoryBudget } == true) throw DecodeResourceLimit()
-                val bytes = when (activeCodec) {
-                    CodecType.LT -> lubyDecoder!!.decode()
-                    CodecType.BINARY -> binaryDecoder!!.decode()
-                    CodecType.RAPTOR -> raptorDecoder!!.decode()
-                    CodecType.RAPTORQ -> raptorQDecoder!!.decode()
-                    CodecType.ONLINE -> onlineDecoder!!.decode()
-                } ?: return // RaptorQ may still be rank deficient; keep accepting symbols.
-                val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
-                    .joinToString("") { "%02x".format(it.toInt() and 0xff) }
-                if (bytes.size != totalSize || digest != manifest!!.sha256) {
-                    lastError = "SHA-256 校验失败，请重新扫描"
-                    return
-                }
-                recovered = bytes
-                completed = true
-                endTime = System.nanoTime() / 1_000_000
+        synchronized(lock) {
+            if (completed || lastError != null) return
+            if (manifest?.sameTransfer(frame) == false) return
+            if (manifest == null) {
+                manifest = frame
+                totalSize = frame.total
+                chunkLen = frame.chunkLen
+                activeCodec = frame.codec
+                numChunks = numberOfChunks(totalSize, chunkLen)
+                neededBlocks = numChunks
             }
-        } catch (e: DecodeResourceLimit) {
-            synchronized(lock) { lastError = e.message }
+            if (frame.isName) {
+                storedFileName = String(frame.payload, Charsets.UTF_8)
+                return
+            }
+            if (frame.blockCode in seenBlockCodes) return
+            if (lubyDecoder == null && binaryDecoder == null && raptorDecoder == null && raptorQDecoder == null && onlineDecoder == null) {
+                when (activeCodec) {
+                    CodecType.LT -> lubyDecoder = LubyCodec(numChunks).newDecoder(totalSize)
+                    CodecType.BINARY -> binaryDecoder = BinaryCodec(numChunks).newDecoder(totalSize)
+                    CodecType.RAPTOR -> raptorDecoder = RaptorCodec(numChunks, 4).newDecoder(totalSize)
+                    CodecType.RAPTORQ -> raptorQDecoder = RaptorQCodec(chunkLen, totalSize).newDecoder()
+                    CodecType.ONLINE -> onlineDecoder = OnlineCodec(numChunks, 0.01, 3, 42).newDecoder(totalSize)
+                }
+            }
+            val now = System.nanoTime() / 1_000_000
+            if (startTime == 0L) startTime = now
+            if (lastChunkTime != 0L) readInterval = now - lastChunkTime
+            lastChunkTime = now
+            val block = listOf(LTBlock(frame.blockCode, frame.payload))
+            val ready = when (activeCodec) {
+                CodecType.LT -> lubyDecoder!!.addBlocks(block)
+                CodecType.BINARY -> binaryDecoder!!.addBlocks(block)
+                CodecType.RAPTOR -> raptorDecoder!!.addBlocks(block)
+                CodecType.RAPTORQ -> raptorQDecoder!!.addBlocks(block)
+                CodecType.ONLINE -> onlineDecoder!!.addBlocks(block)
+            }
+            seenBlockCodes.add(frame.blockCode)
+            sourceBytesRead += frame.payload.size
+            recordSpeedSample(now)
+            if (!ready) return
+            val bytes = when (activeCodec) {
+                CodecType.LT -> lubyDecoder!!.decode()
+                CodecType.BINARY -> binaryDecoder!!.decode()
+                CodecType.RAPTOR -> raptorDecoder!!.decode()
+                CodecType.RAPTORQ -> raptorQDecoder!!.decode()
+                CodecType.ONLINE -> onlineDecoder!!.decode()
+            } ?: return // RaptorQ may still be rank deficient; keep accepting symbols.
+            val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
+                .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            if (bytes.size != totalSize || digest != manifest!!.sha256) {
+                lastError = "SHA-256 校验失败，请重新扫描"
+                return
+            }
+            recovered = bytes
+            completed = true
+            endTime = System.nanoTime() / 1_000_000
         }
     }
 

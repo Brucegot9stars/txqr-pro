@@ -208,7 +208,9 @@ gradlew.bat :app:assembleDebug --no-daemon
 
 ## 版本
 
-当前版本：`v2.0.0`（见 Git tag）。Android 端 `versionCode=11` / `versionName=2.0.0`。
+当前版本：`v2.0.1`（见 Git tag）。Android 端 `versionCode=12` / `versionName=2.0.1`。
+
+v2.0.1 修复播放帧率回归，取消接收端内存估算/累计帧数拒绝，减少重复截图识别及裁剪复制。性能证据及限制见 [性能修复记录](docs/performance-v2.0.1.md)。
 
 v2.0.0 引入 QRT2 会话与完整性校验，修复已知 F01–F24，并加入受限编码 worker、后台接收及解码后呈现。**经典 QR / Color 收发两端必须同时更新**；不兼容旧经典帧，decimen 线格式保持不变。详见 [修复记录](docs/fix-results-20261029.md) 与 [协议及运行上限](docs/protocol-v2.md)。
 

@@ -218,7 +218,9 @@ let session = null;   // current encoded session, null if none
 let playbackRAF = null;
 let playbackGeneration = 0;
 let playbackCells = [];
-let cellCursor = 0;
+const PREFETCH_DEPTH = 3;
+const PRESENTATION_TOLERANCE_MS = 0.75;
+let playbackEpoch = null;
 let presentedFrames = 0;
 function releaseFrame(frame) {
   if (frame && frame.url) { URL.revokeObjectURL(frame.url); frame.url = null; }
@@ -233,13 +235,10 @@ function clearPlayback() {
   playbackGeneration++;
   if (playbackRAF !== null) cancelAnimationFrame(playbackRAF);
   playbackRAF = null;
-  for (const cell of playbackCells) {
-    if (cell.pending) {
-      cell.pending.controller.abort();
-      releaseFrame(cell.pending);
-      if (cell.pending.image) cell.pending.image.removeAttribute('src');
-    }
-    releaseFrame(cell.ready);
+  for (const cell of playbackCells) for (const slot of cell.slots) {
+    if (slot.controller) slot.controller.abort();
+    releaseFrame(slot);
+    if (slot.image) slot.image.removeAttribute('src');
   }
   playbackCells = [];
 }
@@ -251,8 +250,7 @@ let encodeAbort = null; // AbortController for the in-flight serialization
 let fileMD5 = '';     // MD5 of the currently selected file
 let startTime = 0;
 let tiles = [];
-let seqCursor = 0;    // carousel stream position (one seq per cell flip)
-  // per-cell next flip time for staggered phases
+let seqCursor = 0;    // next sequence reserved for prefetch
 
 function bytesFmt(n) {
   if (n >= 1048576) return (n / 1048576).toFixed(2) + ' MB';
@@ -483,9 +481,8 @@ async function start() {
   else showFrame();
 }
 
-// Both modes use decoded images and one presentation scheduler. No visible
-// <img> is pointed at an unfinished request, and at most one next image per
-// cell can be loading/ready. A slow fetch keeps the previous frame on screen.
+// Keep enough decoded images ahead to overlap network and Image.decode().
+// A single next image can miss a compositor turn and halve the displayed FPS.
 function showFrame() { startPlayback(); }
 function startDecimenLoop() { startPlayback(); }
 
@@ -493,77 +490,88 @@ function startPlayback() {
   clearPlayback();
   if (!running || paused || !session) return;
   const generation = playbackGeneration;
-  const now = performance.now();
+  playbackEpoch = null;
   const phase = session.carousel ? 1000 / session.fps / session.codes : 0;
-  cellCursor = 0;
-  playbackCells = tiles.map((_, index) => ({index, nextAt: now + index * phase,
-    pending: null, ready: null, retryAt: 0, failures: 0}));
-  for (const cell of playbackCells) prefetchFrame(cell, generation);
+  playbackCells = tiles.map((_, index) => ({index, phase: index * phase,
+    nextAt: null, slots: []}));
+  fillPrefetch(generation);
   playbackRAF = requestAnimationFrame(time => playbackTick(time, generation));
 }
 
-async function prefetchFrame(cell, generation) {
-  if (cell.pending || cell.ready || generation !== playbackGeneration) return;
-  const frameIndex = seqCursor++ % session.count;
-  const pending = {controller: new AbortController(), image: null, url: null};
-  cell.pending = pending;
+function fillPrefetch(generation) {
+  if (generation !== playbackGeneration) return;
+  // Allocate sequences by depth then cell, preserving the usual systematic
+  // sweep across a grid while requests are allowed to complete independently.
+  for (let depth = 0; depth < PREFETCH_DEPTH; depth++) for (const cell of playbackCells) {
+    if (cell.slots.length > depth) continue;
+    const slot = {frameIndex: seqCursor++ % session.count, image: null, url: null,
+      controller: null, loading: false, ready: false, retryAt: 0, failures: 0};
+    cell.slots.push(slot);
+    prefetchFrame(slot, generation);
+  }
+}
+
+async function prefetchFrame(slot, generation) {
+  if (slot.loading || slot.ready || generation !== playbackGeneration) return;
+  slot.loading = true;
+  slot.controller = new AbortController();
   try {
-    const response = await fetch('/frame/' + session.id + '/' + frameIndex,
-      {signal: pending.controller.signal, cache: 'no-store'});
+    const response = await fetch('/frame/' + session.id + '/' + slot.frameIndex,
+      {signal: slot.controller.signal, cache: 'no-store'});
     if (!response.ok) throw new Error('HTTP ' + response.status);
     const blob = await response.blob();
     if (generation !== playbackGeneration) return;
-    const image = new Image();
-    pending.image = image;
-    pending.url = URL.createObjectURL(blob);
-    image.src = pending.url;
-    await image.decode();
+    slot.image = new Image();
+    slot.url = URL.createObjectURL(blob);
+    slot.image.src = slot.url;
+    await slot.image.decode();
     if (generation !== playbackGeneration) return;
-    cell.ready = {image, url: pending.url, frameIndex};
-    pending.url = null; // ready now owns the URL
-    cell.failures = 0;
+    slot.ready = true;
+    slot.failures = 0;
   } catch (error) {
     if (generation === playbackGeneration && error.name !== 'AbortError') {
-      cell.failures++;
-      cell.retryAt = performance.now() + Math.min(3000, 250 * 2 ** Math.min(4, cell.failures - 1));
+      slot.failures++;
+      slot.retryAt = performance.now() + Math.min(3000, 250 * 2 ** Math.min(4, slot.failures - 1));
       statsEl.textContent = '取帧失败，正在重试：' + error.message;
     }
   } finally {
-    releaseFrame(pending);
-    if (cell.pending === pending) cell.pending = null;
+    if (!slot.ready || generation !== playbackGeneration) releaseFrame(slot);
+    slot.loading = false;
   }
 }
 
 function playbackTick(now, generation) {
   if (generation !== playbackGeneration || !running || paused || !session) return;
   playbackRAF = null;
-  const count = playbackCells.length;
+  if (playbackEpoch === null && playbackCells.some(cell => cell.slots[0]?.ready)) {
+    playbackEpoch = now;
+    for (const cell of playbackCells) cell.nextAt = now + cell.phase;
+  }
+  const interval = 1000 / session.fps;
   let changed = 0;
-  for (let step = 0; step < count; step++) {
-    const index = (cellCursor + step) % count;
-    const cell = playbackCells[index];
-    if (!cell.pending && !cell.ready && now >= cell.retryAt) prefetchFrame(cell, generation);
-    if (!cell.ready || now < cell.nextAt) continue;
-    const ready = cell.ready;
-    const previous = tiles[index];
+  for (const cell of playbackCells) {
+    for (const slot of cell.slots) if (!slot.loading && !slot.ready && now >= slot.retryAt) prefetchFrame(slot, generation);
+    const ready = cell.slots[0];
+    if (!ready?.ready || cell.nextAt === null || now + PRESENTATION_TOLERANCE_MS < cell.nextAt) continue;
+    const previous = tiles[cell.index];
     ready.image.alt = 'QR';
     ready.image.style.cssText = previous.style.cssText;
     ready.image.qrtURL = ready.url;
+    ready.url = null;
     previous.replaceWith(ready.image);
     if (previous.qrtURL) URL.revokeObjectURL(previous.qrtURL);
-    tiles[index] = ready.image;
-    cell.ready = null;
-    cell.nextAt = now + 1000 / session.fps;
+    tiles[cell.index] = ready.image;
+    cell.slots.shift();
+    // Advance the established timeline, rather than restarting the interval
+    // at a jittered RAF timestamp. This avoids 30->20 and 60->30 FPS rounding.
+    const intervals = Math.max(1, Math.floor((now + PRESENTATION_TOLERANCE_MS - cell.nextAt) / interval) + 1);
+    cell.nextAt += intervals * interval;
     presentedFrames++;
     changed++;
-    prefetchFrame(cell, generation);
-    if (session.carousel) {
-      // A refresh can show only one phase. Rotate fairly and never flip both
-      // carousel cells in the same refresh, even after a stall or slow load.
-      cellCursor = (index + 1) % count;
-      break;
-    }
+    // All cells due in this refresh can update. Serializing an N-cell grid
+    // into one flip per refresh imposes an unintended N-fold throughput cap.
   }
+  fillPrefetch(generation);
   if (changed) {
     const elapsed = Math.max(0.001, (performance.now() - startTime) / 1000);
     statsEl.textContent = '已显示 ' + presentedFrames + ' 帧'
