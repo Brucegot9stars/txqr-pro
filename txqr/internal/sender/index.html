@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>序列化工具</title>
+<title>QRT Pro 序列化工具</title>
 <style>
   * { box-sizing: border-box; }
   body { font-family: system-ui, -apple-system, sans-serif; background:#101014; color:#eee; margin:0; min-height:100vh; }
-  #controls { max-width:460px; margin:8vh auto; padding:24px; background:#1b1b22; border-radius:12px; }
+  #controls { max-width:460px; margin:24px auto; padding:24px; background:#1b1b22; border-radius:12px; }
   h1 { margin:0 0 4px; font-size:20px; }
   p.sub { margin:0 0 18px; font-size:13px; opacity:.6; }
   label { display:block; margin:14px 0 6px; font-size:13px; opacity:.8; }
@@ -19,6 +19,12 @@
   button { margin-top:22px; width:100%; padding:12px; font-size:16px; border:none; border-radius:8px; background:#2f81f7; color:#fff; cursor:pointer; }
   button:disabled { opacity:.5; cursor:default; }
   #status { margin-top:14px; font-size:13px; opacity:.7; min-height:18px; }
+  #version { font-size:12px; color:#9ab8e8; }
+  #limits { margin-top:16px; padding:12px; border:1px solid #3a3a44; border-radius:8px; font-size:12px; line-height:1.7; white-space:pre-line; }
+  #selection-error { margin-top:8px; color:#ffac9c; font-size:13px; white-space:pre-line; }
+  #sender-log { white-space:pre-wrap; overflow-wrap:anywhere; max-height:260px; overflow:auto; font-size:11px; }
+  #log-path { font-size:11px; overflow-wrap:anywhere; }
+  #refresh-logs { margin-top:8px; padding:6px; font-size:12px; }
 
   #overlay { display:none; position:fixed; inset:0; background:#000; z-index:10; }
   #overlay.active { display:block; }
@@ -57,6 +63,7 @@
 
 <div id="controls">
   <h1>序列化工具</h1>
+  <div id="version"></div>
   <p class="sub">选择文件，将其序列化为可视数据帧并全屏播放。</p>
 
   <label>文件</label>
@@ -65,11 +72,11 @@
   <div class="row">
     <div>
       <label>每帧字节数 split</label>
-      <input type="number" id="split" value="2048" min="10" step="10">
+      <input type="number" id="split" value="2048" min="1" step="1">
     </div>
     <div>
       <label>帧率 FPS</label>
-      <input type="number" id="fps" value="30" min="1" step="1">
+      <input type="number" id="fps" value="30" min="1" max="120" step="1">
     </div>
     <div>
       <label>网格 (N×N)</label>
@@ -106,8 +113,22 @@
     </div>
   </div>
 
+  <label>二维码准备方式</label>
+  <select id="prepareMode">
+    <option value="progressive">快速开始（首批缓冲，后续提前生成）</option>
+    <option value="all">先准备整轮（等待较长，播放时占用较低）</option>
+  </select>
+  <p style="font-size:12px;opacity:.7;">若机器生成速度跟不上播放，可选「先准备整轮」。两种方式均受缓存上限约束。</p>
+  <div id="limits" aria-live="polite"></div>
+  <div id="selection-error" role="alert"></div>
   <button id="start">序列化</button>
   <div id="status"></div>
+  <details id="logs-panel" style="margin-top:16px; font-size:12px;">
+    <summary>发送日志（错误与阶段耗时）</summary>
+    <button id="refresh-logs" type="button">刷新日志</button>
+    <div id="log-path"></div>
+    <pre id="sender-log">点击刷新查看日志。</pre>
+  </details>
 </div>
 
 <div id="overlay">
@@ -124,11 +145,13 @@
 </div>
 
 <script>
+const APP_CONFIG = /*APP_CONFIG*/ {};
 const fileInput = document.getElementById('file');
 const splitInput = document.getElementById('split');
 const fpsInput = document.getElementById('fps');
 const gridInput = document.getElementById('gridSize');
 const codecInput = document.getElementById('codec');
+const prepareInput = document.getElementById('prepareMode');
 const fitModeInput = document.getElementById('fitMode');
 const ppmInput = document.getElementById('ppmInput');
 const ppmWrap = document.getElementById('ppmWrap');
@@ -258,6 +281,100 @@ function bytesFmt(n) {
   return n + ' B';
 }
 
+function limitBytes(n) {
+  return (n / 1048576).toFixed(2) + ' MiB（' + n.toLocaleString() + ' 字节）';
+}
+
+// Mirrors the fixed QRT2 fields and the current sender's sequential symbol IDs.
+// Filename packets are <= 520 bytes, below either visual format's capacity.
+function dataFrameBytes(total, split, codec) {
+  const k = Math.ceil(total / split);
+  if (codec !== 'raptorq' && (k === 1 || (codec === 'raptor' && k < 4))) codec = 'lt';
+  const count = codec === 'raptorq' ? k + Math.floor(k * 1.05) : (k === 1 ? 1 : 2 * k);
+  const header = ['QRT2', '0'.repeat(32), '0'.repeat(64), count - 1, split, total, codec, 'data', '00000000'].join('/') + '|';
+  return header.length + (codec === 'raptorq' ? split : Math.ceil(total / k));
+}
+
+function usableSplitRange(total, codec, capacity, maximum) {
+  const minimum = Math.ceil(total / APP_CONFIG.maxSourceBlocks);
+  for (let split = maximum; split >= minimum; split--) {
+    if (dataFrameBytes(total, split, codec) <= capacity) return {minimum, maximum: split};
+  }
+  return {minimum, maximum: 0};
+}
+
+function transferPolicy(file) {
+  const c = APP_CONFIG;
+  const result = {error: '', maxFileBytes: 0, blocks: 0, frameBytes: 0, split: 0};
+  if (!c.maxSourceBlocks || !c.maxUploadBytes) {
+    result.error = '无法读取传输限制，请刷新页面。'; return result;
+  }
+  const decimen = decimenModeInput.checked, color = colorModeInput.checked && !decimen;
+  const inputSplit = Number(splitInput.value);
+  const split = decimen ? c.decimenBlockBytes : (color ? Math.min(inputSplit, c.colorSplitBytes) : inputSplit);
+  result.split = split;
+  if (!Number.isInteger(inputSplit) || inputSplit < 1 || (!decimen && !color && inputSplit > c.maxChunkBytes)) {
+    if (!decimen) { result.error = '分片必须是 1～' + c.maxChunkBytes + ' 的整数；普通 QR 还需为协议头留出容量。'; return result; }
+  }
+  result.maxFileBytes = decimen ? c.maxUploadBytes : Math.min(c.maxUploadBytes, c.maxSourceBlocks * split);
+  if (!file) return result;
+  if (!file.size || file.size > c.maxUploadBytes) {
+    result.error = '请选择非空文件，上传上限为 ' + limitBytes(c.maxUploadBytes) + '。'; return result;
+  }
+  if (decimen) return result;
+  result.blocks = Math.ceil(file.size / split);
+  result.frameBytes = dataFrameBytes(file.size, split, codecInput.value);
+  const capacity = color ? c.colorFrameBytes : c.qrFrameBytes;
+  result.range = usableSplitRange(file.size, codecInput.value, capacity, color ? c.colorSplitBytes : c.maxChunkBytes);
+  if (result.blocks > c.maxSourceBlocks) {
+    const possible = result.range.maximum > 0;
+    result.error = '文件需要 ' + result.blocks.toLocaleString() + ' 个源块，当前最多 ' + c.maxSourceBlocks.toLocaleString()
+      + ' 个；当前分片的文件上限为 ' + limitBytes(result.maxFileBytes) + '。\n'
+      + (possible ? '该文件的可用分片范围为 ' + result.range.minimum + '～' + result.range.maximum + ' 字节。'
+        : '该文件无法仅靠增大分片满足当前模式的限制，请压缩或分卷后分别传输。');
+  } else if (result.frameBytes > capacity) {
+    result.error = '当前数据帧约 ' + result.frameBytes + ' 字节（含协议头），超过 '
+      + (color ? 'Color' : 'QR ECC M') + ' 容量 ' + capacity + ' 字节。'
+      + (result.range.maximum ? '该文件的可用分片范围为 ' + result.range.minimum + '～' + result.range.maximum + ' 字节。'
+        : '该文件在当前模式没有可用分片范围，请压缩或分卷传输。');
+  }
+  return result;
+}
+
+function updateLimits() {
+  const c = APP_CONFIG, policy = transferPolicy(fileInput.files[0]);
+  document.getElementById('version').textContent = c.version ? 'QRT Pro v' + c.version : '版本未知';
+  if (c.version) document.title = 'QRT Pro v' + c.version + ' · 序列化工具';
+  let text = '传输限制\n';
+  if (c.maxSourceBlocks) {
+    text += '上传上限：' + limitBytes(c.maxUploadBytes) + '\n';
+    text += decimenModeInput.checked ? 'Decimen：每帧 ' + c.decimenBlockBytes + ' 字节，固定 60 FPS / 2 码。\n'
+      : '经典模式：源块最多 ' + c.maxSourceBlocks.toLocaleString() + ' 个；当前实际分片 ' + policy.split + ' 字节。\n'
+        + '当前分片的文件参数上限：' + limitBytes(policy.maxFileBytes) + '。\n'
+        + (colorModeInput.checked ? 'Color 每帧总容量 ' + c.colorFrameBytes + ' 字节，实际分片最多 ' + c.colorSplitBytes + ' 字节。\n'
+          : 'QR ECC M 每帧总容量 ' + c.qrFrameBytes + ' 字节，包含协议头，并非全都可用于分片。\n');
+    if (policy.frameBytes) text += '所选文件：' + policy.blocks.toLocaleString() + ' 个源块，数据帧约 ' + policy.frameBytes + ' 字节（含头）。\n';
+    if (policy.range) text += policy.range.maximum ? '该文件的可用分片范围：' + policy.range.minimum + '～' + policy.range.maximum + ' 字节。\n' : '该文件在当前模式没有可用分片范围。\n';
+    text += '资源上限：编码进程 ' + Math.round(c.workerMemoryBytes / 1048576) + ' MiB；单次图像缓存 '
+      + Math.round(c.pngCacheBytes / 1048576) + ' MiB；会话缓存合计 ' + Math.round(c.sessionCacheBytes / 1048576)
+      + ' MiB / ' + c.maxSessions + ' 个会话；编码最长 ' + c.encodeTimeoutSeconds / 60 + ' 分钟。\n'
+      + '参数上限不代表资源一定足够；实际显示帧率还受屏幕及远程桌面限制。';
+  } else text += policy.error;
+  document.getElementById('limits').textContent = text;
+  document.getElementById('selection-error').textContent = policy.error;
+  if (!encoding) startBtn.disabled = Boolean(policy.error);
+}
+
+async function refreshSenderLogs() {
+  try {
+    const response = await fetch('/logs', {cache:'no-store'});
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const data = await response.json();
+    document.getElementById('log-path').textContent = '日志文件：' + data.path + (data.writeError ? '\n文件写入失败，以下为内存日志：' + data.writeError : '');
+    document.getElementById('sender-log').textContent = data.lines.join('\n');
+  } catch (error) { document.getElementById('sender-log').textContent = '日志读取失败：' + error.message; }
+}
+
 // gridDims mirrors the reference: count of codes -> {cols, rows}.
 function gridDims(n) {
   const cols = Math.floor(Math.sqrt(n));
@@ -360,6 +477,7 @@ window.addEventListener('resize', () => {
 });
 
 function showFileInfo() {
+  updateLimits();
   const file = fileInput.files[0];
   if (!file) { statusEl.textContent = ''; return; }
   const ready = session ? '（已编码，可「继续序列化」）' : '';
@@ -367,28 +485,11 @@ function showFileInfo() {
   statusEl.textContent = file.name + '  ' + bytesFmt(file.size) + ready + md5;
 }
 
-// Compute the file's MD5 locally via the server so it can be shown the
-// moment a file is picked, long before any serialization starts.
-async function updateFileMD5() {
-  const file = fileInput.files[0];
-  fileMD5 = '';
-  showFileInfo();
-  if (!file) return;
-  try {
-    const resp = await fetch('/md5', { method: 'POST', body: await file.arrayBuffer() });
-    if (!resp.ok) return;
-    const data = await resp.json();
-    if (fileInput.files[0] === file) {
-      fileMD5 = data.md5 || '';
-      showFileInfo();
-    }
-  } catch (e) { /* network hiccup: leave MD5 empty */ }
-}
-
 async function encodeFile(generation) {
   const file = fileInput.files[0];
   if (!file) { statusEl.textContent = '请先选择文件'; return null; }
-  if (file.size === 0 || file.size > 64 * 1024 * 1024) { statusEl.textContent = '请选择非空且不超过 64 MiB 的文件'; return null; }
+  const policy = transferPolicy(file);
+  if (policy.error) { statusEl.textContent = policy.error; updateLimits(); return null; }
   const decimen = decimenModeInput.checked;
   // Decimen uses fixed reference parameters; only classic mode reads the knobs.
   const fps = decimen ? DECIMEN_FPS : Math.max(1, Math.min(120, parseFloat(fpsInput.value) || 30));
@@ -400,7 +501,7 @@ async function encodeFile(generation) {
   encoding = true;
   const controller = new AbortController();
   encodeAbort = controller;
-  statusEl.textContent = '编码中...（点击「取消序列化」可中止）';
+  statusEl.textContent = prepareInput.value === 'all' ? '编码并准备整轮二维码...（可取消）' : '编码并准备首批二维码...（可取消；其余帧会提前生成）';
   try {
     let url;
     if (decimen) {
@@ -420,6 +521,7 @@ async function encodeFile(generation) {
     } else if (fitModeInput.value === 'manual') {
       url += '&ppm=' + clampPPM(ppmInput.value);
     }
+    url += '&prepare=' + encodeURIComponent(prepareInput.value);
     const resp = await fetch(url, { method: 'POST', body: await file.arrayBuffer(), signal: controller.signal });
     if (!resp.ok) throw new Error(await resp.text());
     const data = await resp.json();
@@ -427,6 +529,7 @@ async function encodeFile(generation) {
       fetch('/cancel/' + data.id,{method:'DELETE'}).catch(() => {});
       return null;
     }
+    fileMD5 = data.md5 || '';
     statusEl.textContent = '编码完成：' + bytesFmt(file.size) + ' · MD5: ' + (data.md5 || '');
     return {
       id: data.id, count: data.count, total: data.total,
@@ -443,6 +546,8 @@ async function encodeFile(generation) {
       return null;
     }
     statusEl.textContent = '编码失败: ' + e.message;
+    document.getElementById('logs-panel').open = true;
+    refreshSenderLogs();
     return null;
   } finally {
     if (generation === encodeGeneration) {
@@ -450,6 +555,7 @@ async function encodeFile(generation) {
       encodeAbort = null;
       startBtn.disabled = false;
       startBtn.textContent = '序列化';
+      updateLimits();
     }
   }
 }
@@ -648,7 +754,8 @@ async function cancel() {
 fileInput.addEventListener('change', function () {
   // re-selected file: drop the old session so everything is fresh
   cancel();
-  updateFileMD5();
+  fileMD5 = '';
+  showFileInfo();
 });
 
 startBtn.addEventListener('click', function () {
@@ -658,12 +765,18 @@ startBtn.addEventListener('click', function () {
 pauseBtn.addEventListener('click', togglePause);
 stopBtn.addEventListener('click', stop);
 cancelBtn.addEventListener('click', cancel);
+document.getElementById('refresh-logs').addEventListener('click', refreshSenderLogs);
 document.addEventListener('keydown', function (e) {
   if (e.key === 'Escape') stop();
   else if (e.key === ' ') { e.preventDefault(); togglePause(); }
   else if (e.key === 's' || e.key === 'S') stop();
   else if (e.key === 'c' || e.key === 'C') cancel();
 });
+for (const control of [splitInput, codecInput, colorModeInput, decimenModeInput]) {
+  control.addEventListener('input', updateLimits);
+  control.addEventListener('change', updateLimits);
+}
+updateLimits();
 </script>
 
 </body>

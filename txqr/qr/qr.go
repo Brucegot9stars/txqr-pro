@@ -14,6 +14,9 @@ import (
 // RecoveryLevel represents QR encoding error detection/recovery capacity.
 type RecoveryLevel int
 
+// MaxMediumBytes is the QR V40-M byte-mode capacity, including packet headers.
+const MaxMediumBytes = 2331
+
 const (
 	// Low is Level L: 7% error recovery.
 	Low RecoveryLevel = iota
@@ -45,7 +48,7 @@ var eccMByteCapacity = [41]int{0,
 	14, 26, 42, 62, 84, 106, 122, 152, 180, 213,
 	251, 287, 331, 362, 412, 450, 504, 560, 624, 666,
 	711, 779, 857, 911, 997, 1059, 1125, 1190, 1264, 1370,
-	1452, 1538, 1628, 1722, 1809, 1911, 1989, 2099, 2213, 2331,
+	1452, 1538, 1628, 1722, 1809, 1911, 1989, 2099, 2213, MaxMediumBytes,
 }
 
 // ModulesForBytes reports how many modules a QR symbol holding n payload bytes

@@ -12,6 +12,8 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -30,6 +32,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.qrtpro.reader.ScannerUiState
 import com.qrtpro.reader.ScannerViewModel
 import com.qrtpro.reader.ScanState
+import com.qrtpro.reader.decoder.TransferFrame
 import java.util.concurrent.Executors
 
 @Composable
@@ -88,6 +91,8 @@ fun ScannerScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
+                VersionAndLimits(textColor = MaterialTheme.colorScheme.onBackground)
+                Spacer(modifier = Modifier.height(16.dp))
                 Text("Camera permission is required to scan QR codes")
                 Spacer(modifier = Modifier.height(16.dp))
                 Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
@@ -262,13 +267,7 @@ private fun TopBar(
             modifier = Modifier.fillMaxWidth().padding(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = "QRT Pro Reader",
-                modifier = Modifier.weight(1f),
-                textAlign = TextAlign.Center,
-                color = Color.White,
-                fontSize = 20.sp
-            )
+            VersionAndLimits(Modifier.weight(1f))
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("Color", color = Color.White, fontSize = 10.sp)
                 Switch(
@@ -304,6 +303,37 @@ private fun TopBar(
                 Text("重选", color = Color.White)
             }
         }
+    }
+}
+
+@Composable
+private fun VersionAndLimits(modifier: Modifier = Modifier, textColor: Color = Color.White) {
+    val context = LocalContext.current
+    val version = remember(context) {
+        context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "未知"
+    }
+    var showLimits by remember { mutableStateOf(false) }
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("QRT Pro Reader", color = textColor, fontSize = 16.sp)
+        TextButton(onClick = { showLimits = true }) {
+            Text("v$version · 限制", fontSize = 12.sp)
+        }
+    }
+    if (showLimits) {
+        AlertDialog(
+            onDismissRequest = { showLimits = false },
+            title = { Text("v$version · 传输限制") },
+            text = {
+                Text(
+                    "经典 QR / Color：原始文件最多 ${TransferFrame.MAX_TRANSFER_BYTES / (1024 * 1024)} MiB，源块最多 ${TransferFrame.MAX_SOURCE_BLOCKS} 个，协议分片最多 ${TransferFrame.MAX_CHUNK_BYTES} 字节。\n\n" +
+                        "实际文件参数上限还受源块数约束：2048 字节分片时最多 ${TransferFrame.MAX_SOURCE_BLOCKS * 2048 / (1024 * 1024)} MiB。\n\n" +
+                        "配套发送端的普通 QR 使用 ECC M，每帧总容量为 2331 字节，包含协议头；Color 的有效分片最多 1426 字节。不能把协议分片上限直接当作二维码可装的数据量。\n\n" +
+                        "Decimen 原始文件最多 64 MiB。参数合法仍受设备实际内存和画面识别条件影响；发送端还有编码内存、缓存和任务时限，详见其限制面板。",
+                    modifier = Modifier.verticalScroll(rememberScrollState())
+                )
+            },
+            confirmButton = { TextButton(onClick = { showLimits = false }) { Text("关闭") } }
+        )
     }
 }
 

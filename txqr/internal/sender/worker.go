@@ -23,6 +23,9 @@ import (
 const workerArg = "--qrt-private-encode-worker-v1"
 const workerMemoryBytes = 512 << 20
 const maxSessionBytes = 256 << 20
+const maxPNGCacheBytes = 128 << 20
+const maxActiveSessions = 4
+const encodeTimeout = 5 * time.Minute
 
 // The same executable provides the private worker. It runs before application
 // main (and before Windows UI initialization), and never starts a listener.
@@ -33,6 +36,7 @@ func init() {
 }
 
 type workerRequest struct {
+	RenderAll             bool
 	Mode                  string
 	Codec                 txqr.CodecType
 	Name, MediaType       string
@@ -48,6 +52,8 @@ type workerHeader struct {
 	Carousel                          bool
 	K, BlockLen                       int
 	SessionID                         uint16
+	Warmup                            int
+	EncodingMillis, WarmupMillis      int64
 }
 
 // Worker errors never publish a partially encoded or rendered session.
@@ -77,6 +83,7 @@ func workerMain() int {
 		return 2
 	}
 	var sess *session
+	encodingStart := time.Now()
 	size := frameSize{fit: req.Fit, ppm: req.PPM}
 	if req.Mode == "decimen" {
 		query := url.Values{"name": {req.Name}, "type": {req.MediaType}}
@@ -87,6 +94,9 @@ func workerMain() int {
 	} else {
 		err = errors.New("unsupported mode")
 	}
+	encodingMillis := time.Since(encodingStart).Milliseconds()
+	warmupStart := time.Now()
+	warmup := 0
 	if err == nil {
 		var frameBytes int64
 		for _, frame := range sess.frames {
@@ -94,14 +104,27 @@ func workerMain() int {
 		}
 		available := req.CacheBytes - frameBytes
 		if available <= 0 {
-			err = errors.New("session cache limit exceeded")
+			err = errors.New("编码数据超过当前剩余会话缓存，请取消旧会话或分卷后重试")
 		} else {
-			sess.renderBudget = min(128<<20, available)
-			renderFrames(sess, context.Background())
+			sess.renderBudget = min(maxPNGCacheBytes, available)
+			warmup = min(initialFrames, len(sess.frames))
+			if req.RenderAll {
+				warmup = len(sess.frames)
+			}
+			renderFrameCount(sess, context.Background(), warmup)
 			if sess.renderExceeded.Load() {
-				err = errors.New("render cache limit exceeded")
-			} else if renderFailed(sess) {
-				err = errors.New("QR render failed")
+				action := "请取消旧会话或分卷后重试"
+				if req.RenderAll {
+					action = "可改用「快速开始」，或取消旧会话后重试"
+				}
+				err = fmt.Errorf("二维码准备超过 %.2f MiB 图像缓存预算；%s", float64(sess.renderBudget)/(1<<20), action)
+			} else {
+				for _, png := range sess.pngs[:warmup] {
+					if png == nil {
+						err = errors.New("二维码准备失败，请查看发送日志")
+						break
+					}
+				}
 			}
 		}
 	}
@@ -112,7 +135,7 @@ func workerMain() int {
 		return 0
 	}
 	header := workerHeader{Count: len(sess.frames), Total: sess.total, Split: sess.split, Modules: sess.modules, PPM: sess.ppm,
-		Mode: sess.mode, Carousel: sess.carousel, K: sess.k, BlockLen: sess.blockLen, SessionID: sess.sessionID}
+		Mode: sess.mode, Carousel: sess.carousel, K: sess.k, BlockLen: sess.blockLen, SessionID: sess.sessionID, Warmup: warmup, EncodingMillis: encodingMillis, WarmupMillis: time.Since(warmupStart).Milliseconds()}
 	if json.NewEncoder(out).Encode(header) != nil {
 		return 2
 	}
@@ -145,7 +168,7 @@ func readWorkerLine(in *bufio.Reader) ([]byte, error) {
 // encodeIsolated gives uninterruptible third-party calls an OS cancellation
 // boundary. Killing and waiting for the child also releases all of its memory.
 func encodeIsolated(ctx context.Context, req workerRequest, body []byte, started func()) (*session, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, encodeTimeout)
 	defer cancel()
 	executable, err := os.Executable()
 	if err != nil {
@@ -215,10 +238,10 @@ func encodeIsolated(ctx context.Context, req workerRequest, body []byte, started
 		return nil, ctx.Err()
 	}
 	if err != nil {
-		return nil, fmt.Errorf("encode worker: %w", err)
+		return nil, &workerProcessError{fmt.Errorf("encode worker: %w", err), stderr.String()}
 	}
 	if waitErr != nil {
-		return nil, fmt.Errorf("encode worker stopped (memory limit or process failure): %w", waitErr)
+		return nil, &workerProcessError{fmt.Errorf("encode worker stopped (memory limit or process failure): %w", waitErr), stderr.String()}
 	}
 	return sess, nil
 }
@@ -239,15 +262,22 @@ func readWorkerSession(in *bufio.Reader, budget int64) (*session, error) {
 		h.Split <= 0 || h.Split > 2933 || h.Modules <= 0 || h.Modules > 185 || h.PPM < minPPM || h.PPM > maxPPM {
 		return nil, errors.New("invalid worker result")
 	}
+	if h.Warmup != min(initialFrames, h.Count) && h.Warmup != h.Count {
+		return nil, errors.New("invalid initial frame count")
+	}
 	s := &session{frames: make([][]byte, h.Count), pngs: make([][]byte, h.Count), total: h.Total, split: h.Split, modules: h.Modules,
-		ppm: h.PPM, mode: h.Mode, carousel: h.Carousel, k: h.K, blockLen: h.BlockLen, sessionID: h.SessionID, createdAt: time.Now()}
+		ppm: h.PPM, mode: h.Mode, carousel: h.Carousel, k: h.K, blockLen: h.BlockLen, sessionID: h.SessionID, createdAt: time.Now(), encodingMillis: h.EncodingMillis, warmupMillis: h.WarmupMillis}
+	s.preparedFrames = h.Warmup
 	for i := 0; i < h.Count; i++ {
-		for _, target := range []*[]byte{&s.frames[i], &s.pngs[i]} {
+		for kind, target := range []*[]byte{&s.frames[i], &s.pngs[i]} {
 			var length uint32
 			if err = binary.Read(in, binary.LittleEndian, &length); err != nil {
 				return nil, err
 			}
 			// Validate before allocating, including cumulative frame and PNG bytes.
+			if length == 0 && kind == 1 && i >= h.Warmup {
+				continue
+			}
 			if length == 0 || int64(length) > budget || length > 16<<20 {
 				return nil, errors.New("worker output exceeds cache budget")
 			}
@@ -266,6 +296,14 @@ func readWorkerSession(in *bufio.Reader, budget int64) (*session, error) {
 }
 
 type cappedErrorOutput struct{ bytes.Buffer }
+
+type workerProcessError struct {
+	err    error
+	stderr string
+}
+
+func (e *workerProcessError) Error() string { return e.err.Error() }
+func (e *workerProcessError) Unwrap() error { return e.err }
 
 func (b *cappedErrorOutput) Write(p []byte) (int, error) {
 	n := len(p)

@@ -41,8 +41,14 @@ const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
    } finally {fixtureActive--;}
  };
  </script>`;
- let html=fs.readFileSync(path.join(__dirname,'..','index.html'),'utf8').replace('<head>','<head>'+setup);
+ const config={version:'2.0.3',maxUploadBytes:64*1024*1024,maxSourceBlocks:8192,maxChunkBytes:2933,qrFrameBytes:2331,colorFrameBytes:1587,colorSplitBytes:1426,decimenBlockBytes:2933,workerMemoryBytes:512*1024*1024,pngCacheBytes:128*1024*1024,sessionCacheBytes:256*1024*1024,maxSessions:4,encodeTimeoutSeconds:300};
+ let html=fs.readFileSync(path.join(__dirname,'..','index.html'),'utf8').replace('/*APP_CONFIG*/ {}',JSON.stringify(config)).replace('<head>','<head>'+setup);
  await cdp('Page.setDocumentContent',{frameId:frameTree.frame.id,html},sessionId);
+ assert((await evaluate('document.getElementById("version").textContent')).includes('2.0.3'),'missing displayed version');
+ await evaluate(`fileInput.files=(()=>{const transfer=new DataTransfer();transfer.items.add(new File([new Uint8Array(25585664)],'large.bin'));return transfer.files})();fileInput.dispatchEvent(new Event('change'))`);
+ await sleep(50);
+ assert(await evaluate('startBtn.disabled && document.getElementById("selection-error").textContent.includes("无法仅靠增大分片")'),'24.4 MiB was not explained before encoding');
+ await evaluate('fileInput.value="";fileInput.dispatchEvent(new Event("change"))');await sleep(50);
  await evaluate(`
    new MutationObserver(records=>{for(const r of records)for(const n of r.addedNodes)if(n.tagName==='IMG'&&n.src.startsWith('blob:'))fixturePaints.push({time:performance.now(),width:n.naturalWidth,ready:n.complete})}).observe(gridEl,{childList:true});
    session={id:'fixture',count:16,codes:2,carousel:true,fps:60,dims:{cols:1,rows:2},modules:96,ppm:4,k:8};

@@ -17,6 +17,7 @@ import (
 	"github.com/divan/txqr/internal/scanner"
 	"github.com/divan/txqr/internal/sender"
 	"github.com/divan/txqr/internal/uikit"
+	"github.com/divan/txqr/internal/version"
 	"github.com/divan/txqr/internal/w32"
 )
 
@@ -168,7 +169,7 @@ func (a *app) createWindows() bool {
 	w32.RegisterClass(overlayClass, cb(a.overlayProc), w32.IDCCross)
 
 	style := uintptr(w32.WSOverlappedWindow|w32.WSVisible|w32.WSClipChildren) & ^uintptr(w32.WSMaximizeBox)
-	hwnd := w32.CreateWindow(mainClass, "QRT Pro · 光传输工具箱", style, 0,
+	hwnd := w32.CreateWindow(mainClass, "QRT Pro v"+version.Number+" · 光传输工具箱", style, 0,
 		w32.Scale(120), w32.Scale(80), w32.Scale(1080), w32.Scale(720), 0)
 	if hwnd == 0 {
 		w32.MessageBox(0, "创建主窗口失败", "QRT Pro", w32.MBIconError)
@@ -336,7 +337,7 @@ func (a *app) drawNav(r w32.Rect) {
 	u := a.theme.Unit
 	// Brand block
 	title := "QRT Pro"
-	sub := "收发一体·一步到位"
+	sub := "v" + version.Number + " · 光传输工具箱"
 	brandTop := r.T + a.px(22)
 	a.ui.Text(w32.Rect{L: r.L + u*4, T: brandTop, R: r.R - u*2, B: brandTop + a.px(26)}, title, uikit.FontTitle, a.theme.Text, uikit.AlignLeft)
 	a.ui.Text(w32.Rect{L: r.L + u*4, T: brandTop + a.px(28), R: r.R - u*2, B: brandTop + a.px(46)}, sub, uikit.FontCaption, a.theme.TextDim, uikit.AlignLeft)

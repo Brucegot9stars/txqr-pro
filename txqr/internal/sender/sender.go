@@ -60,17 +60,26 @@ const DefaultMaxUpload = txqr.MaxTransferBytes
 
 // session is one encoded transfer waiting to be played out frame by frame.
 type session struct {
-	frames         [][]byte
-	pngs           [][]byte
-	total          int
-	split          int    // effective payload bytes per frame, after any mode clamp
-	modules        int    // symbol modules per side, quiet zone included
-	ppm            int    // device pixels per module the frames were rendered at
-	mode           string // "qr", "color" or "decimen"
-	createdAt      time.Time
-	lastUsed       time.Time
-	renderBudget   int64
-	renderExceeded atomic.Bool
+	frames             [][]byte
+	pngs               [][]byte
+	total              int
+	split              int    // effective payload bytes per frame, after any mode clamp
+	modules            int    // symbol modules per side, quiet zone included
+	ppm                int    // device pixels per module the frames were rendered at
+	mode               string // "qr", "color" or "decimen"
+	createdAt          time.Time
+	lastUsed           time.Time
+	renderBudget       int64
+	renderExceeded     atomic.Bool
+	cacheReady         bool
+	rawBytes, pngBytes int64
+	pngOrder           []int
+	pngHead            int
+	pending            map[int]*frameRender
+	prefetchCancel     context.CancelFunc
+	prefetchContext    context.Context
+	prefetchJobs       chan int
+	prefetchQueued     map[int]bool
 
 	// decimen mode: fountain metadata echoed to the UI
 	carousel  bool
@@ -78,8 +87,11 @@ type session struct {
 	sessionID uint16
 	blockLen  int
 
-	name string
-	size int
+	name                         string
+	size                         int
+	encodingMillis, warmupMillis int64
+	preparedFrames               int
+	firstFrameReported           bool
 }
 
 // Event records one completed encode so the host UI can show recent transfers.
@@ -103,9 +115,10 @@ type Stats struct {
 
 // Server is the sender HTTP service. Zero value is unusable; use New.
 type Server struct {
-	mu       sync.Mutex
-	sessions map[string]*session
-	events   []Event
+	lifecycle sync.Mutex
+	mu        sync.Mutex
+	sessions  map[string]*session
+	events    []Event
 
 	transfers int
 	bytesSent int64
@@ -115,19 +128,27 @@ type Server struct {
 	mux      *http.ServeMux
 	// done belongs to the current run: Start replaces it, so a stop/start
 	// cycle never reuses (and re-closes) a channel that is already closed.
-	done       chan struct{}
-	maxUpload  int64
-	encodeSlot chan struct{}
+	done        chan struct{}
+	maxUpload   int64
+	encodeSlot  chan struct{}
+	renderSlots chan struct{}
+	prefetchWG  sync.WaitGroup
+	stopped     bool
+	diagnostics *senderDiagnostics
+	renderFn    func(string, []byte, int, int) []byte
 }
 
 // New builds a Server with no network activity.
 func New() *Server {
 	s := &Server{
-		sessions:   map[string]*session{},
-		done:       make(chan struct{}),
-		maxUpload:  DefaultMaxUpload,
-		encodeSlot: make(chan struct{}, 1),
+		sessions:    map[string]*session{},
+		done:        make(chan struct{}),
+		maxUpload:   DefaultMaxUpload,
+		encodeSlot:  make(chan struct{}, 1),
+		renderSlots: make(chan struct{}, 8),
 	}
+	s.diagnostics = newSenderDiagnostics()
+	s.note("info", "app.start", map[string]any{"initialFrames": initialFrames, "renderWorkers": cap(s.renderSlots)})
 	// Before the first Start nothing runs, so Done() must report that instead
 	// of blocking a caller that selects on it.
 	close(s.done)
@@ -137,6 +158,7 @@ func New() *Server {
 	s.mux.HandleFunc("/md5", s.handleMD5)
 	s.mux.HandleFunc("/frame/", s.handleFrame)
 	s.mux.HandleFunc("/cancel/", s.handleCancel)
+	s.mux.HandleFunc("/logs", s.handleLogs)
 	return s
 }
 
@@ -151,6 +173,8 @@ func (s *Server) SetMaxUpload(n int64) {
 // pick a free port; read Addr afterwards. Start is a no-op when already running.
 // Start may be called again after Close: every run gets its own done channel.
 func (s *Server) Start(addr string) error {
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
 	s.mu.Lock()
 	running := s.listener != nil
 	s.mu.Unlock()
@@ -170,6 +194,7 @@ func (s *Server) Start(addr string) error {
 	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
+		s.note("error", "server.start", map[string]any{"addr": addr, "error": err.Error()})
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
 
@@ -181,6 +206,7 @@ func (s *Server) Start(addr string) error {
 		return nil
 	}
 	s.listener = ln
+	s.stopped = false
 	s.srv = srv
 	s.done = done
 	s.mu.Unlock()
@@ -189,6 +215,7 @@ func (s *Server) Start(addr string) error {
 		defer close(done)
 		err := srv.Serve(ln)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.note("error", "server.serve", map[string]any{"error": err.Error()})
 			log.Printf("sender: serve stopped: %v", err)
 		}
 	}()
@@ -270,10 +297,19 @@ func (s *Server) LANURLs() []string {
 // a restart silently did nothing and the port stayed open while the UI claimed
 // the service had stopped.
 func (s *Server) Close() error {
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
 	s.mu.Lock()
+	s.stopped = true
+	for _, sess := range s.sessions {
+		if sess.prefetchCancel != nil {
+			sess.prefetchCancel()
+		}
+	}
 	srv, ln, done := s.srv, s.listener, s.done
 	s.srv, s.listener = nil, nil
 	s.mu.Unlock()
+	s.prefetchWG.Wait()
 	if srv == nil && ln == nil {
 		return nil // nothing running
 	}
@@ -372,6 +408,9 @@ func (s *Server) cleanup(done <-chan struct{}) {
 					last = v.createdAt
 				}
 				if time.Since(last) > 30*time.Minute {
+					if v.prefetchCancel != nil {
+						v.prefetchCancel()
+					}
 					delete(s.sessions, k)
 				}
 			}
@@ -389,10 +428,28 @@ func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
-	_, _ = w.Write(indexHTML)
+	config, err := json.Marshal(s.pageConfig())
+	if err != nil {
+		http.Error(w, "page configuration unavailable", http.StatusInternalServerError)
+		return
+	}
+	_, _ = w.Write(bytes.Replace(indexHTML, []byte("/*APP_CONFIG*/ {}"), config, 1))
 }
 
 func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	response := &encodeResponse{ResponseWriter: w}
+	w = response
+	defer func() {
+		fields := map[string]any{"mode": r.URL.Query().Get("mode"), "codec": r.URL.Query().Get("codec"), "split": r.URL.Query().Get("split"), "inputBytes": r.ContentLength, "elapsedMs": time.Since(start).Milliseconds(), "status": response.status}
+		if r.Context().Err() != nil {
+			fields["error"] = r.Context().Err().Error()
+			s.note("info", "encode.cancel", fields)
+		} else if response.status >= 400 {
+			fields["error"] = response.message.String()
+			s.note("error", "encode.error", fields)
+		}
+	}()
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
@@ -406,18 +463,10 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	sessionsFull := len(s.sessions) >= 4
-	var retained int64
-	for _, existing := range s.sessions {
-		for _, f := range existing.frames {
-			retained += int64(len(f))
-		}
-		for _, p := range existing.pngs {
-			retained += int64(len(p))
-		}
-	}
+	sessionsFull := len(s.sessions) >= maxActiveSessions
+	retained := s.retainedLocked()
 	s.mu.Unlock()
-	if sessionsFull || retained >= 256<<20 {
+	if sessionsFull || retained >= maxSessionBytes {
 		http.Error(w, "cancel an existing transfer before encoding another", http.StatusTooManyRequests)
 		return
 	}
@@ -461,6 +510,11 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	codecTag := r.URL.Query().Get("codec")
+	prepare := r.URL.Query().Get("prepare")
+	if prepare != "" && prepare != "progressive" && prepare != "all" {
+		http.Error(w, "无效的二维码准备方式", http.StatusBadRequest)
+		return
+	}
 	codec := txqr.ParseCodec(codecTag)
 	if codecTag != "" && codecTag != "lt" && string(codec) != codecTag {
 		http.Error(w, "invalid codec", http.StatusBadRequest)
@@ -475,14 +529,26 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "empty request body", http.StatusBadRequest)
 		return
 	}
+	if mode != "decimen" {
+		if err := validateClassicRequest(len(body), split, mode, codec, r.URL.Query().Get("name")); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 
 	sum := md5.Sum(body)
+	s.note("info", "encode.start", map[string]any{"bytes": len(body), "mode": mode, "codec": codec, "split": split, "uploadMs": time.Since(start).Milliseconds()})
 
 	sess, err := encodeIsolated(r.Context(), workerRequest{
-		Mode: mode, Codec: codec, Name: r.URL.Query().Get("name"), MediaType: r.URL.Query().Get("type"),
+		RenderAll: prepare == "all",
+		Mode:      mode, Codec: codec, Name: r.URL.Query().Get("name"), MediaType: r.URL.Query().Get("type"),
 		Split: split, Fit: size.fit, PPM: size.ppm, Size: len(body), MemoryBytes: workerMemoryBytes, CacheBytes: maxSessionBytes - retained,
 	}, body, nil)
 	if err != nil {
+		var processError *workerProcessError
+		if errors.As(err, &processError) && processError.stderr != "" {
+			s.note("error", "worker.stderr", map[string]any{"error": err.Error(), "stderr": processError.stderr})
+		}
 		if r.Context().Err() != nil {
 			return
 		}
@@ -498,10 +564,16 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 
 	id := newID()
 	s.mu.Lock()
+	if err := s.admitLocked(sess); err != nil {
+		s.mu.Unlock()
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
+		return
+	}
 	s.sessions[id] = sess
 	s.transfers++
 	s.bytesSent += int64(len(body))
 	s.mu.Unlock()
+	s.note("info", "encode.ready", map[string]any{"session": id, "frames": len(sess.frames), "initialFrames": sess.preparedFrames, "encodingMs": sess.encodingMillis, "warmupMs": sess.warmupMillis, "totalMs": time.Since(start).Milliseconds()})
 	s.recordEvent(Event{
 		Time:   time.Now(),
 		Name:   truncateName(sess.name, 96),
@@ -512,10 +584,11 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 	})
 
 	resp := map[string]any{
-		"id":    id,
-		"count": len(sess.frames),
-		"total": sess.total,
-		"md5":   hex.EncodeToString(sum[:]),
+		"prepared": sess.preparedFrames,
+		"id":       id,
+		"count":    len(sess.frames),
+		"total":    sess.total,
+		"md5":      hex.EncodeToString(sum[:]),
 		// Echo the payload size actually used: a mode clamp can make it
 		// smaller than what the client asked for.
 		"split": sess.split,
@@ -593,6 +666,13 @@ func encodeClassic(body []byte, split int, mode string, codec txqr.CodecType, si
 }
 
 func encodeClassicContext(ctx context.Context, body []byte, split int, mode string, codec txqr.CodecType, size frameSize, names ...string) (*session, error) {
+	name := ""
+	if len(names) > 0 {
+		name = names[0]
+	}
+	if err := validateClassicRequest(len(body), split, mode, codec, name); err != nil {
+		return nil, err
+	}
 	str := string(body)
 	encoder := txqr.NewEncoder(split, codec)
 	if len(names) > 0 {
@@ -760,46 +840,38 @@ func (s *Server) handleFrame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	sess, ok := s.sessions[id]
-	var pngBytes []byte
-	badIndex := false
-	switch {
-	case !ok:
-	case idx < 0 || idx >= len(sess.frames):
-		// Index bound to the frame slice; pngs has identical length. Answering
-		// 400 here keeps "no such frame" distinct from "frame failed to render".
-		badIndex = true
-	case sess.pngs[idx] == nil:
-		sess.lastUsed = time.Now()
-		pngBytes = renderByMode(sess.mode, sess.frames[idx], sess.ppm, sess.modules)
-		if pngBytes != nil {
-			sess.pngs[idx] = pngBytes
+	pngBytes, err := s.framePNG(r.Context(), id, idx)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, errMissingSession) {
+			status = http.StatusNotFound
+		} else if errors.Is(err, errFrameIndex) {
+			status = http.StatusBadRequest
 		}
-	default:
-		sess.lastUsed = time.Now()
-		pngBytes = sess.pngs[idx]
-	}
-	s.mu.Unlock()
-
-	if !ok {
-		http.Error(w, "session not found", http.StatusNotFound)
+		if !errors.Is(err, context.Canceled) {
+			s.note("error", "frame.request", map[string]any{"session": id, "frame": idx, "status": status, "error": err.Error()})
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
-	if badIndex {
-		http.Error(w, "bad index", http.StatusBadRequest)
-		return
-	}
-	if pngBytes == nil {
-		// The old handler answered 200 with an empty body here, which the
-		// player silently rendered as a blank frame and then hung waiting for
-		// the next one. Failing loudly lets the UI retry or stop.
-		http.Error(w, "frame render failed", http.StatusInternalServerError)
-		return
-	}
+	s.prefetch(id, idx)
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write(pngBytes)
+	_, writeErr := w.Write(pngBytes)
+	if writeErr != nil {
+		s.note("error", "frame.response", map[string]any{"session": id, "frame": idx, "error": writeErr.Error()})
+		return
+	}
+	s.mu.Lock()
+	sess := s.sessions[id]
+	first := sess != nil && !sess.firstFrameReported
+	if first {
+		sess.firstFrameReported = true
+	}
+	s.mu.Unlock()
+	if first {
+		s.note("info", "frame.first", map[string]any{"session": id, "frame": idx, "pngBytes": len(pngBytes), "sinceSessionMs": time.Since(sess.createdAt).Milliseconds()})
+	}
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
@@ -813,6 +885,9 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
+	if sess := s.sessions[id]; sess != nil && sess.prefetchCancel != nil {
+		sess.prefetchCancel()
+	}
 	delete(s.sessions, id)
 	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
@@ -926,7 +1001,8 @@ func renderColorPNG(frame []byte, ppm int) []byte {
 
 func encodePNG(img image.Image) []byte {
 	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
+	encoder := png.Encoder{CompressionLevel: png.BestSpeed}
+	if err := encoder.Encode(&buf, img); err != nil {
 		log.Printf("PNG encode error: %v", err)
 		return nil
 	}
@@ -935,8 +1011,9 @@ func encodePNG(img image.Image) []byte {
 
 // renderFrames pre-renders every frame across available CPUs, stopping early
 // when the request is cancelled so an aborted upload doesn't burn the pool.
-func renderFrames(s *session, ctx context.Context) {
-	n := len(s.frames)
+func renderFrames(s *session, ctx context.Context) { renderFrameCount(s, ctx, len(s.frames)) }
+
+func renderFrameCount(s *session, ctx context.Context, n int) {
 	if n == 0 {
 		return
 	}

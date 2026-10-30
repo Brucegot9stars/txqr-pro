@@ -57,7 +57,7 @@ func validateParameters(total, chunk int, ct CodecType) error {
 	}
 	k := numberOfChunks(total, chunk)
 	if k > MaxSourceBlocks || (ct == CodecRaptor && k < 4) {
-		return errors.New("unsupported number of source blocks")
+		return fmt.Errorf("源块数 %d 不受支持，当前最多 %d 个；分片 %d 字节时文件上限 %.2f MiB（%d 字节）", k, MaxSourceBlocks, chunk, float64(min(MaxTransferBytes, MaxSourceBlocks*chunk))/(1<<20), min(MaxTransferBytes, MaxSourceBlocks*chunk))
 	}
 	return nil
 }

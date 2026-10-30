@@ -355,24 +355,24 @@ func (q *QRCode) Image(size int) image.Image {
 	p := color.Palette([]color.Color{q.BackgroundColor, q.ForegroundColor})
 	img := image.NewPaletted(rect, p)
 
-	for i := 0; i < size; i++ {
-		for j := 0; j < size; j++ {
-			img.Set(i, j, q.BackgroundColor)
-		}
-	}
-
+	// NewPaletted initializes every pixel to index 0, the background. Resolve
+	// the foreground index once; this also preserves identical-color palettes.
+	foreground := uint8(p.Index(q.ForegroundColor))
 	bitmap := q.symbol.bitmap()
-	for y, row := range bitmap {
-		for x, v := range row {
-			if v {
-				startX := x*pixelsPerModule + offset
-				startY := y*pixelsPerModule + offset
-				for i := startX; i < startX+pixelsPerModule; i++ {
-					for j := startY; j < startY+pixelsPerModule; j++ {
-						img.Set(i, j, q.ForegroundColor)
-					}
+	for y, modules := range bitmap {
+		startY := y*pixelsPerModule + offset
+		start := startY*img.Stride + offset
+		row := img.Pix[start : start+realSize*pixelsPerModule]
+		for x, black := range modules {
+			if black {
+				for pixel := x * pixelsPerModule; pixel < (x+1)*pixelsPerModule; pixel++ {
+					row[pixel] = foreground
 				}
 			}
+		}
+		for dy := 1; dy < pixelsPerModule; dy++ {
+			dest := (startY+dy)*img.Stride + offset
+			copy(img.Pix[dest:dest+len(row)], row)
 		}
 	}
 

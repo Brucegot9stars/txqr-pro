@@ -202,6 +202,48 @@ func (e *Encoder) withNameFrame(frames []string, total int, ct CodecType) []stri
 	return append([]string{e.nameFrame(total, ct)}, frames...)
 }
 
+// MaxFrameSize estimates the longest packet without running a fountain solver.
+// It uses the same framing and filename handling as Encode. Raptor may later
+// fall back to LT, whose shorter codec name cannot make the estimate too small.
+func (e *Encoder) MaxFrameSize(total int) (int, error) {
+	if !validCodec(e.codec) {
+		return 0, fmt.Errorf("invalid codec")
+	}
+	ct := e.codec
+	k := 0
+	if e.chunkLen > 0 {
+		k = numberOfChunks(total, e.chunkLen)
+	}
+	if ct != CodecRaptorQ && (k == 1 || (ct == CodecRaptor && k < 4)) {
+		ct = CodecLT
+	}
+	if err := validateParameters(total, e.chunkLen, ct); err != nil {
+		return 0, err
+	}
+	if math.IsNaN(e.redundancyFactor) || math.IsInf(e.redundancyFactor, 0) || e.redundancyFactor < 1 || e.redundancyFactor > 4 {
+		return 0, fmt.Errorf("invalid encoding redundancy")
+	}
+	count := int(float64(k) * e.redundancyFactor)
+	if ct == CodecRaptorQ {
+		count = k + int(float64(k)*1.05)
+	} else if k == 1 {
+		count = 1
+	}
+	size := e.chunkLen
+	if ct != CodecRaptorQ {
+		size = numberOfChunks(total, k)
+	}
+	copy := *e
+	copy.sessionID = strings.Repeat("0", 32)
+	longest := len(copy.frame(int64(count-1), total, make([]byte, size), codecName(ct)))
+	if e.fileName != "" {
+		if n := len(copy.nameFrame(total, ct)); n > longest {
+			longest = n
+		}
+	}
+	return longest, nil
+}
+
 func (e *Encoder) createGofountainCodec(numChunks int, ct CodecType) fountain.Codec {
 	switch ct {
 	case CodecBinary:

@@ -96,6 +96,7 @@ jobs:
         run: |
           node internal/sender/testdata/playback.test.cjs
           node internal/sender/testdata/throughput.test.cjs
+          node internal/sender/testdata/limits.test.cjs
 
   android:
     runs-on: ubuntu-latest

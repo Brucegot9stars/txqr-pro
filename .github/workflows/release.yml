@@ -15,6 +15,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify displayed release versions
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          go_version = re.search(r'const Number = "([^"]+)"', Path('txqr/internal/version/version.go').read_text()).group(1)
+          android_version = re.search(r'versionName\s*=\s*"([^"]+)"', Path('txqr-reader/android/app/build.gradle.kts').read_text()).group(1)
+          expected = os.environ['GITHUB_REF_NAME'].removeprefix('v')
+          assert go_version == android_version == expected, (go_version, android_version, expected)
+          PY
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:

@@ -58,7 +58,7 @@ func TestCancelLiveWorkerKillsLibraryCall(t *testing.T) {
 
 func TestWorkerOutputLengthValidatedBeforeAllocation(t *testing.T) {
 	var out bytes.Buffer
-	json.NewEncoder(&out).Encode(workerHeader{Count: 1, Total: 1, Split: 1, Modules: 29, PPM: 4})
+	json.NewEncoder(&out).Encode(workerHeader{Count: 1, Total: 1, Split: 1, Modules: 29, PPM: 4, Warmup: 1})
 	binary.Write(&out, binary.LittleEndian, uint32(1<<30))
 	if _, err := readWorkerSession(bufio.NewReader(&out), 1<<20); err == nil {
 		t.Fatal("unbounded worker allocation")

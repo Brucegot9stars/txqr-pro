@@ -5,10 +5,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/divan/txqr"
 	"github.com/divan/txqr/internal/scanner"
 	"github.com/divan/txqr/internal/sender"
 	"github.com/divan/txqr/internal/uikit"
 	"github.com/divan/txqr/internal/w32"
+	"github.com/divan/txqr/qr"
 )
 
 // ---------------------------------------------------------------- sender view
@@ -33,7 +35,18 @@ func (a *app) drawSenderView(r w32.Rect) {
 		}
 	}
 
-	listTop := row.B + u*4
+	limitsTop := row.B + u*3
+	limitsBox := w32.Rect{L: body.L, T: limitsTop, R: body.R, B: limitsTop + a.px(64)}
+	a.ui.Panel(limitsBox)
+	lines := []string{
+		fmt.Sprintf("经典模式最多 %d 源块；2048B 分片时最多 %d MiB。", txqr.MaxSourceBlocks, txqr.MaxSourceBlocks*2048/(1<<20)),
+		fmt.Sprintf("QR ECC M 每帧最多 %dB（含头）；容量及资源限制详见发送网页。", qr.MaxMediumBytes),
+	}
+	for i, line := range lines {
+		textR := w32.Rect{L: limitsBox.L + u*3, T: limitsBox.T + u*2 + int32(i)*a.px(22), R: limitsBox.R - u*3, B: limitsBox.T + u*2 + int32(i+1)*a.px(22)}
+		a.ui.Text(textR, a.ui.Ellipsize(line, uikit.FontCaption, textR.W()), uikit.FontCaption, a.theme.TextDim, uikit.AlignLeft)
+	}
+	listTop := limitsBox.B + u*3
 	list := w32.Rect{L: body.L, T: listTop, R: body.R, B: body.B}
 	a.drawSenderHistory(list)
 }
@@ -538,7 +551,7 @@ func (a *app) statusPill(s scanner.Snapshot) (string, w32.Color) {
 func (a *app) drawDiagView(r w32.Rect) {
 	u := a.theme.Unit
 	body, _ := a.headerArea(r, "诊断日志",
-		"逐条记录解码失败、帧头异常与停滞；传不动时先看这里，再看区域行上的提示")
+		"本页为接收日志；发送错误与编码耗时请在发送网页的「发送日志」中查看")
 
 	path := a.scan.AuditPath()
 	fileErr := a.scan.AuditFileError()
