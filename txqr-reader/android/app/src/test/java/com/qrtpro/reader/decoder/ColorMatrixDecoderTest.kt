@@ -3,7 +3,6 @@ package com.qrtpro.reader.decoder
 import org.junit.Assert.assertArrayEquals
 import org.junit.Before
 import org.junit.Test
-import javax.imageio.ImageIO
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 
@@ -16,13 +15,10 @@ class ColorMatrixDecoderTest {
 
     @Before
     fun setup() {
-        val image=ImageIO.read(requireNotNull(javaClass.getResourceAsStream("/regression/color.png")))
-        width=image.width; height=image.height
-        rgba=ByteArray(width*height*4)
-        for(y in 0 until height) for(x in 0 until width) {
-            val rgb=image.getRGB(x,y); val at=(y*width+x)*4
-            rgba[at]=(rgb shr 16).toByte(); rgba[at+1]=(rgb shr 8).toByte(); rgba[at+2]=rgb.toByte(); rgba[at+3]=(-1).toByte()
-        }
+        width = ColorMatrixDecoder.MATRIX_SIZE
+        height = ColorMatrixDecoder.MATRIX_SIZE
+        rgba = requireNotNull(javaClass.getResourceAsStream("/regression/color.rgba")).use { it.readBytes() }
+        assertEquals(width * height * 4, rgba.size)
         payload=requireNotNull(javaClass.getResourceAsStream("/regression/color-payload.bin")).use{it.readBytes()}
     }
 

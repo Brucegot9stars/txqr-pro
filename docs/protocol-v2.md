@@ -50,7 +50,7 @@ Android 由一个后台处理器顺序接收帧批次，只保留一个最新的
 
 ## 共享向量
 
-`txqr/cmd/goldengen` 生成五种 codec 的帧、K=1536 Online 错误恢复反例、K=8192 索引指纹、RaptorQ 欠秩反例、非整除分片和 Color PNG fixture。接收端 JVM 测试从仓库 resources 读取，不依赖临时目录文件。
+`txqr/cmd/goldengen` 生成五种 codec 的帧、K=1536 Online 错误恢复反例、K=8192 索引指纹、RaptorQ 欠秩反例、非整除分片和 Color RGBA/PNG fixture。接收端 JVM 测试从仓库 resources 读取，不依赖临时目录文件。
 
 ```
 cd txqr

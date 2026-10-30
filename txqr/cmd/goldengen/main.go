@@ -129,6 +129,21 @@ func regressions(dir string) {
 		panic(err)
 	}
 	write("color-payload.bin", []byte(f[0]))
+	// One RGBA pixel per module keeps Android JVM tests independent of
+	// desktop-only javax.imageio/ java.awt APIs.
+	small, err := qr.ColorMatrixEncode([]byte(f[0]), qr.ColorMatrixSize)
+	if err != nil {
+		panic(err)
+	}
+	rgba := make([]byte, 0, qr.ColorMatrixSize*qr.ColorMatrixSize*4)
+	for y := 0; y < qr.ColorMatrixSize; y++ {
+		for x := 0; x < qr.ColorMatrixSize; x++ {
+			red, green, blue, alpha := small.At(x, y).RGBA()
+			rgba = append(rgba, byte(red>>8), byte(green>>8), byte(blue>>8), byte(alpha>>8))
+		}
+	}
+	write("color.rgba", rgba)
+
 	img, err := qr.ColorMatrixEncode([]byte(f[0]), qr.ColorMatrixSize*4)
 	if err != nil {
 		panic(err)
