@@ -2,7 +2,6 @@ package com.qrtpro.reader
 
 import android.app.Application
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.util.Log
@@ -13,8 +12,13 @@ import com.google.mlkit.vision.barcode.BarcodeScanner
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import com.qrtpro.reader.decoder.ReceiveSession
+import com.qrtpro.reader.decoder.ReceiveUpdate
+import com.qrtpro.reader.decoder.LatestFrameProcessor
+import com.qrtpro.reader.decoder.moduleToPixelAffine
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.qrtpro.reader.decoder.TxqrDecoder
-import com.qrtpro.reader.decoder.DecimenDecoder
 import com.qrtpro.reader.decoder.ColorMatrixDecoder
 import com.qrtpro.reader.decoder.ColorMatrixDecodeException
 import kotlinx.coroutines.Job
@@ -24,14 +28,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import java.security.MessageDigest
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 enum class ScanState {
     SCANNING,
     COMPLETED,
+    FAILED,
     SAVING,
     IDLE
 }
@@ -61,30 +62,22 @@ data class ScannerUiState(
     val suggestedFileName: String = "",
     val md5: String = "",
     val error: String? = null,
+    val warning: String? = null,
     val scanResult: ScanResult? = null
 )
 
 class ScannerViewModel(application: Application) : AndroidViewModel(application) {
-    private val decoder = TxqrDecoder()
-    private val decimenDecoder = DecimenDecoder()
+    private var receiveSession = ReceiveSession()
+    private var published: ReceiveUpdate? = null
+    @Volatile
     private var barcodeScanner: BarcodeScanner? = null
 
-    // 0 = undecided, 1 = classic txqr stream, 2 = decimen stream.
-    // Sniffed from the first frame's magic bytes; a self-describing frame is
-    // enough for the receiver to know which pipeline to run.
-    //
-    // Everything below is touched by two threads: the camera analyzer thread
-    // (which calls onQrCodeScanned) and the main thread (ML Kit callbacks and
-    // the UI ticker). The shared flags are therefore atomic and the tracking
-    // box is published through @Volatile plus a defensive copy — Rect is
-    // mutable, so handing the same instance across threads is a data race even
-    // when the reference itself is volatile.
-    @Volatile
-    private var streamMode = 0
-
+    // Tracking is shared with the analyzer. Decoders belong exclusively to the
+    // background processor; the main thread only reads immutable publications.
     @Volatile
     private var trackBox: Rect? = null
 
+    private val scanGeneration = java.util.concurrent.atomic.AtomicLong(0)
     private val decodeInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private val _uiState = MutableStateFlow(ScannerUiState())
@@ -101,6 +94,16 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     var scanResultData: ByteArray? = null
         private set
 
+    private data class FrameBatch(val generation: Long, val session: ReceiveSession, val frames: List<ByteArray>)
+    private val frameProcessor = LatestFrameProcessor<FrameBatch, ReceiveUpdate?>(
+        viewModelScope,
+        process = { batch -> batch.session.accept(batch.frames) { batch.generation == scanGeneration.get() } },
+        publish = { batch, update ->
+            if (update != null && batch.generation == scanGeneration.get() &&
+                _uiState.value.scanState == ScanState.SCANNING) applyUpdate(update)
+        },
+    )
+
     init {
         barcodeScanner = BarcodeScanning.getClient()
         _uiState.value = ScannerUiState(scanState = ScanState.SCANNING)
@@ -112,6 +115,18 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         uiTicker = viewModelScope.launch {
             while (true) {
                 refreshUiState()
+                // Poll only while waiting for metadata. The session serializes
+                // this background check with frame work; it never drops a queued
+                // camera batch or acquires the decoder lock on the UI thread.
+                if (published?.waitingForName == true && _uiState.value.scanState == ScanState.SCANNING) {
+                    val generation = scanGeneration.get()
+                    val session = receiveSession
+                    val update = withContext(Dispatchers.Default) {
+                        session.accept(emptyList()) { generation == scanGeneration.get() }
+                    }
+                    if (update != null && generation == scanGeneration.get() &&
+                        _uiState.value.scanState == ScanState.SCANNING) applyUpdate(update)
+                }
                 delay(500)
             }
         }
@@ -119,55 +134,48 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     private fun refreshUiState() {
         if (_uiState.value.scanState != ScanState.SCANNING) {
-            // Stop ticking instead of emitting a no-op: MutableStateFlow emits
-            // on every assignment, so an early return would still have woken
-            // the compositor twice a second for the rest of the session.
             uiTicker?.cancel()
             uiTicker = null
             return
         }
-        // update{} is a single atomic read-modify-write; assigning
-        // _uiState.value = value.copy(...) loses a concurrent update from the
-        // frame handler.
-        _uiState.update { current ->
-            current.copy(
-                progress = activeProgress,
-                speed = activeSpeedStr,
-                avgSpeed = activeAvgSpeedStr,
-                peakSpeed = activePeakSpeedStr,
-                readInterval = activeReadInterval,
-                totalSize = activeTotalSizeStr,
-                bytesDetail = activeBytesDetailStr,
-                totalTime = activeTotalTime
-            )
-        }
+        val update = published ?: return
+        val now = System.nanoTime() / 1_000_000
+        _uiState.update { it.copy(
+            speed = if (now - update.observedAt > 2000) "0B/s" else update.speed,
+            avgSpeed = update.avgSpeed(now), totalTime = update.duration(now),
+        ) }
     }
 
-    private val activeProgress: Int
-        get() = if (streamMode == 2) decimenDecoder.progress else decoder.progress
-    private val activeSpeedStr: String
-        get() = if (streamMode == 2) DecimenDecoder.formatSize(decimenDecoder.speedBps) + "/s" else decoder.speedStr
-    private val activeAvgSpeedStr: String
-        get() = if (streamMode == 2) DecimenDecoder.formatSize(decimenDecoder.avgSpeedBps) + "/s" else decoder.avgSpeedStr
-    private val activePeakSpeedStr: String
-        get() = if (streamMode == 2) DecimenDecoder.formatSize(decimenDecoder.peakBps) + "/s" else decoder.peakSpeedStr
-    private val activeReadInterval: Long
-        get() = if (streamMode == 2) decimenDecoder.readIntervalMs else decoder.readIntervalMs
-    private val activeTotalSizeStr: String
-        get() = if (streamMode == 2) decimenDecoder.totalSizeStr else decoder.totalSizeStr
-    private val activeBytesDetailStr: String
-        get() = if (streamMode == 2) decimenDecoder.bytesDetailStr else decoder.bytesDetailStr
-    private val activeTotalTime: String
-        get() = if (streamMode == 2) {
-            val ms = decimenDecoder.elapsedMs
-            if (ms > 1000) "%.1fs".format(ms / 1000.0) else "${ms}ms"
-        } else {
-            decoder.totalTime
-        }
+    private fun applyUpdate(update: ReceiveUpdate) {
+        published = update
+        _decimenMode.value = update.decimen
+        val now = System.nanoTime() / 1_000_000
+        if (update.data != null) scanResultData = update.data
+        _uiState.update { it.copy(
+            scanState = when {
+                update.error != null -> ScanState.FAILED
+                update.data != null -> ScanState.COMPLETED
+                else -> ScanState.SCANNING
+            },
+            progress = update.progress, speed = update.speed,
+            avgSpeed = update.avgSpeed(now), peakSpeed = update.peakSpeed,
+            readInterval = update.readInterval, totalSize = TxqrDecoder.formatSize(update.totalBytes),
+            bytesDetail = update.bytesDetail, totalTime = update.duration(now),
+            suggestedFileName = update.fileName, md5 = update.md5, error = update.error, warning = update.warning,
+        ) }
+    }
+
+    // The bounded queue favors fresh camera frames under load. It preserves
+    // order within each batch, and only one batch can mutate a decoder at once.
+    private fun enqueueFrames(frames: List<ByteArray>, generation: Long) {
+        if (generation != scanGeneration.get() || _uiState.value.scanState != ScanState.SCANNING) return
+        val bounded = frames.asSequence().filter { it.size <= 4096 }.take(16).map { it.copyOf() }.toList()
+        if (bounded.isNotEmpty()) frameProcessor.submit(FrameBatch(generation,receiveSession,bounded))
+    }
 
     fun onQrCodeScanned(imageProxy: ImageProxy) {
-        // Runs on the camera analyzer thread, so it must never touch the
-        // decoders or _uiState: both are main-thread state.
+        // Runs on the analyzer thread; decoder state belongs to the background queue.
+        val generation = scanGeneration.get()
         val scanning = _uiState.value.scanState == ScanState.SCANNING
         if (!scanning) {
             imageProxy.close()
@@ -175,7 +183,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
 
         if (_colorMode.value) {
-            decodeColorMatrix(imageProxy)
+            decodeColorMatrix(imageProxy, generation)
             return
         }
 
@@ -211,36 +219,39 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
 
         val track = trackBox?.let { Rect(it) }
-        // isRecycled makes the free idempotent: the crop path can fall back to
-        // the full frame, so two branches may both try to release it.
-        val freeBitmap = { if (!bitmap.isRecycled) bitmap.recycle() }
-        val release = { freeBitmap(); decodeInFlight.set(false) }
+        // The final task owns the full bitmap and guard, including a crop retry.
+        val released = java.util.concurrent.atomic.AtomicBoolean(false)
+        val release = {
+            if (released.compareAndSet(false,true)) {
+                if (!bitmap.isRecycled) bitmap.recycle()
+                decodeInFlight.set(false)
+            }
+        }
+        var cropBitmap: Bitmap? = null
         try {
-            if (track != null) {
-                val crop = expandRect(track, bitmap.width, bitmap.height)
-                val cropped = safeCrop(bitmap, crop)
-                if (cropped == null) {
-                    submit(scanner, bitmap, null, release)
-                    return
-                }
-                scanner.process(InputImage.fromBitmap(cropped, 0))
-                    .addOnSuccessListener { barcodes ->
-                        if (barcodes.isNotEmpty()) {
-                            consumeBarcodes(barcodes, crop)
+            val crop = track?.let { expandRect(it,bitmap.width,bitmap.height) }
+            val cropped = crop?.let { safeCrop(bitmap,it) }
+            cropBitmap = cropped
+            if (cropped == null) {
+                submit(scanner,bitmap,null,generation,release)
+            } else {
+                scanner.process(InputImage.fromBitmap(cropped,0))
+                    .addOnCompleteListener { task ->
+                        val hits = if (task.isSuccessful) task.result else emptyList()
+                        if (cropped !== bitmap && !cropped.isRecycled) cropped.recycle()
+                        if (generation != scanGeneration.get() || _uiState.value.scanState != ScanState.SCANNING) {
+                            release()
+                        } else if (hits.isNotEmpty()) {
+                            try { consumeBarcodes(hits,crop,generation) } finally { release() }
                         } else {
-                            // the crop missed this frame; retry on the full frame
-                            submit(scanner, bitmap, null, release)
+                            // Crop task has finished; keep the full bitmap alive for its retry.
+                            submit(scanner,bitmap,null,generation,release)
                         }
                     }
-                    .addOnCompleteListener {
-                        if (!cropped.isRecycled) cropped.recycle()
-                        release()
-                    }
-            } else {
-                submit(scanner, bitmap, null, release)
             }
-        } catch (t: Throwable) {
-            Log.w("QRT", "barcode submit failed: ${t.message}")
+        } catch (e: Exception) {
+            Log.w("QRT","barcode submit failed: ${e.message}")
+            cropBitmap?.let { if(it !== bitmap && !it.isRecycled) it.recycle() }
             release()
         }
     }
@@ -250,12 +261,15 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         scanner: BarcodeScanner,
         bitmap: Bitmap,
         crop: Rect?,
+        generation: Long,
         onDone: () -> Unit
     ) {
         try {
             scanner.process(InputImage.fromBitmap(bitmap, 0))
-                .addOnSuccessListener { barcodes -> consumeBarcodes(barcodes, crop) }
-                .addOnCompleteListener { onDone() }
+                .addOnCompleteListener { task ->
+                    try { if(task.isSuccessful) consumeBarcodes(task.result,crop,generation) }
+                    finally { onDone() }
+                }
         } catch (t: Throwable) {
             Log.w("QRT", "barcode submit failed: ${t.message}")
             onDone()
@@ -278,8 +292,8 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     /** Feed decoded barcodes into the pipeline and refresh the tracking box to
      *  the union of all found codes (so a grid stays covered in one crop). */
-    private fun consumeBarcodes(barcodes: List<Barcode>, crop: Rect?) {
-        if (_uiState.value.scanState != ScanState.SCANNING) return
+    private fun consumeBarcodes(barcodes: List<Barcode>, crop: Rect?, generation: Long) {
+        if (generation != scanGeneration.get() || _uiState.value.scanState != ScanState.SCANNING) return
         var union: Rect? = null
         for (b in barcodes) {
             val bb = b.boundingBox ?: continue
@@ -295,21 +309,9 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
         if (union != null) trackBox = union
 
-        for (barcode in barcodes) {
-            val frameBytes = barcode.rawBytes ?: barcode.rawValue?.toByteArray()
-            if (frameBytes == null) continue
-
-            if (streamMode == 0) {
-                streamMode = if (decimenDecoder.isDecimenFrame(frameBytes)) 2 else 1
-                if (streamMode == 2) _decimenMode.value = true
-            }
-            if (streamMode == 2) {
-                handleDecimenFrame(frameBytes)
-            } else {
-                handleTxqrFrame(frameBytes)
-            }
-            if (_uiState.value.scanState == ScanState.COMPLETED) return
-        }
+        enqueueFrames(barcodes.mapNotNull { barcode ->
+            barcode.rawBytes ?: barcode.rawValue?.toByteArray(Charsets.ISO_8859_1)
+        }, generation)
     }
 
     private fun expandRect(r: Rect, w: Int, h: Int): Rect {
@@ -361,88 +363,18 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         return rotated
     }
 
-    private fun handleTxqrFrame(frameBytes: ByteArray) {
-        decoder.decodeFrame(frameBytes)
-
-        _uiState.update { state ->
-            state.copy(
-                progress = decoder.progress,
-                speed = decoder.speedStr,
-                avgSpeed = decoder.avgSpeedStr,
-                peakSpeed = decoder.peakSpeedStr,
-                readInterval = decoder.readIntervalMs,
-                totalSize = decoder.totalSizeStr,
-                bytesDetail = decoder.bytesDetailStr,
-                totalTime = decoder.totalTime
-            )
-        }
-
-        if (decoder.isCompleted) {
-            val dataBytes = decoder.dataBytes ?: return
-            scanResultData = dataBytes
-            val originalName = decoder.receivedFileName
-            _uiState.update {
-                it.copy(
-                    scanState = ScanState.COMPLETED,
-                    md5 = computeMd5(dataBytes),
-                    suggestedFileName = if (originalName.isNotBlank()) originalName else generateFileName(dataBytes)
-                )
-            }
-        }
-    }
-
-    private fun handleDecimenFrame(frameBytes: ByteArray) {
-        decimenDecoder.addFrame(frameBytes)
-
-        _uiState.update { state ->
-            state.copy(
-                progress = decimenDecoder.progress,
-                speed = DecimenDecoder.formatSize(decimenDecoder.speedBps) + "/s",
-                avgSpeed = DecimenDecoder.formatSize(decimenDecoder.avgSpeedBps) + "/s",
-                peakSpeed = DecimenDecoder.formatSize(decimenDecoder.peakBps) + "/s",
-                readInterval = decimenDecoder.readIntervalMs,
-                totalSize = decimenDecoder.totalSizeStr,
-                bytesDetail = decimenDecoder.bytesDetailStr,
-                totalTime = activeTotalTime
-            )
-        }
-
-        if (decimenDecoder.isComplete) {
-            val container = decimenDecoder.assemble() ?: return
-            val file = try {
-                decimenDecoder.unpackContainer(container)
-            } catch (e: Exception) {
-                Log.e("QRT", "decimen unpack: ${e.message}")
-                _uiState.update { it.copy(bytesDetail = "Decimen: ${e.message}") }
-                return
-            }
-            if (!decimenDecoder.verifySha256(container, file.bytes)) {
-                _uiState.update { it.copy(bytesDetail = "Decimen: SHA-256 mismatch") }
-                return
-            }
-            scanResultData = file.bytes
-            _uiState.update {
-                it.copy(
-                    scanState = ScanState.COMPLETED,
-                    md5 = computeMd5(file.bytes),
-                    suggestedFileName = file.name.ifBlank { generateFileName(file.bytes) }
-                )
-            }
-        }
-    }
-
     fun setColorMode(enabled: Boolean) {
-        _colorMode.value = enabled
+        if (_colorMode.value != enabled) { _colorMode.value = enabled; startScan() }
     }
 
     /**
      * Color-matrix path. The sampling itself is expensive and stays on the
-     * camera analyzer thread, but it returns plain bytes: the decoders and
-     * [_uiState] are main-thread state, so applying the result is dispatched
+     * camera analyzer thread, but it returns plain bytes: the equation solving uses the
+     * background queue, and publishing [_uiState] is dispatched
      * back to [viewModelScope]. Doing both on the analyzer thread (as before)
      * raced the UI ticker over the same decoder instance.
      */
-    private fun decodeColorMatrix(imageProxy: ImageProxy) {
+    private fun decodeColorMatrix(imageProxy: ImageProxy, generation: Long) {
         var frame: ByteArray? = null
         var note: String? = null
         try {
@@ -463,8 +395,9 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         val bytes = frame
         val message = note
         viewModelScope.launch {
+            if (generation != scanGeneration.get() || _uiState.value.scanState != ScanState.SCANNING) return@launch
             if (bytes != null) {
-                handleTxqrFrame(bytes)
+                enqueueFrames(listOf(bytes),generation)
             } else if (message != null && _uiState.value.scanState == ScanState.SCANNING) {
                 _uiState.update { it.copy(bytesDetail = message) }
             }
@@ -503,7 +436,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 ColorMatrixDecoder.FINDER_OFF + ColorMatrixDecoder.FINDER_SZ / 2 to
                         ColorMatrixDecoder.MATRIX_SIZE - ColorMatrixDecoder.FINDER_OFF - ColorMatrixDecoder.FINDER_SZ / 2 - 1
             )
-            val coeffs = computeAffine(centers, known) ?: continue
+            val coeffs = moduleToPixelAffine(known, centers) ?: continue
             val axx = coeffs[0]; val axy = coeffs[1]; val atx = coeffs[2]
             val ayx = coeffs[3]; val ayy = coeffs[4]; val aty = coeffs[5]
 
@@ -587,36 +520,12 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         return contrast.coerceAtLeast(0)
     }
 
-    /** Compute affine transform from 3 point pairs. Returns 6 coefficients or null. */
-    private fun computeAffine(
-        pixelPts: List<Pair<Int, Int>>, modulePts: List<Pair<Int, Int>>
-    ): DoubleArray? {
-        if (pixelPts.size < 3 || modulePts.size < 3) return null
-        val x1 = pixelPts[0].first.toDouble(); val y1 = pixelPts[0].second.toDouble()
-        val x2 = pixelPts[1].first.toDouble(); val y2 = pixelPts[1].second.toDouble()
-        val x3 = pixelPts[2].first.toDouble(); val y3 = pixelPts[2].second.toDouble()
-        val u1 = modulePts[0].first.toDouble(); val v1 = modulePts[0].second.toDouble()
-        val u2 = modulePts[1].first.toDouble(); val v2 = modulePts[1].second.toDouble()
-        val u3 = modulePts[2].first.toDouble(); val v3 = modulePts[2].second.toDouble()
-        val det = (x1 - x3) * (y2 - y3) - (x2 - x3) * (y1 - y3)
-        if (kotlin.math.abs(det) < 1e-6) return null
-        val inv = 1.0 / det
-        return doubleArrayOf(
-            ((u1 - u3) * (y2 - y3) - (u2 - u3) * (y1 - y3)) * inv,  // axx
-            ((u1 - u3) * (x3 - x2) + (u2 - u3) * (x1 - x3)) * inv,  // axy
-            u1 - ((u1 - u3) * (y2 - y3) - (u2 - u3) * (y1 - y3)) * inv * x1 - ((u1 - u3) * (x3 - x2) + (u2 - u3) * (x1 - x3)) * inv * y1,
-            ((v1 - v3) * (y2 - y3) - (v2 - v3) * (y1 - y3)) * inv,  // ayx
-            ((v1 - v3) * (x3 - x2) + (v2 - v3) * (x1 - x3)) * inv,  // ayy
-            v1 - ((v1 - v3) * (y2 - y3) - (v2 - v3) * (y1 - y3)) * inv * x1 - ((v1 - v3) * (x3 - x2) + (v2 - v3) * (x1 - x3)) * inv * y1,
-        )
-    }
-
     fun startScan() {
-        decoder.reset()
-        decimenDecoder.reset()
-        streamMode = 0
+        scanGeneration.incrementAndGet()
+        receiveSession = ReceiveSession()
+        published = null
         trackBox = null
-        decodeInFlight.set(false)
+        // An older ML Kit task releases the guard only after its bitmap is no longer used.
         _decimenMode.value = false
         scanResultData = null
         _uiState.value = ScannerUiState(scanState = ScanState.SCANNING)
@@ -630,11 +539,13 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             _uiState.update { it.copy(error = "文件名不能为空") }
             return
         }
+        val generation = scanGeneration.get()
         _uiState.update { it.copy(scanState = ScanState.SAVING, error = null) }
         viewModelScope.launch {
-            val saved = runCatching { FileSaver.saveData(getApplication(), data, trimmed) }
+            val saved = withContext(Dispatchers.IO) { runCatching { FileSaver.saveData(getApplication(), data, trimmed) }
                 .onFailure { Log.e("QRT", "save failed: ${it.message}", it) }
-                .isSuccess
+                .getOrDefault(false) }
+            if (generation != scanGeneration.get()) return@launch
             // Reading the summary fields inside update{} keeps them consistent
             // with the snapshot that is being published.
             _uiState.update { state ->
@@ -659,29 +570,13 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun generateFileName(data: ByteArray): String {
-        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val hash = sha1Hex(data)
-        return "received_${ts}_${hash}.bin"
-    }
-
-    private fun computeMd5(data: ByteArray): String {
-        val digest = MessageDigest.getInstance("MD5").digest(data)
-        return digest.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
-    }
-
-    private fun sha1Hex(data: ByteArray): String {
-        val digest = MessageDigest.getInstance("SHA-1").digest(data)
-        val sb = StringBuilder()
-        for (i in 0 until 8) {
-            sb.append("%02x".format(digest[i].toInt() and 0xFF))
-        }
-        return sb.toString()
-    }
-
     override fun onCleared() {
         super.onCleared()
+        scanGeneration.incrementAndGet()
+        _uiState.update { it.copy(scanState=ScanState.IDLE) }
         uiTicker?.cancel()
+        frameProcessor.close()
         barcodeScanner?.close()
+        barcodeScanner=null
     }
 }

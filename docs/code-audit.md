@@ -1,9 +1,12 @@
 # QRT Pro 代码审计报告
 
+> 历史分析快照：经典帧、资源边界和播放调度已更新；当前行为请参阅 [QRT2 协议](protocol-v2.md) 与 [修复记录](fix-results-20261029.md)。本文中的速率估算不代表当前端到端 Goodput。decimen 的 D1 0D 线格式保持不变。
+
+
 范围：`txqr/`（Go 桌面端）与 `txqr-reader/android/`（Kotlin 接收端）。
 目标：逻辑错误、边界条件遗漏、空指针风险、异常处理不完整、资源泄漏、协程/线程使用不当、线程安全。
 
-本报告按「严重程度 → 位置 → 问题 → 处置」记录。第一至第三节共 31 项，全部为 ✅（已修复）；第四节的 3 项收尾工作同样已完成。
+本报告按「严重程度 → 位置 → 问题 → 处置」记录。第一至第三节共 35 项，全部为 ✅（已修复）；第四节的 3 项收尾工作同样已完成。
 
 > **补记（编码方案与工作模式专项）**：针对五种喷泉码与两种工作模式做的专项验证又发现
 > 3 个跨端/静默损坏缺陷，均已修复，详见 **`docs/mode-and-codec-analysis.md` §4**：
@@ -152,6 +155,88 @@ func (s *Server) Close() error {
 | `TestDoneNeverBlocks` | `Done()` 在未启动/运行中/已停止三种状态都不挂住 |
 
 真机验证（临时注入自检、跑完即删）：真实 exe 连点 3 轮「启动服务 / 停止服务」，每轮启动后 `listening=true`、端口可连，停止后 `listening=false`、端口拒绝连接；`toggleSender()` 本身耗时 0 ms（不再阻塞界面）。
+
+### A9 ✅ 发送端用最近邻缩放帧图：窗口稍小就整帧读不出
+
+位置：`txqr/internal/sender/index.html`（`#qr` / `#grid img` 的 `image-rendering: pixelated`）
+
+现象：同一个框、同一台机器，传输「有时候能成、有时候持续失败」，改的只是浏览器窗口大小。
+接收端日志（`receiver.log`）里只有连续 `qr.notfound`，没有任何 `fountain.stalled`——说明帧
+根本没被解码，不是喷泉码的问题。
+
+根因：页面把每帧缩放到 `min(92vw, 90vh)`，而 `pixelated` 对**缩小**同样使用最近邻。
+512 px 的图缩到 500 px 时，每 25 行模块被整行丢掉，二维码因此出现缺失行，检测器直接放弃。
+缩小幅度随窗口大小连续变化，于是成败取决于窗口宽度：实测某些尺寸下 **0/12 帧能解**，
+相邻的尺寸又是 12/12。
+
+处置：去掉 `#qr` 与 `#grid img` 的 `image-rendering`，交给浏览器的平滑缩放。实测
+（4~6 帧 × 8~15 个窗口宽度 × 收/不收留白，共 80 组）：
+
+| 组合 | 解码成功率 |
+| --- | --- |
+| 512 px 帧图 + `pixelated`（修复前，即已发布行为） | **56%**，且有整段 0% 的窗口宽度 |
+| 512 px 帧图 + 平滑缩放（修复后） | **91%**，无 0% 区间 |
+| 改为整数模块渲染（708 px，符号填满图）+ 平滑 | 83% |
+| 改为整数 3 px 模块（531 px）+ 平滑 | 86% |
+
+仅去掉 `image-rendering` 仍不够稳：窗口宽度一变，缩放比例就变，相位还是随机。最终改成
+**不让浏览器缩放**——码的尺寸由「整数个设备像素/模块」决定：
+
+1. 页面在 `/encode` 里带上 `fit=<一个码可用的设备像素>`（按视口估算）；
+2. 服务端用 `pickPPM(fit, modules)` 取最大整数 ppm（钳在 2~8），按 `ppm*modules` 渲染每帧
+   （`qr.Encode(data, -ppm)`、`EncodeVersioned(..., ppm*185)`、`ColorMatrixEncode(..., ppm*96)`）；
+3. 页面把 `<img>` 设成 `modules*ppm/dpr` CSS px，即**与渲染尺寸完全一致**，浏览器不做任何重采样；
+4. 改窗口只在整数 ppm 之间跳（`applyFrameSize`），每一档都能读；只有窗口小于渲染尺寸时才
+   退回 `max-width` 缩放，并在状态栏提示「窗口偏小，码已缩放」。
+5. 页面提供三档开关，把「能不能缩放」交还给用户：`固定不缩放`（默认，上述路径）、
+   `允许缩放`（铺满格位，即旧行为）、`手动`（直接指定 2~8 px/模块，仍按该值渲染并 1:1 显示）。
+   手动值改了但未重新序列化时，状态栏提示「点「序列化」应用 Npx/模块」，不会静默缩放。
+
+1:1 的实测：ppm 2~8 × 留白 0/10/40 共 21 组**全部解码**；而在同样尺寸下让浏览器缩放，
+只有约 60%。这一条由 `TestFramesDecodeAtIntegerModuleSizes` 与
+`TestFrameImageIsAnExactModuleMultiple`（图必须等于 modules*ppm）锁定，
+`TestPageDoesNotAskForNearestNeighbourScaling` 禁止重新引入 `image-rendering`，
+`TestFramesDecodeThroughBrowserRescale` 覆盖用户用 Ctrl+/- 缩放浏览器的情况。
+
+顺带（同一轮定位问题所得，非缺陷）：
+- 接收端新增 `region.too-small` / `region.dense` 两条诊断，用「区域像素 ÷ 符号模块数」直接
+  算出像素密度，并给出需要的框尺寸——这就是这次「只看到一个失败计数」缺的那句话。
+  `qr.ModulesForBytes` 提供 ECC M 下的模块数（含静区），`TestModulesForBytesMatchesEncoder`
+  与编码器逐版本对齐。
+- 阈值以实测为准（框先定尺寸、码缩放到框内、留 10px 白边，3 帧全中记为可用）：
+
+  | 每帧字节 | 模块（含静区） | 平滑缩放可用下限 | 说明 |
+  | --- | --- | --- | --- |
+  | 256 | 77 | 160 px（1.8 px/模块） | |
+  | 512 | 97 | 180 px（1.9） | |
+  | 1024 | 129 | 320 px（2.3） | |
+  | 1536 | 157 | 360 px（2.2） | 280 px 处也有一次 3/3，属相位运气 |
+  | 2048 | 177 | 400 px（2.2） | |
+
+  低于约 1.5 px/模块完全读不出；1.5~2.5 之间能解但成败取决于缩放相位（相邻 20px 可能全灭）。
+  因此诊断阈值定为「<1.5 报错、<2.5 警告、建议按 3 px/模块 留余量」——原先按 3.5 估会
+  误报用户实际能用的配置（例如 298×305 在 129 模块下是 2.3 px/模块，正常工作）。
+
+### A10 ✅ 帧图衬底是近黑色：框一留白就出现「倒置对比度环」
+
+位置：`txqr/internal/sender/index.html`（`#grid` 的 `background:#000`）
+
+二维码的静区（码外围那圈白）是白的，而页面把码画在近黑底上。抓图区域只要比码大一点，
+码的外围就变成「白静区 → 黑底」的倒置边界：二值化后这一圈被当成码的一部分，检测器把
+符号边界判在错误的位置，于是整帧读不出。同一张码、同一尺寸的实测：
+
+| 衬底 | 1:1 大图下的解码 |
+| --- | --- |
+| 深色 `rgb(24,26,32)` | 1/4 |
+| 白色 | **4/4** |
+
+**这也是「框大一点反而失败」的一部分原因**——用户直觉上认为留白越多越好，实际上留白把
+黑底圈进来了。
+
+处置：`#grid` 改白底，并加 20px 白色外环（`box-shadow: 0 0 0 20px #fff`），使框比码大
+20px 时仍只看到白；绿色参考边框保留（亮绿在二值化里落在亮侧），虚线框与文字改用深色以
+保证可读性。`TestFramesDecodeAtIntegerModuleSizes` 的取景背景随之改为白色：修复前
+21 组里 2 组失败，修复后 21/21。
 
 ---
 
@@ -317,6 +402,63 @@ UI 线程写、worker 线程读的 `bool` 字段。
 
 处置：`progress.coerceIn(0, 100) / 100f`。
 
+### B20 ✅ 列表面板无法滚动：超过三行直接看不到
+
+位置：`cmd/qrt-pro/views.go`（`drawRegionList` / `drawFilesView`）
+
+两个列表都用「画到超出面板就 `break`」的方式处理溢出：
+
+```go
+for i, s := range snaps {
+	rowTop := top + int32(i)*pitch
+	row := ...
+	if row.B > inner.B {
+		break // 第 4 行之后既不画，也没有任何滚动手段
+	}
+	a.drawRegionRow(row, i, s)
+}
+```
+
+所以第 4 个及以后的扫描区域（以及较长的已收文件列表）被静默丢弃：计数显示「5 个」，列表里只能看到 3 个，
+既不能滚轮也不能拖动，新加的区域落在末尾等于没有反馈。
+
+处置：
+
+- 新增 `cmd/qrt-pro/scroll.go`：`scrollList` 保存 offset / viewport / content，提供 `layout`（每帧重算并
+  clamp，窗口变矮或删掉行后不会停在越界位置）、`wheel`、`beginDrag`/`dragTo`/`endDrag`、`scrollToEnd`。
+- 列表改为按 `offset` 平移绘制，并用 `Ctx.PushClip(viewport)` 裁剪；完全在视口外的行直接 `continue`。
+- 输入：新增 `WM_MOUSEWHEEL` 处理（`WM_MOUSEWHEEL` 报的是**屏幕坐标**，先 `ScreenToClient` 再判定在哪个列表上），
+  滚轮一格 = 一个行距，`delta` 不足 120 的高精度滚轮/触控板也按一格处理（否则这类设备完全没反应）；
+  在列表空白处按下拖动可滚动，按在控件上则控件优先。
+- 新增右侧滚动条（滑块 + 轨道），只在内容超出时出现。
+- 新增区域时 `scrollToEnd()`：新行在末尾，跳到底部才算给了反馈。
+
+顺带修掉两个被这个功能暴露出来的底层问题：
+
+- `RoundRectGradient` 用 `SelectClipRgn` 设置圆角裁剪，而它是**替换**语义，会把列表视口的裁剪整块顶掉——
+  行卡片因此能画到面板外面。改为 `ExtSelectClipRgn(..., RGN_AND)` 求交，并用 `SaveDC/RestoreDC`
+  保存/恢复，而不是 `SelectClipRgn(h, 0)` 硬清零。
+- `internal/w32` 新增 `DC.PushClip/PopClip`（`SaveDC` + `IntersectClipRect` + `RestoreDC`）与
+  `ScreenToClient`、`WheelDelta`；`uikit.Ctx.PushClip` 同时让**控件矩形中心落在裁剪区外时不注册**，
+  否则滚出半个身位的行按钮还能从列表外面点到。
+
+验证：`cmd/qrt-pro/scroll_test.go` 6 个用例（clamp、短内容不滚、滚轮方向与高精度增量、拖动、
+内容缩短后重新 clamp、pinToEnd）；真机自检驱动真实 handler：滚轮下三格 → 停在 271（max），
+上一格 → 135（正好一个行距），拖动上移 120 → 120，删掉一个区域后 → 自动 clamp 到 135。
+自检还抓到我写反的 `regionRowMetrics()` 返回值顺序（`_, pitch :=` 拿到的其实是行高，每格少滚 8px）。
+
+### B21 ✅ 文件名帧被当成一个数据块计数
+
+位置：`internal/scanner/decode.go`（`feedTxqrLocked`）
+
+发送端会先发一帧元数据 `-1/{chunk}/{total}/{codec}/name|{文件名}`。旧代码只判断
+`len(parts) >= 3` 且数值可解析，于是 blockCode=-1 的元数据帧也被算进 `txqrSeen`/`txqrGot`：
+进度条提前一个块、`已收 N/M 块` 多算 1，且文件名根本没被记录（桌面端 txqr 传输的
+`fileName` 恒为空）。加诊断日志时顺带发现。
+
+处置：`code < 0` 且 header 以 `/name` 结尾时按元数据帧处理——写入 `fileName`、记一条
+`frame.name` 日志、直接返回，不计入进度。`TestNameFrameIsMetadataNotProgress` 覆盖。
+
 ---
 
 ## 三、结构性整改（需求 1：整合到一个启动器）
@@ -391,3 +533,6 @@ UI 线程写、worker 线程读的 `bool` 字段。
 | 三张页面离屏快照配色复核 | ✅ 大面积纯红/纯黑已消除 |
 | 真实窗口 DC 采样（`QRT_PAINT_CHECK`） | ✅ 修复前全 `rgb(255,255,255)`，修复后为主题色 |
 | 发送服务启停（`internal/sender/lifecycle_test.go`） | ✅ 5 个启停周期端口都真正释放（A8） |
+| 列表滚动（`cmd/qrt-pro/scroll_test.go`） | ✅ 6 个用例 + 真机 handler 自检（B20） |
+| 诊断日志（`internal/scanner/audit_test.go`） | ✅ 采样/轮转/环形缓冲 + 会话切换/停滞/文件名帧 |
+| 真机捕获日志 | ✅ 空白区域 2 秒 → 1 条 `qr.notfound`（折叠 60+ 次），含 gozxing 原始错误 |

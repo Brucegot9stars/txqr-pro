@@ -14,10 +14,10 @@ func TestNameFrameLT(t *testing.T) {
 		t.Fatalf("encode: %v", err)
 	}
 
-	if !strings.HasPrefix(chunks[0], "-1/") {
+	if f, err := ParseFrame(chunks[0]); err != nil || !f.Name {
 		t.Fatalf("expected first frame to be metadata, got %q", chunks[0])
 	}
-	if !strings.HasSuffix(chunks[0], "name|my important file.pdf") {
+	if f, err := ParseFrame(chunks[0]); err != nil || string(f.Payload) != "my important file.pdf" {
 		t.Fatalf("expected filename in metadata, got %q", chunks[0])
 	}
 
@@ -50,7 +50,7 @@ func TestNameFrameRaptorAndRaptorQ(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s encode: %v", c, err)
 		}
-		if !strings.HasPrefix(chunks[0], "-1/") {
+		if f, err := ParseFrame(chunks[0]); err != nil || !f.Name {
 			t.Fatalf("%s: expected metadata first, got %q", c, chunks[0])
 		}
 		d := NewDecoder()
@@ -73,7 +73,7 @@ func TestSetFileNameEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	if strings.HasPrefix(chunks[0], "-1/") {
+	if f, err := ParseFrame(chunks[0]); err != nil || f.Name {
 		t.Fatalf("metadata frame must not be emitted for empty file name, got %q", chunks[0])
 	}
 }

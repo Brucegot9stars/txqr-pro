@@ -1,223 +1,128 @@
 package txqr
 
 import (
+	"crypto/sha256"
 	"fmt"
-	"strings"
 
 	fountain "github.com/google/gofountain"
 	raptorq "github.com/xssnick/raptorq"
 )
 
-// Decoder represents protocol decode.
+// Decoder owns one verified transfer. It is not safe for concurrent use.
 type Decoder struct {
-	chunkLen  int
-	codec     fountain.Codec
-	fd        fountain.Decoder
-	completed bool
-	total     int
-	cache     map[string]struct{}
-
-	// RaptorQ state
-	codecType   CodecType
-	raptorQ     *raptorq.RaptorQ
-	raptorQDec  *raptorq.Decoder
+	chunkLen   int
+	codecType  CodecType
+	codec      fountain.Codec
+	fd         fountain.Decoder
+	raptorQDec *raptorq.Decoder
+	total      int
+	manifest   *Frame
+	seen       map[int64]struct{}
+	result     []byte
+	fileName   string
+	read       int
+	failed     error
+	completed  bool
 }
 
-// NewDecoder creates and inits a new decoder.
-func NewDecoder() *Decoder {
-	return &Decoder{
-		cache: make(map[string]struct{}),
-	}
-}
+func NewDecoder() *Decoder { return &Decoder{seen: make(map[int64]struct{})} }
 
-// NewDecoderSize creates and inits a new decoder for the known size.
 func NewDecoderSize(size, chunkLen int, ct CodecType) *Decoder {
-	d := &Decoder{
-		total:     size,
-		chunkLen:  chunkLen,
-		cache:     make(map[string]struct{}),
-		codecType: ct,
+	if validateParameters(size, chunkLen, ct) != nil {
+		return nil
 	}
-
-	if ct == CodecRaptorQ {
-		rq := raptorq.NewRaptorQ(uint32(chunkLen))
-		dec, err := rq.CreateDecoder(uint32(size))
-		if err != nil {
-			return nil
-		}
-		d.raptorQ = rq
-		d.raptorQDec = dec
-	} else {
-		numChunks := numberOfChunks(size, chunkLen)
-		d.codec = gofountainCodec(numChunks, ct)
-		d.fd = d.codec.NewDecoder(size)
-	}
+	d := NewDecoder()
+	d.total, d.chunkLen, d.codecType = size, chunkLen, ct
 	return d
 }
 
-// Decode takes a single chunk of data and decodes it.
-func (d *Decoder) Decode(chunk string) error {
-	idx := strings.IndexByte(chunk, '|')
-	if idx == -1 {
-		return fmt.Errorf("invalid frame: \"%s\"", chunk)
+// Decode rejects corruption and foreign sessions before touching the equations.
+// RaptorQ's AddSymbol boolean means "try Decode", not "file is complete".
+func (d *Decoder) Decode(packet string) error {
+	f, err := ParseFrame(packet)
+	if err != nil {
+		return err
 	}
-
-	header := chunk[:idx]
-	if d.isCached(header) {
+	if d.manifest != nil && !d.manifest.SameTransfer(f) {
+		return ErrSessionMismatch
+	}
+	if d.total != 0 && (d.total != f.Total || d.chunkLen != f.ChunkLen || d.codecType != f.Codec) {
+		return ErrSessionMismatch
+	}
+	if d.failed != nil {
+		return d.failed
+	}
+	if d.manifest == nil {
+		d.manifest = f
+		d.total, d.chunkLen, d.codecType = f.Total, f.ChunkLen, f.Codec
+	}
+	if f.Name {
+		if d.fileName == "" {
+			d.fileName = string(f.Payload)
+		}
 		return nil
 	}
-
-	payload := chunk[idx+1:]
-
-	// Parse header: blockCode/chunkLen/total[/codec]
-	parts := strings.Split(header, "/")
-	if len(parts) < 3 {
-		return fmt.Errorf("invalid header: %s", header)
-	}
-
-	// Metadata frame (original file name): -1/{chunkLen}/{total}/{codec}/name|{name}
-	if len(parts) >= 5 && parts[0] == "-1" && parts[4] == "name" {
+	if d.completed {
 		return nil
 	}
-
-	var blockCode int64
-	var chunkLen, total int
-	if _, err := fmt.Sscanf(parts[0], "%d", &blockCode); err != nil {
-		return fmt.Errorf("invalid blockCode: %v", err)
+	if _, ok := d.seen[f.BlockCode]; ok {
+		return nil
 	}
-	if _, err := fmt.Sscanf(parts[1], "%d", &chunkLen); err != nil {
-		return fmt.Errorf("invalid chunkLen: %v", err)
-	}
-	if _, err := fmt.Sscanf(parts[2], "%d", &total); err != nil {
-		return fmt.Errorf("invalid total: %v", err)
-	}
-
-	// Detect codec from 4th field, default to LT for backward compatibility
-	ct := CodecLT
-	if len(parts) >= 4 {
-		ct = ParseCodec(parts[3])
-	}
-
-	// Lazy initialization
 	if d.fd == nil && d.raptorQDec == nil {
-		d.total = total
-		d.chunkLen = chunkLen
-		d.codecType = ct
-
-		if ct == CodecRaptorQ {
-			rq := raptorq.NewRaptorQ(uint32(chunkLen))
-			dec, err := rq.CreateDecoder(uint32(total))
+		if d.codecType == CodecRaptorQ {
+			d.raptorQDec, err = raptorq.NewRaptorQ(uint32(d.chunkLen)).CreateDecoder(uint32(d.total))
 			if err != nil {
-				return fmt.Errorf("raptorq create decoder: %w", err)
+				return fmt.Errorf("create raptorq decoder: %w", err)
 			}
-			d.raptorQ = rq
-			d.raptorQDec = dec
 		} else {
-			numChunks := numberOfChunks(total, chunkLen)
-			d.codec = gofountainCodec(numChunks, ct)
-			d.fd = d.codec.NewDecoder(total)
+			d.codec = gofountainCodec(numberOfChunks(d.total, d.chunkLen), d.codecType)
+			d.fd = d.codec.NewDecoder(d.total)
 		}
 	}
-
-	// Add block to decoder
-	if ct == CodecRaptorQ {
-		ready, err := d.raptorQDec.AddSymbol(uint32(blockCode), []byte(payload))
+	ready := false
+	if d.raptorQDec != nil {
+		ready, err = d.raptorQDec.AddSymbol(uint32(f.BlockCode), f.Payload)
 		if err != nil {
-			return fmt.Errorf("raptorq add symbol: %w", err)
-		}
-		if ready {
-			d.completed = true
+			return fmt.Errorf("add raptorq symbol: %w", err)
 		}
 	} else {
-		lubyBlock := fountain.LTBlock{
-			BlockCode: blockCode,
-			Data:      []byte(payload),
-		}
-		d.completed = d.fd.AddBlocks([]fountain.LTBlock{lubyBlock})
+		ready = d.fd.AddBlocks([]fountain.LTBlock{{BlockCode: f.BlockCode, Data: f.Payload}})
 	}
-
-	return nil
-}
-
-// Validate checks if a given chunk of data is a valid txqr protocol packet.
-func (d *Decoder) Validate(chunk string) error {
-	if chunk == "" || len(chunk) < 4 {
-		return fmt.Errorf("invalid frame: \"%s\"", chunk)
+	d.seen[f.BlockCode] = struct{}{}
+	d.read += len(f.Payload)
+	if !ready {
+		return nil
 	}
-
-	idx := strings.IndexByte(chunk, '|')
-	if idx == -1 {
-		return fmt.Errorf("invalid frame: \"%s\"", chunk)
-	}
-
-	return nil
-}
-
-// Data returns decoded data.
-func (d *Decoder) Data() string {
-	return string(d.DataBytes())
-}
-
-// DataBytes returns decoded data as a byte slice.
-func (d *Decoder) DataBytes() []byte {
+	var result []byte
 	if d.raptorQDec != nil {
-		if !d.completed {
-			return []byte{}
+		var ok bool
+		ok, result, err = d.raptorQDec.Decode()
+		if err != nil {
+			return fmt.Errorf("decode raptorq: %w", err)
 		}
-		ok, data, err := d.raptorQDec.Decode()
-		if err != nil || !ok {
-			return []byte{}
+		if !ok {
+			return nil
 		}
-		d.completed = true
-		return data
+	} else {
+		result = d.fd.Decode()
 	}
-
-	if d.fd == nil {
-		return []byte{}
+	if len(result) != d.total || sha256.Sum256(result) != d.manifest.SHA256 {
+		d.failed = ErrIntegrity
+		return d.failed
 	}
-	if !d.completed {
-		return []byte{}
-	}
-	return d.fd.Decode()
+	d.result = result
+	d.completed = true
+	return nil
 }
 
-// Length returns length of the decoded data.
-func (d *Decoder) Length() int {
-	return 0
-}
+func (d *Decoder) Validate(packet string) error { _, err := ParseFrame(packet); return err }
+func (d *Decoder) Data() string                 { return string(d.DataBytes()) }
+func (d *Decoder) DataBytes() []byte            { return append([]byte(nil), d.result...) }
+func (d *Decoder) Length() int                  { return len(d.result) }
 
-// Read returns amount of currently read bytes.
-func (d *Decoder) Read() int {
-	return 0
-}
-
-// Total returns total amount of data.
-func (d *Decoder) Total() int {
-	return d.total
-}
-
-// IsCompleted reports whether the read was completed successfully or not.
-func (d *Decoder) IsCompleted() bool {
-	return d.completed
-}
-
-// Reset resets decoder, preparing it for the next run.
-func (d *Decoder) Reset() {
-	d.fd = nil
-	d.completed = false
-	d.chunkLen = 0
-	d.total = 0
-	d.cache = map[string]struct{}{}
-	d.codec = nil
-	d.codecType = CodecLT
-	d.raptorQ = nil
-	d.raptorQDec = nil
-}
-
-func (d *Decoder) isCached(header string) bool {
-	if _, ok := d.cache[header]; ok {
-		return true
-	}
-	d.cache[header] = struct{}{}
-	return false
-}
+// Read is received unique encoded payload bytes, not source-file goodput.
+func (d *Decoder) Read() int         { return d.read }
+func (d *Decoder) Total() int        { return d.total }
+func (d *Decoder) FileName() string  { return d.fileName }
+func (d *Decoder) IsCompleted() bool { return d.completed }
+func (d *Decoder) Reset()            { *d = *NewDecoder() }

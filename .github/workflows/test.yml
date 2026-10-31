@@ -23,7 +23,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: txqr/go.mod
           cache-dependency-path: txqr/go.sum
 
       - name: gofmt
@@ -65,10 +65,8 @@ jobs:
             exit 1
           fi
 
-  # -race requires cgo. The w32/scanner/uikit packages pull in
-  # golang.org/x/sys/windows and cannot compile off Windows, so the race
-  # detector covers the platform-neutral packages that hold the concurrent
-  # logic (sender sessions, decimen fountain, qr codec).
+  # Native w32/uikit remain Windows-only. Scanner's native capture boundary is
+  # split by platform, so its shared pipeline can run under Linux -race too.
   race:
     runs-on: ubuntu-latest
     defaults:
@@ -83,8 +81,62 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: txqr/go.mod
           cache-dependency-path: txqr/go.sum
 
       - name: Test with race detector
-        run: go test -race -short ./internal/sender/... ./decimen/... ./qr/... -timeout 300s
+        run: go test -race -short . ./internal/scanner/... ./internal/sender/... ./decimen/... ./qr/... -timeout 300s
+
+      - name: Set up Node for playback regressions
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Test playback and actual presentation cadence
+        run: |
+          node internal/sender/testdata/playback.test.cjs
+          node internal/sender/testdata/throughput.test.cjs
+          node internal/sender/testdata/limits.test.cjs
+
+  android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: txqr-reader/android
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Test release receiver
+        run: |
+          chmod +x ./gradlew
+          set +e
+          ./gradlew :app:testReleaseUnitTest --no-daemon --console=plain > "$RUNNER_TEMP/qrt-android-test.log" 2>&1
+          result=$?
+          cat "$RUNNER_TEMP/qrt-android-test.log"
+          if [ "$result" -ne 0 ]; then
+            python3 - <<'PY_DIAGNOSTIC'
+          import os
+          from pathlib import Path
+          lines = Path(os.environ['RUNNER_TEMP'], 'qrt-android-test.log').read_text(errors='replace').splitlines()
+          selected = set()
+          for index, line in enumerate(lines):
+              if any(marker in line for marker in ('e: ', 'error:', '* What went wrong:', 'FAILURE:', 'Execution failed', 'Could not', 'Exception')):
+                  selected.update(range(max(0, index - 1), min(len(lines), index + 12)))
+          if not selected:
+              selected.update(range(max(0, len(lines) - 80), len(lines)))
+          message = '\n'.join(lines[index] for index in sorted(selected))[-16000:]
+          escaped = message.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::error title=Android release unit test diagnostics::' + escaped)
+          PY_DIAGNOSTIC
+          fi
+          exit "$result"

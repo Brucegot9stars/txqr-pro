@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"image"
+	"image/draw"
 
 	"github.com/makiuchi-d/gozxing"
 	zqrcode "github.com/makiuchi-d/gozxing/qrcode"
@@ -12,6 +13,9 @@ import (
 
 // RecoveryLevel represents QR encoding error detection/recovery capacity.
 type RecoveryLevel int
+
+// MaxMediumBytes is the QR V40-M byte-mode capacity, including packet headers.
+const MaxMediumBytes = 2331
 
 const (
 	// Low is Level L: 7% error recovery.
@@ -34,6 +38,33 @@ func Encode(data string, size int, lvl RecoveryLevel) (image.Image, error) {
 		return nil, fmt.Errorf("encode QR: %v", err)
 	}
 	return qr.Image(size), nil
+}
+
+// eccMByteCapacity is the byte-mode capacity of each QR version at error
+// correction level M, indexed by version (0 unused). The receiver uses it to
+// turn "this frame carries N bytes" into "the symbol has M modules", which is
+// what lets it tell the user that a capture region is physically too small.
+var eccMByteCapacity = [41]int{0,
+	14, 26, 42, 62, 84, 106, 122, 152, 180, 213,
+	251, 287, 331, 362, 412, 450, 504, 560, 624, 666,
+	711, 779, 857, 911, 997, 1059, 1125, 1190, 1264, 1370,
+	1452, 1538, 1628, 1722, 1809, 1911, 1989, 2099, 2213, MaxMediumBytes,
+}
+
+// ModulesForBytes reports how many modules a QR symbol holding n payload bytes
+// occupies per side at error correction level M — the quiet zone included,
+// because that is what has to fit inside a capture region.
+//
+// It returns 0 when n exceeds what a QR symbol can hold. Levels other than M
+// change the answer by a version or two, which is within the tolerance of the
+// rough "is my region big enough" advice this feeds.
+func ModulesForBytes(n int) int {
+	for v := 1; v <= 40; v++ {
+		if n <= eccMByteCapacity[v] {
+			return 21 + 4*(v-1) + 8
+		}
+	}
+	return 0
 }
 
 // EncodeVersioned encodes data into a QR code with a forced version and mask.
@@ -65,8 +96,9 @@ func Decode(img image.Image) (string, error) {
 }
 
 // decodeOnce runs the QR reader, optionally with the pure-barcode fast path.
-func decodeOnce(img image.Image, pure bool) (*gozxing.Result, error) {
-	bitmap, err := gozxing.NewBinaryBitmapFromImage(img)
+func decodeOnce(source gozxing.LuminanceSource, pure bool) (*gozxing.Result, error) {
+	// Each attempt owns its mutable binary matrix. Only luminance is shared.
+	bitmap, err := gozxing.NewBinaryBitmap(gozxing.NewHybridBinarizer(source))
 	if err != nil {
 		return nil, err
 	}
@@ -82,6 +114,28 @@ func decodeOnce(img image.Image, pure bool) (*gozxing.Result, error) {
 		hints[gozxing.DecodeHintType_TRY_HARDER] = true
 	}
 	return zqrcode.NewQRCodeReader().Decode(bitmap, hints)
+}
+
+// The library's generic RGBA conversion boxes one color value per pixel.
+// Convert captures through their pixel buffer first, preserving its exact
+// green-weighted luminance and white-background alpha arithmetic. Gray's
+// single-byte color values avoid those per-pixel heap allocations.
+func luminanceSource(img image.Image) gozxing.LuminanceSource {
+	if rgba, ok := img.(*image.RGBA); ok {
+		bounds := rgba.Bounds()
+		gray := image.NewGray(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+		for y := 0; y < bounds.Dy(); y++ {
+			row := rgba.Pix[rgba.PixOffset(bounds.Min.X, bounds.Min.Y+y):]
+			for x := 0; x < bounds.Dx(); x++ {
+				p := row[x*4 : x*4+4]
+				lum := (uint32(p[0]) + 2*uint32(p[1]) + uint32(p[2])) / 4
+				alpha := uint32(p[3])
+				gray.Pix[y*gray.Stride+x] = byte((lum*alpha + (255-alpha)*255) / 255)
+			}
+		}
+		img = gray
+	}
+	return gozxing.NewLuminanceSourceFromImage(img)
 }
 
 // ScaleBilinear resizes an image with bilinear interpolation (exported for
@@ -170,15 +224,26 @@ func scaleForDecode(img image.Image) image.Image {
 // margin, edges and background); if that fails, the pure-barcode fast path is
 // tried, which assumes the image is exactly the code.
 func DecodeRaw(img image.Image) ([]byte, error) {
-	img = scaleForDecode(img)
-	result, err := decodeOnce(img, false)
+	source := luminanceSource(scaleForDecode(img))
+	result, err := decodeOnce(source, false)
 	if err != nil {
-		result, err = decodeOnce(img, true)
+		result, err = decodeOnce(source, true)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("gozxing: %v", err)
 	}
 	return result.GetRawBytes(), nil
+}
+
+// Attempt is one candidate the multi-scale search tried. It exists so a failed
+// decode can be explained instead of merely counted: "a QR was found but its
+// payload is not a frame" and "no QR was found at all" need completely
+// different fixes (wrong region vs. wrong protocol).
+type Attempt struct {
+	Label   string // e.g. "crop6%@1.0x", "bare", "up1.5x"
+	Err     error  // decoder error; nil when a symbol was decoded
+	Found   bool   // a QR symbol was decoded
+	Payload bool   // ...and its payload passed the optional frame validator
 }
 
 // DecodeRawMultiScale decodes a QR trying cheap crops first, then scales.
@@ -187,74 +252,129 @@ func DecodeRaw(img image.Image) ([]byte, error) {
 // original resolution succeeds in ~10ms — putting that path first is what
 // makes the desktop receiver fast. Upscales follow for very small codes.
 func DecodeRawMultiScale(img image.Image, scales []float64) ([]byte, error) {
-	b := img.Bounds()
+	raw, err, _ := DecodeRawMultiScaleVerbose(img, scales)
+	return raw, err
+}
 
-	tryCrop := func(cropPct, sc float64) []byte {
+// DecodeRawMultiScaleVerbose is DecodeRawMultiScale plus the list of attempts
+// it made, for the receiver's diagnostic log.
+func DecodeRawMultiScaleVerbose(img image.Image, scales []float64) ([]byte, error, []Attempt) {
+	return DecodeRawMultiScalePreferred(img, scales, "", nil)
+}
+
+// DecodeRawMultiScalePreferred tries a previous successful attempt first, then
+// all remaining candidates in the original order. Unknown labels are ignored.
+// valid optionally checks extracted payloads before accepting a candidate;
+// returning false keeps the search going, without changing receive state.
+func DecodeRawMultiScalePreferred(img image.Image, scales []float64, preferred string, valid func([]byte) bool) ([]byte, error, []Attempt) {
+	b := img.Bounds()
+	var attempts []Attempt
+
+	record := func(label string, raw []byte, err error) ([]byte, bool) {
+		at := Attempt{Label: label, Err: err, Found: err == nil}
+		if at.Found {
+			payload := ExtractFramePayload(raw)
+			at.Payload = payload != nil && (valid == nil || valid(payload))
+		}
+		attempts = append(attempts, at)
+		if at.Found && at.Payload {
+			return raw, true
+		}
+		return nil, false
+	}
+
+	type candidate struct {
+		label       string
+		crop, scale float64
+	}
+	candidates := []candidate{
+		{"crop6%@1.0x", .06, 1}, {"crop3%@1.0x", .03, 1}, {"crop10%@1.0x", .10, 1},
+		{"bare", 0, 1},
+		{"crop6%@1.5x", .06, 1.5}, {"crop6%@2.0x", .06, 2},
+		{"crop3%@1.5x", .03, 1.5}, {"crop3%@2.0x", .03, 2},
+	}
+	for _, scale := range scales {
+		if scale != 1 {
+			candidates = append(candidates, candidate{fmt.Sprintf("scale%.1fx", scale), 0, scale})
+		}
+	}
+
+	try := func(c candidate) ([]byte, bool) {
+		cropPct, sc := c.crop, c.scale
+		if cropPct == 0 {
+			cand := img
+			if sc != 1 {
+				nw, nh := int(float64(b.Dx())*sc), int(float64(b.Dy())*sc)
+				if nw < 8 || nh < 8 {
+					return nil, false
+				}
+				cand = scaleBilinear(img, nw, nh)
+			}
+			raw, err := DecodeRaw(cand)
+			return record(c.label, raw, err)
+		}
 		dx := int(float64(b.Dx()) * cropPct)
 		dy := int(float64(b.Dy()) * cropPct)
 		if b.Dx()-2*dx < 60 || b.Dy()-2*dy < 60 {
-			return nil
+			return nil, false
 		}
-		cropped := image.NewRGBA(image.Rect(0, 0, b.Dx()-2*dx, b.Dy()-2*dy))
-		for y := 0; y < cropped.Bounds().Dy(); y++ {
-			for x := 0; x < cropped.Bounds().Dx(); x++ {
-				cropped.Set(x, y, img.At(b.Min.X+x+dx, b.Min.Y+y+dy))
-			}
+		rect := image.Rect(b.Min.X+dx, b.Min.Y+dy, b.Max.X-dx, b.Max.Y-dy)
+		// Captures remain immutable during decode, so standard image types can
+		// share their pixels. The QR reader honours nonzero image origins.
+		var cropped image.Image
+		if source, ok := img.(interface {
+			SubImage(image.Rectangle) image.Image
+		}); ok {
+			cropped = source.SubImage(rect)
+		} else {
+			copy := image.NewRGBA(image.Rect(0, 0, rect.Dx(), rect.Dy()))
+			draw.Draw(copy, copy.Bounds(), img, rect.Min, draw.Src)
+			cropped = copy
 		}
-		cand := image.Image(cropped)
+		cand := cropped
 		if sc != 1.0 {
 			cw, ch := cropped.Bounds().Dx(), cropped.Bounds().Dy()
 			cand = scaleBilinear(cropped, int(float64(cw)*sc), int(float64(ch)*sc))
 		}
 		raw, err := DecodeRaw(cand)
-		if err != nil {
-			return nil
-		}
-		if ExtractFramePayload(raw) != nil {
-			return raw
-		}
-		return nil
+		return record(c.label, raw, err)
 	}
 
-	// 1. cheap original-resolution crops (fast path for boxed-in frames)
-	for _, cropPct := range []float64{0.06, 0.03, 0.10} {
-		if p := tryCrop(cropPct, 1.0); p != nil {
-			return p, nil
-		}
-	}
-	// 2. bare image (tight, border-free boxes)
-	if raw, err := DecodeRaw(img); err == nil && ExtractFramePayload(raw) != nil {
-		return raw, nil
-	}
-	// 3. upscales for small codes
-	for _, cropPct := range []float64{0.06, 0.03} {
-		for _, sc := range []float64{1.5, 2.0} {
-			if p := tryCrop(cropPct, sc); p != nil {
-				return p, nil
+	preferredIndex := -1
+	if preferred != "" {
+		for i, c := range candidates {
+			if c.label != preferred {
+				continue
 			}
+			preferredIndex = i
+			if raw, ok := try(c); ok {
+				return raw, nil, attempts
+			}
+			break
 		}
 	}
-	// 4. coarse scales as a last resort
-	var lastErr error
-	for _, s := range scales {
-		if s == 1.0 {
+	for i, c := range candidates {
+		if i == preferredIndex {
 			continue
 		}
-		w, h := b.Dx(), b.Dy()
-		nw, nh := int(float64(w)*s), int(float64(h)*s)
-		if nw < 8 || nh < 8 {
-			continue
-		}
-		raw, err := DecodeRaw(scaleBilinear(img, nw, nh))
-		lastErr = err
-		if err == nil && ExtractFramePayload(raw) != nil {
-			return raw, nil
+		if raw, ok := try(c); ok {
+			return raw, nil, attempts
 		}
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no payload at any scale")
+
+	err := fmt.Errorf("no payload at any scale")
+	for _, at := range attempts {
+		if at.Found && !at.Payload {
+			// A symbol was read, its bytes just were not a frame. That is the
+			// actionable case (wrong protocol on screen), so say so.
+			err = fmt.Errorf("QR decoded but payload is not a txqr/decimen frame")
+			break
+		}
+		if at.Err != nil {
+			err = fmt.Errorf("%s: %w", at.Label, at.Err)
+		}
 	}
-	return nil, lastErr
+	return nil, err, attempts
 }
 
 // bitReader reads MSB-first from a byte slice.

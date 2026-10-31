@@ -15,10 +15,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify displayed release versions
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          go_version = re.search(r'const Number = "([^"]+)"', Path('txqr/internal/version/version.go').read_text()).group(1)
+          android_version = re.search(r'versionName\s*=\s*"([^"]+)"', Path('txqr-reader/android/app/build.gradle.kts').read_text()).group(1)
+          expected = os.environ['GITHUB_REF_NAME'].removeprefix('v')
+          assert go_version == android_version == expected, (go_version, android_version, expected)
+          PY
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: txqr/go.mod
           cache-dependency-path: txqr/go.sum
 
       # One binary now hosts both the sender and the receiver: the old
@@ -61,7 +72,7 @@ jobs:
         working-directory: txqr-reader/android
         run: |
           chmod +x ./gradlew
-          ./gradlew :app:assembleRelease --no-daemon
+          ./gradlew :app:testReleaseUnitTest :app:assembleRelease --no-daemon
 
       - name: Stage release APK with version name
         working-directory: txqr-reader/android
@@ -81,6 +92,7 @@ jobs:
         with:
           # A silently missing asset is worse than a red build: catch it here.
           fail_on_unmatched_files: true
+          body_path: docs/releases/${{ github.ref_name }}.md
           files: |
             dist/qrt-pro-windows-amd64-${{ github.ref_name }}.exe
             dist/qrt-pro-sender-windows-amd64-${{ github.ref_name }}.exe

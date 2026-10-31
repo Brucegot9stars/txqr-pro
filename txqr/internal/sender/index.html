@@ -3,106 +3,233 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>序列化工具</title>
+<title>QRT Pro 序列化工具</title>
 <style>
-  * { box-sizing: border-box; }
-  body { font-family: system-ui, -apple-system, sans-serif; background:#101014; color:#eee; margin:0; min-height:100vh; }
-  #controls { max-width:460px; margin:8vh auto; padding:24px; background:#1b1b22; border-radius:12px; }
-  h1 { margin:0 0 4px; font-size:20px; }
-  p.sub { margin:0 0 18px; font-size:13px; opacity:.6; }
-  label { display:block; margin:14px 0 6px; font-size:13px; opacity:.8; }
-  input[type=file] { width:100%; }
-  .row { display:flex; gap:12px; }
-  .row > div { flex:1; }
-  input[type=number] { width:100%; padding:8px; border-radius:6px; border:1px solid #3a3a44; background:#232330; color:#eee; }
-  select { width:100%; padding:8px; border-radius:6px; border:1px solid #3a3a44; background:#232330; color:#eee; }
-  button { margin-top:22px; width:100%; padding:12px; font-size:16px; border:none; border-radius:8px; background:#2f81f7; color:#fff; cursor:pointer; }
+  :root { color-scheme:dark; --bg:#0d1119; --panel:#151d2a; --line:#2a3648; --muted:#9aaac0; --text:#edf3fc; --accent:#73dcc7; }
+  * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
+  body { font-family:system-ui,-apple-system,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); margin:0; min-height:100vh; line-height:1.5; }
+  #controls { max-width:1120px; margin:auto; padding:32px 28px 140px; }
+  .page-header { display:flex; justify-content:space-between; align-items:center; gap:20px; margin-bottom:28px; }
+  .brand { display:flex; align-items:center; gap:14px; }
+  .brand-mark { display:grid; grid-template-columns:repeat(2,10px); gap:4px; padding:12px; border:1px solid #426a70; border-radius:14px; background:#173239; }
+  .brand-mark i { width:10px; height:10px; background:var(--accent); border-radius:2px; }
+  .brand-mark i:last-child { background:transparent; border:2px solid var(--accent); }
+  h1 { font-size:23px; line-height:1.3; margin:0; letter-spacing:.3px; }
+  p.sub { color:var(--muted); font-size:13px; margin:5px 0 0; }
+  #version { color:var(--accent); border:1px solid #345652; border-radius:20px; padding:6px 12px; font-size:12px; white-space:nowrap; }
+  .workspace { display:grid; grid-template-columns:minmax(0,1.45fr) minmax(290px,1fr); gap:20px; align-items:start; }
+  .stack { display:grid; gap:18px; min-width:0; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:22px; min-width:0; }
+  .section-heading { display:flex; align-items:center; gap:10px; margin-bottom:18px; }
+  .section-number { color:var(--accent); font-size:11px; font-weight:700; border:1px solid #345652; padding:3px 7px; border-radius:6px; }
+  h2 { margin:0; font-size:15px; font-weight:650; }
+  .helper { color:var(--muted); font-size:12px; margin:8px 0 0; line-height:1.7; }
+  label { display:block; font-size:12px; color:#bcc9db; margin:0 0 8px; }
+  input[type=file] { width:100%; font-size:13px; border:1px dashed #455972; padding:18px 12px; border-radius:10px; background:#101824; color:#bcc9db; }
+  input[type=file]::file-selector-button { color:var(--text); background:#263a50; border:1px solid #42607d; padding:8px 12px; border-radius:6px; margin-right:12px; cursor:pointer; }
+  .row { display:flex; gap:14px; }
+  .row > div { flex:1; min-width:0; }
+  .field-row + .field-row { margin-top:18px; }
+  input[type=number],select { width:100%; min-height:42px; padding:9px 10px; border-radius:8px; border:1px solid #35455b; background:#101824; color:var(--text); font:inherit; font-size:13px; }
+  input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+  input:disabled,select:disabled { opacity:.45; cursor:not-allowed; }
+  .mode-options { display:grid; gap:12px; margin-top:20px; border-top:1px solid var(--line); padding-top:18px; }
+  .mode-option { display:flex; gap:10px; align-items:flex-start; margin:0; cursor:pointer; color:var(--text); font-size:13px; }
+  .mode-option input { accent-color:var(--accent); margin:4px 0 0; flex-shrink:0; }
+  .mode-option small { display:block; color:var(--muted); font-size:11px; line-height:1.6; margin-top:3px; }
+  .toggle { display:flex; align-items:center; justify-content:space-between; gap:14px; cursor:pointer; color:var(--text); margin:0; font-size:14px; }
+  .toggle input { appearance:none; flex-shrink:0; width:42px; height:24px; margin:0; border:1px solid #687080; border-radius:12px; background:#3a4657; cursor:pointer; position:relative; }
+  .toggle input::before { content:''; position:absolute; width:18px; height:18px; top:2px; left:2px; border-radius:50%; background:#fff; }
+  .toggle input:checked { background:#208b7b; border-color:#208b7b; }
+  .toggle input:checked::before { transform:translateX(18px); }
+  button { cursor:pointer; font:inherit; border:1px solid transparent; border-radius:8px; }
   button:disabled { opacity:.5; cursor:default; }
-  #status { margin-top:14px; font-size:13px; opacity:.7; min-height:18px; }
+  .action-bar { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); width:calc(100% - 56px); max-width:1064px; display:flex; align-items:center; gap:20px; padding:14px 18px; background:#1b2b3c; border:1px solid #425e70; border-radius:12px; z-index:3; }
+  #start { width:200px; flex-shrink:0; padding:12px 18px; background:var(--accent); color:#08271f; font-size:15px; font-weight:700; }
+  #status { color:#b6c7d9; font-size:12px; overflow-wrap:anywhere; max-height:64px; overflow:auto; }
+  #limits { color:#b3c1d4; font-size:12px; line-height:1.9; white-space:pre-line; overflow-wrap:anywhere; }
+  #selection-error { color:#ffb3a8; font-size:12px; white-space:pre-line; overflow-wrap:anywhere; }
+  #selection-error:not(:empty) { border:1px solid #764740; background:#322125; padding:12px; border-radius:8px; margin-top:14px; }
+  .info-note { color:var(--muted); font-size:12px; line-height:1.8; }
+  .info-note strong { color:#cbd8e9; font-weight:600; }
+  details.panel { padding:18px 22px; }
+  summary { cursor:pointer; color:#cbd8e9; font-size:13px; }
+  #sender-log { white-space:pre-wrap; overflow-wrap:anywhere; max-height:260px; overflow:auto; font-size:11px; color:#c2d0e0; }
+  #log-path { font-size:11px; overflow-wrap:anywhere; color:var(--muted); margin-top:12px; }
+  #refresh-logs { margin-top:14px; padding:7px 12px; font-size:12px; background:#23344a; color:var(--text); border-color:#405571; }
+  .page-footer { margin:22px 0 0; text-align:center; color:#718299; font-size:11px; }
+  @media(max-width:800px) { #controls { padding:24px 18px 160px; } .workspace { grid-template-columns:1fr; } .action-bar { width:calc(100% - 36px); } }
+  @media(max-width:480px) { .page-header { align-items:flex-start; gap:10px; } h1 { font-size:20px; } .brand-mark { display:none; } #version { padding:4px 8px; font-size:11px; } .panel { padding:18px; } .row { gap:10px; } .row label { font-size:11px; } .action-bar { flex-direction:column; gap:8px; padding:12px; } #start { width:100%; } #status:empty { display:none; } }
 
   #overlay { display:none; position:fixed; inset:0; background:#000; z-index:10; }
   #overlay.active { display:block; }
-  #qrwrap { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; }
-  #qr { width:min(92vw, 90vh); image-rendering:pixelated; }
+  #qrwrap { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; padding:110px 28px 40px; position:relative; }
+  /* No `image-rendering: pixelated`. Nearest-neighbour looks tidy but is
+     destructive here: the page stretches a fixed-size PNG to min(92vw,90vh),
+     and when the window is a few percent smaller than the PNG every other
+     module row gets dropped, which kills decoding outright. Smooth resampling
+     keeps every module distinguishable at any window size (measured: 12/13
+     sizes decoded with smooth vs 5/13 with pixelated at the old render size). */
+  /* Size comes from JS (applyFrameSize): modules*ppm device pixels, i.e. an
+     exact whole number of pixels per module, never a viewport stretch. */
+  #qr { display:block; margin:0 auto; }
   /* The QR range frame: prominent so the receiver knows exactly what to box,
      but sits OUTSIDE a quiet-zone padding so it never crowds the codes. A
      receiver that boxes it in still decodes via edge-crop + upscale. */
-  #grid { display:grid; gap:6px; width:min(88vw, 86vh); height:min(88vw, 86vh); background:#000; position:relative; margin-top:30px; padding:18px; border:4px solid rgba(0,220,120,.95); outline:2px dashed rgba(255,255,255,.55); outline-offset:10px; box-shadow:0 0 26px rgba(0,220,120,.55); }
+  /* White card, not black: a QR's quiet zone is white, so a dark surround puts
+     an inverted-contrast ring right at the symbol boundary and the detector
+     loses the symbol's extent (measured: same image decodes 4/4 on white and
+     1/4 on a dark surround at 1:1). The 20px white ring means a region boxed a
+     little too wide still only sees white around the code. */
+  #grid { display:grid; gap:6px; width:min(calc(100vw - 100px), calc(100vh - 210px)); height:min(calc(100vw - 100px), calc(100vh - 210px)); background:#fff; position:relative; padding:18px; border:4px solid rgba(0,180,100,.95); outline:2px dashed rgba(0,0,0,.35); outline-offset:10px; box-shadow:0 0 0 20px #fff; }
   #grid::after { content:'二维码区域 ── 接收端框选此处'; position:absolute; left:50%; top:-30px; transform:translateX(-50%); background:rgba(0,220,120,.92); color:#00110a; font-size:13px; font-weight:bold; padding:2px 12px; border-radius:4px; white-space:nowrap; z-index:5; pointer-events:none; }
-  #grid img { width:100%; height:100%; image-rendering:pixelated; }
-  #stats { position:fixed; top:8px; left:0; right:0; text-align:center; font-size:13px; font-family:Consolas,monospace; opacity:.85; z-index:11; pointer-events:none; text-shadow:0 0 4px #000; }
-  #hint { margin-top:10px; font-size:12px; opacity:.55; }
-  #controls-bar { position:fixed; top:8px; right:12px; z-index:12; display:flex; gap:8px; }
-  #controls-bar button { width:auto; margin:0; padding:6px 14px; font-size:13px; }
-  #pause { background:#2f81f7; }
-  #stop { background:#d9a03c; }
-  #cancel { background:#d33; }
+  #grid img { display:block; } /* sized by applyFrameSize, see #qr */
+  #grid { place-items:center; }
+  .playback-toolbar { position:fixed; inset:0 0 auto; z-index:12; background:#0d141f; border-bottom:1px solid #2c3b50; padding:14px 24px 10px; }
+  .toolbar-main { display:flex; align-items:center; justify-content:space-between; gap:20px; }
+  #stats { display:flex; gap:32px; font-variant-numeric:tabular-nums; }
+  .metric span { display:block; color:#9bafc5; font-size:11px; margin-bottom:2px; }
+  .metric strong { color:#ecf4ff; font-family:Consolas,monospace; font-size:20px; font-weight:600; }
+  .metric:first-child strong { color:var(--accent); }
+  #playback-info { color:#9bafc5; font-size:11px; margin-top:7px; }
+  #playback-notice { color:#ffbb9b; font-size:12px; }
+  #hint { position:fixed; bottom:12px; left:12px; right:12px; text-align:center; font-size:11px; color:#9bafc5; }
+  #controls-bar { display:flex; gap:8px; flex-shrink:0; }
+  #controls-bar button { padding:8px 14px; font-size:12px; color:#e6efff; background:#21314a; border-color:#3d5472; }
+  #cancel { color:#ffb6b0 !important; background:#38232b !important; border-color:#74434b !important; }
+  #grid.preparing { background:#0e1a27; border:2px dashed #74bba9; box-shadow:0 0 0 20px #0e1a27; outline-color:#48736d; }
+  #grid.preparing::after { content:'二维码播放区域 · 准备中'; }
+  .preview-cell { width:100%; height:100%; min-height:0; border:1px dashed #3c576b; border-radius:8px; }
+  #preparation-message { position:absolute; left:50%; top:calc(50% + 35px); transform:translate(-50%,-50%); width:min(360px,75vw); padding:22px; border:1px solid #345466; background:#152536; border-radius:12px; text-align:center; z-index:2; }
+  #preparation-message h2 { font-size:17px; color:#dcf5ed; }
+  #preparation-message p { font-size:12px; color:#c0d0e1; line-height:1.8; }
+  #preparation-message small { color:#90a9bd; font-size:11px; }
+  @media(max-width:640px) {
+    .playback-toolbar { padding:12px 16px; }
+    .toolbar-main { flex-wrap:wrap; gap:10px; }
+    #stats { justify-content:space-between; gap:16px; width:100%; }
+    .metric strong { font-size:17px; }
+    #controls-bar { width:100%; justify-content:flex-end; }
+    #qrwrap { padding-top:144px; }
+    #grid { width:min(calc(100vw - 56px), calc(100vh - 244px)); height:min(calc(100vw - 56px), calc(100vh - 244px)); }
+    #grid::after { font-size:11px; padding:2px 8px; }
+    #playback-info { font-size:10px; }
+  }
 </style>
 </head>
 <body>
 
-<div id="controls">
-  <h1>序列化工具</h1>
-  <p class="sub">选择文件，将其序列化为可视数据帧并全屏播放。</p>
-
-  <label>文件</label>
-  <input type="file" id="file">
-
-  <div class="row">
-    <div>
-      <label>每帧字节数 split</label>
-      <input type="number" id="split" value="2048" min="10" step="10">
+<main id="controls">
+  <header class="page-header">
+    <div class="brand"><div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></div><div><h1>QRT Pro <span style="font-weight:400;color:#9aaac0">/ 光传输</span></h1><p class="sub">通过屏幕传送文件，让数据跨越网络边界。</p></div></div>
+    <div id="version"></div>
+  </header>
+  <div class="workspace">
+    <div class="stack">
+      <section class="panel" aria-labelledby="file-heading">
+        <div class="section-heading"><span class="section-number">01</span><h2 id="file-heading">选择文件</h2></div>
+        <label for="file">待发送的原始文件</label><input type="file" id="file">
+        <p class="helper">参数检查通过后即可序列化，准备完成自动播放。</p>
+      </section>
+      <section class="panel" aria-labelledby="settings-heading">
+        <div class="section-heading"><span class="section-number">02</span><h2 id="settings-heading">传输设置</h2></div>
+        <div class="row field-row">
+          <div><label for="split">分片字节数</label><input type="number" id="split" value="2048" min="1" step="1"></div>
+          <div><label for="fps">目标帧率 · FPS</label><input type="number" id="fps" value="30" min="1" max="120" step="1"></div>
+          <div><label for="gridSize">网格 · N × N</label><input type="number" id="gridSize" value="1" min="1" max="4" step="1"></div>
+        </div>
+        <div class="row field-row">
+          <div><label for="codec">编码方案</label><select id="codec"><option value="lt">LT (经典)</option><option value="binary">Binary</option><option value="raptor">Raptor (RFC 5053)</option><option value="raptorq" selected>RaptorQ (RFC 6330)</option><option value="online">Online</option></select></div>
+          <div><label for="fitMode">缩放方式</label><select id="fitMode"><option value="fixed" selected>固定不缩放（推荐）</option><option value="scale">允许缩放（铺满窗口）</option><option value="manual">手动指定 px/模块</option></select></div>
+          <div id="ppmWrap" style="display:none;"><label for="ppmInput">像素/模块</label><input type="number" id="ppmInput" value="4" min="2" max="8" step="1"></div>
+        </div>
+        <div class="mode-options">
+          <label class="mode-option"><input type="checkbox" id="colorMode"><span>Color Matrix<small>2 位/模块，每帧有效分片最多 <span id="colorCap">1426</span> B，自动收敛分片。</small></span></label>
+          <label class="mode-option"><input type="checkbox" id="decimenMode"><span>Decimen<small>固定 V40-L / mask 4 / ECC L；使用专用分片、帧率和双码布局。</small></span></label>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="prepare-heading">
+        <div class="section-heading"><span class="section-number">03</span><h2 id="prepare-heading">准备与播放</h2></div>
+        <label class="toggle"><span>预生成全部二维码</span><input type="checkbox" id="preGenerate" role="switch" aria-describedby="prepare-help"></label>
+        <p id="prepare-help" class="helper">开启：先准备整轮，播放时生成开销较低。关闭：先准备首批，边生成边播放。选择在下次序列化生效，两种方式均受缓存约束。</p>
+        <div id="selection-error" role="alert"></div>
+      </section>
     </div>
-    <div>
-      <label>帧率 FPS</label>
-      <input type="number" id="fps" value="30" min="1" step="1">
-    </div>
-    <div>
-      <label>网格 (N×N)</label>
-      <input type="number" id="gridSize" value="1" min="1" max="4" step="1">
-    </div>
+    <aside class="stack" aria-label="传输说明与诊断">
+      <section class="panel"><div class="section-heading"><h2>当前传输限制</h2></div><div id="limits" aria-live="polite"></div></section>
+      <section class="panel info-note"><div class="section-heading"><h2>关于发送速率</h2></div><strong>按实际显示的编码数据统计</strong><p>播放时显示最近 2 秒的发送速率，包含喷泉冗余和轮播重发，不含协议头、文件名帧和 PNG 体积。</p><p>发送端无法确认接收成功量；文件恢复的有效速度以接收端为准。远程桌面还可能丢弃画面更新。</p></section>
+      <details id="logs-panel" class="panel"><summary>发送日志 · 错误与阶段耗时</summary><button id="refresh-logs" type="button">刷新日志</button><div id="log-path"></div><pre id="sender-log">点击刷新查看日志。</pre></details>
+    </aside>
   </div>
-
-  <label style="margin-top:14px; display:inline-flex; align-items:center; gap:8px;"><input type="checkbox" id="colorMode" style="width:auto;"> Color Matrix 模式（2 位/模块，每帧上限 <span id="colorCap">1539</span> B，split 会自动收敛）</label>
-
-  <label style="margin-top:14px; display:inline-flex; align-items:center; gap:8px;"><input type="checkbox" id="decimenMode" style="width:auto;"> Decimen 模式（DCF2 + 喷泉码，V40-L / mask 4 / ECC L）</label>
-
-  <div class="row">
-    <div>
-      <label>编码方案</label>
-      <select id="codec" style="width:100%; padding:8px; border-radius:6px; border:1px solid #3a3a44; background:#232330; color:#eee;">
-        <option value="lt">LT (经典)</option>
-        <option value="binary">Binary</option>
-        <option value="raptor">Raptor (RFC 5053，长度非整倍数时回落 LT)</option>
-        <option value="raptorq" selected>RaptorQ (RFC 6330)</option>
-        <option value="online">Online</option>
-      </select>
-    </div>
-  </div>
-
-  <button id="start">序列化</button>
-  <div id="status"></div>
-</div>
+  <div class="action-bar"><button id="start">序列化</button><div id="status" role="status">选择文件后开始传输。</div></div>
+  <p class="page-footer">离线工作 · 无需剪贴板 · 光学单向传输</p>
+</main>
 
 <div id="overlay">
-  <div id="stats"></div>
-  <div id="controls-bar">
-    <button id="pause">暂停</button>
-    <button id="stop">停止</button>
-    <button id="cancel">取消</button>
-  </div>
+  <header class="playback-toolbar">
+    <div class="toolbar-main">
+      <div id="stats">
+        <div class="metric"><span>发送速率</span><strong id="send-rate">0 KB/s</strong></div>
+        <div class="metric"><span>显示帧率</span><strong id="display-rate">0 FPS</strong></div>
+        <div class="metric"><span>累计发送</span><strong id="sent-bytes">0 B</strong></div>
+      </div>
+      <div id="controls-bar"><button id="pause">暂停</button><button id="stop">返回设置</button><button id="cancel">取消任务</button></div>
+    </div>
+    <div id="playback-info">等待二维码就绪</div><div id="playback-notice" role="status"></div>
+  </header>
   <div id="qrwrap">
     <div id="grid"></div>
-    <div id="hint">暂停/继续：空格 | 停止：S | 取消：C | Esc 返回</div>
+    <div id="preparation-message" hidden role="status"><h2>正在准备二维码</h2><p id="preparation-status"></p><small>虚线框即为后续播放区域，准备完成后在此播放。</small></div>
+    <div id="hint">暂停/继续：空格 | 返回：S / Esc | 取消：C</div>
   </div>
 </div>
 
 <script>
+const APP_CONFIG = /*APP_CONFIG*/ {};
 const fileInput = document.getElementById('file');
 const splitInput = document.getElementById('split');
 const fpsInput = document.getElementById('fps');
 const gridInput = document.getElementById('gridSize');
 const codecInput = document.getElementById('codec');
+const prepareInput = document.getElementById('preGenerate');
+const fitModeInput = document.getElementById('fitMode');
+const ppmInput = document.getElementById('ppmInput');
+const ppmWrap = document.getElementById('ppmWrap');
+
+// The scaling mode decides how much the browser is allowed to resample:
+//   fixed  — server renders N device px per module, page shows it 1:1 (default)
+//   scale  — page stretches the image to the cell; smoothest size, least robust
+//   manual — you pick the module size; still rendered and shown 1:1
+const FIT_MODES = ['fixed', 'scale', 'manual'];
+function loadFitMode() {
+  try {
+    const saved = localStorage.getItem('qrt-pro.fitMode');
+    if (FIT_MODES.includes(saved)) fitModeInput.value = saved;
+    const ppm = parseInt(localStorage.getItem('qrt-pro.ppm'), 10);
+    if (ppm >= 2 && ppm <= 8) ppmInput.value = ppm;
+  } catch (e) { /* private mode: defaults are fine */ }
+}
+function saveFitMode() {
+  try {
+    localStorage.setItem('qrt-pro.fitMode', fitModeInput.value);
+    localStorage.setItem('qrt-pro.ppm', String(clampPPM(ppmInput.value)));
+  } catch (e) { /* ignore */ }
+}
+function clampPPM(v) {
+  const n = parseInt(v, 10);
+  if (!isFinite(n)) return 4;
+  return Math.max(2, Math.min(8, n));
+}
+function syncFitModeUI() {
+  ppmWrap.style.display = fitModeInput.value === 'manual' ? '' : 'none';
+  saveFitMode();
+  applyFrameSize();
+}
+loadFitMode();
+fitModeInput.addEventListener('change', syncFitModeUI);
+ppmInput.addEventListener('change', syncFitModeUI);
+ppmWrap.style.display = fitModeInput.value === 'manual' ? '' : 'none';
 const colorModeInput = document.getElementById('colorMode');
 const decimenModeInput = document.getElementById('decimenMode');
 const startBtn = document.getElementById('start');
@@ -113,6 +240,13 @@ const statusEl = document.getElementById('status');
 const overlay = document.getElementById('overlay');
 const gridEl = document.getElementById('grid');
 const statsEl = document.getElementById('stats');
+const sendRateEl = document.getElementById('send-rate');
+const displayRateEl = document.getElementById('display-rate');
+const sentBytesEl = document.getElementById('sent-bytes');
+const playbackInfoEl = document.getElementById('playback-info');
+const playbackNoticeEl = document.getElementById('playback-notice');
+const preparationMessageEl = document.getElementById('preparation-message');
+const preparationStatusEl = document.getElementById('preparation-status');
 
 // Decimen and Color Matrix are mutually exclusive. Decimen pins the reference
 // sender's parameters (2953 B/frame V40-L, ECC L, mask 4, 60 fps, 2 codes) —
@@ -141,7 +275,7 @@ applyDecimenMode();
 // Color Matrix frames hold far fewer bytes than a QR symbol, so a split that
 // is fine for QR silently renders nothing here. The server clamps it anyway;
 // showing the cap up front saves a "why is nothing happening" round trip.
-const COLOR_SPLIT_CAP = 1539;
+const COLOR_SPLIT_CAP = 1426;
 colorModeInput.addEventListener('change', () => {
   if (colorModeInput.checked) {
     decimenModeInput.checked = false;
@@ -152,22 +286,220 @@ colorModeInput.addEventListener('change', () => {
 });
 
 let session = null;   // current encoded session, null if none
+let playbackRAF = null;
+let playbackGeneration = 0;
+let playbackCells = [];
+const PREFETCH_DEPTH = 3;
+const PRESENTATION_TOLERANCE_MS = 0.75;
+let playbackEpoch = null;
+let presentedFrames = 0;
+function releaseFrame(frame) {
+  if (frame && frame.url) { URL.revokeObjectURL(frame.url); frame.url = null; }
+}
+function releaseTiles() {
+  for (const tile of tiles) {
+    if (tile.qrtURL) URL.revokeObjectURL(tile.qrtURL);
+    tile.qrtURL = null;
+  }
+}
+function clearPlayback() {
+  playbackGeneration++;
+  if (playbackRAF !== null) cancelAnimationFrame(playbackRAF);
+  playbackRAF = null;
+  for (const cell of playbackCells) for (const slot of cell.slots) {
+    if (slot.controller) slot.controller.abort();
+    releaseFrame(slot);
+    if (slot.image) slot.image.removeAttribute('src');
+  }
+  playbackCells = [];
+}
 let running = false;  // overlay active and playing
 let paused = false;
+let encodeGeneration = 0;
 let encoding = false; // a serialization request is in flight
 let encodeAbort = null; // AbortController for the in-flight serialization
 let fileMD5 = '';     // MD5 of the currently selected file
-let base = 0;         // index of the first frame on screen
-let shownBytes = 0;
 let startTime = 0;
 let tiles = [];
-let seqCursor = 0;    // carousel stream position (one seq per cell flip)
-let cellNextAt = [];  // per-cell next flip time for staggered phases
+let seqCursor = 0;    // next sequence reserved for prefetch
 
 function bytesFmt(n) {
   if (n >= 1048576) return (n / 1048576).toFixed(2) + ' MB';
   if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
   return n + ' B';
+}
+
+// A bounded two-second window of frames actually inserted for presentation.
+// Prefetched, failed or merely downloaded images never enter this meter.
+let sendMeter = {samples: [], epoch: 0, lastUpdate: -Infinity, totalBytes: 0, unknown: false};
+let playbackError = '';
+function resetSendStats(now) {
+  sendMeter = {samples: [], epoch: now, lastUpdate: -Infinity, totalBytes: 0, unknown: false};
+  playbackError = '';
+}
+function resetSendWindow(now) {
+  sendMeter.samples = [];
+  sendMeter.epoch = now;
+  sendMeter.lastUpdate = -Infinity;
+}
+function recordPresentedFrame(now, payloadBytes) {
+  const known = Number.isSafeInteger(payloadBytes) && payloadBytes >= 0;
+  const bytes = known ? payloadBytes : 0;
+  let sample = sendMeter.samples[sendMeter.samples.length - 1];
+  if (!sample || sample.at !== now) {
+    sample = {at: now, bytes: 0, frames: 0, unknown: 0};
+    sendMeter.samples.push(sample);
+  }
+  sample.bytes += bytes;
+  sample.frames++;
+  sample.unknown += known ? 0 : 1;
+  sendMeter.totalBytes += bytes;
+  sendMeter.unknown ||= !known;
+}
+function playbackRates(now) {
+  const cutoff = now - 2000;
+  let old = 0;
+  while (old < sendMeter.samples.length && sendMeter.samples[old].at <= cutoff) old++;
+  if (old) sendMeter.samples.splice(0, old);
+  let bytes = 0, frames = 0, unknown = 0;
+  for (const sample of sendMeter.samples) {
+    bytes += sample.bytes; frames += sample.frames; unknown += sample.unknown;
+  }
+  const seconds = Math.max(0.001, Math.min(2000, now - sendMeter.epoch) / 1000);
+  return {bytes: unknown ? null : bytes / seconds, fps: frames / seconds / session.codes};
+}
+function updatePlaybackStats(now, force = false) {
+  if (!session || (!force && now - sendMeter.lastUpdate < 250)) return;
+  sendMeter.lastUpdate = now;
+  const rates = playbackRates(now);
+  const warming = !paused && now - sendMeter.epoch < 250;
+  sendRateEl.textContent = paused ? '0 KB/s' : warming ? '测量中' : rates.bytes === null ? '—' : bytesFmt(Math.round(rates.bytes)) + '/s';
+  displayRateEl.textContent = (paused ? '0.0' : warming ? '0.0' : rates.fps.toFixed(1)) + ' FPS';
+  sentBytesEl.textContent = sendMeter.unknown ? '—' : bytesFmt(sendMeter.totalBytes);
+  playbackInfoEl.textContent = (paused ? '已暂停 · ' : '') + '已显示 ' + presentedFrames + ' 帧 · 目标 ' + session.fps + ' FPS/码 · 网格 ' + session.dims.cols + '×' + session.dims.rows + ' · ' + sizeNote();
+  playbackNoticeEl.textContent = playbackError;
+}
+function showPreparation(codes) {
+  releaseTiles();
+  tiles = [];
+  const dims = gridDims(codes);
+  gridEl.innerHTML = '';
+  gridEl.style.gridTemplateColumns = 'repeat(' + dims.cols + ', 1fr)';
+  gridEl.style.gridTemplateRows = 'repeat(' + dims.rows + ', 1fr)';
+  for (let i = 0; i < codes; i++) {
+    const cell = document.createElement('div');
+    cell.className = 'preview-cell';
+    gridEl.appendChild(cell);
+  }
+  gridEl.classList.add('preparing');
+  preparationStatusEl.textContent = statusEl.textContent;
+  preparationMessageEl.hidden = false;
+  pauseBtn.disabled = true;
+  sendRateEl.textContent = '0 KB/s';
+  displayRateEl.textContent = '0 FPS';
+  sentBytesEl.textContent = '0 B';
+  playbackInfoEl.textContent = '准备中 · 网格 ' + dims.cols + '×' + dims.rows;
+  playbackNoticeEl.textContent = '';
+  overlay.classList.add('active');
+}
+function finishPreparation() {
+  gridEl.classList.remove('preparing');
+  preparationMessageEl.hidden = true;
+  pauseBtn.disabled = false;
+}
+
+function limitBytes(n) {
+  return (n / 1048576).toFixed(2) + ' MiB（' + n.toLocaleString() + ' 字节）';
+}
+
+// Mirrors the fixed QRT2 fields and the current sender's sequential symbol IDs.
+// Filename packets are <= 520 bytes, below either visual format's capacity.
+function dataFrameBytes(total, split, codec) {
+  const k = Math.ceil(total / split);
+  if (codec !== 'raptorq' && (k === 1 || (codec === 'raptor' && k < 4))) codec = 'lt';
+  const count = codec === 'raptorq' ? k + Math.floor(k * 1.05) : (k === 1 ? 1 : 2 * k);
+  const header = ['QRT2', '0'.repeat(32), '0'.repeat(64), count - 1, split, total, codec, 'data', '00000000'].join('/') + '|';
+  return header.length + (codec === 'raptorq' ? split : Math.ceil(total / k));
+}
+
+function usableSplitRange(total, codec, capacity, maximum) {
+  const minimum = Math.ceil(total / APP_CONFIG.maxSourceBlocks);
+  for (let split = maximum; split >= minimum; split--) {
+    if (dataFrameBytes(total, split, codec) <= capacity) return {minimum, maximum: split};
+  }
+  return {minimum, maximum: 0};
+}
+
+function transferPolicy(file) {
+  const c = APP_CONFIG;
+  const result = {error: '', maxFileBytes: 0, blocks: 0, frameBytes: 0, split: 0};
+  if (!c.maxSourceBlocks || !c.maxUploadBytes) {
+    result.error = '无法读取传输限制，请刷新页面。'; return result;
+  }
+  const decimen = decimenModeInput.checked, color = colorModeInput.checked && !decimen;
+  const inputSplit = Number(splitInput.value);
+  const split = decimen ? c.decimenBlockBytes : (color ? Math.min(inputSplit, c.colorSplitBytes) : inputSplit);
+  result.split = split;
+  if (!Number.isInteger(inputSplit) || inputSplit < 1 || (!decimen && !color && inputSplit > c.maxChunkBytes)) {
+    if (!decimen) { result.error = '分片必须是 1～' + c.maxChunkBytes + ' 的整数；普通 QR 还需为协议头留出容量。'; return result; }
+  }
+  result.maxFileBytes = decimen ? c.maxUploadBytes : Math.min(c.maxUploadBytes, c.maxSourceBlocks * split);
+  if (!file) return result;
+  if (!file.size || file.size > c.maxUploadBytes) {
+    result.error = '请选择非空文件，上传上限为 ' + limitBytes(c.maxUploadBytes) + '。'; return result;
+  }
+  if (decimen) return result;
+  result.blocks = Math.ceil(file.size / split);
+  result.frameBytes = dataFrameBytes(file.size, split, codecInput.value);
+  const capacity = color ? c.colorFrameBytes : c.qrFrameBytes;
+  result.range = usableSplitRange(file.size, codecInput.value, capacity, color ? c.colorSplitBytes : c.maxChunkBytes);
+  if (result.blocks > c.maxSourceBlocks) {
+    const possible = result.range.maximum > 0;
+    result.error = '文件需要 ' + result.blocks.toLocaleString() + ' 个源块，当前最多 ' + c.maxSourceBlocks.toLocaleString()
+      + ' 个；当前分片的文件上限为 ' + limitBytes(result.maxFileBytes) + '。\n'
+      + (possible ? '该文件的可用分片范围为 ' + result.range.minimum + '～' + result.range.maximum + ' 字节。'
+        : '该文件无法仅靠增大分片满足当前模式的限制，请压缩或分卷后分别传输。');
+  } else if (result.frameBytes > capacity) {
+    result.error = '当前数据帧约 ' + result.frameBytes + ' 字节（含协议头），超过 '
+      + (color ? 'Color' : 'QR ECC M') + ' 容量 ' + capacity + ' 字节。'
+      + (result.range.maximum ? '该文件的可用分片范围为 ' + result.range.minimum + '～' + result.range.maximum + ' 字节。'
+        : '该文件在当前模式没有可用分片范围，请压缩或分卷传输。');
+  }
+  return result;
+}
+
+function updateLimits() {
+  const c = APP_CONFIG, policy = transferPolicy(fileInput.files[0]);
+  document.getElementById('version').textContent = c.version ? 'QRT Pro v' + c.version : '版本未知';
+  if (c.version) document.title = 'QRT Pro v' + c.version + ' · 序列化工具';
+  let text = '传输限制\n';
+  if (c.maxSourceBlocks) {
+    text += '上传上限：' + limitBytes(c.maxUploadBytes) + '\n';
+    text += decimenModeInput.checked ? 'Decimen：每帧 ' + c.decimenBlockBytes + ' 字节，固定 60 FPS / 2 码。\n'
+      : '经典模式：源块最多 ' + c.maxSourceBlocks.toLocaleString() + ' 个；当前实际分片 ' + policy.split + ' 字节。\n'
+        + '当前分片的文件参数上限：' + limitBytes(policy.maxFileBytes) + '。\n'
+        + (colorModeInput.checked ? 'Color 每帧总容量 ' + c.colorFrameBytes + ' 字节，实际分片最多 ' + c.colorSplitBytes + ' 字节。\n'
+          : 'QR ECC M 每帧总容量 ' + c.qrFrameBytes + ' 字节，包含协议头，并非全都可用于分片。\n');
+    if (policy.frameBytes) text += '所选文件：' + policy.blocks.toLocaleString() + ' 个源块，数据帧约 ' + policy.frameBytes + ' 字节（含头）。\n';
+    if (policy.range) text += policy.range.maximum ? '该文件的可用分片范围：' + policy.range.minimum + '～' + policy.range.maximum + ' 字节。\n' : '该文件在当前模式没有可用分片范围。\n';
+    text += '资源上限：编码进程 ' + Math.round(c.workerMemoryBytes / 1048576) + ' MiB；单次图像缓存 '
+      + Math.round(c.pngCacheBytes / 1048576) + ' MiB；会话缓存合计 ' + Math.round(c.sessionCacheBytes / 1048576)
+      + ' MiB / ' + c.maxSessions + ' 个会话；编码最长 ' + c.encodeTimeoutSeconds / 60 + ' 分钟。\n'
+      + '参数上限不代表资源一定足够；实际显示帧率还受屏幕及远程桌面限制。';
+  } else text += policy.error;
+  document.getElementById('limits').textContent = text;
+  document.getElementById('selection-error').textContent = policy.error;
+  if (!encoding) startBtn.disabled = Boolean(policy.error);
+}
+
+async function refreshSenderLogs() {
+  try {
+    const response = await fetch('/logs', {cache:'no-store'});
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const data = await response.json();
+    document.getElementById('log-path').textContent = '日志文件：' + data.path + (data.writeError ? '\n文件写入失败，以下为内存日志：' + data.writeError : '');
+    document.getElementById('sender-log').textContent = data.lines.join('\n');
+  } catch (error) { document.getElementById('sender-log').textContent = '日志读取失败：' + error.message; }
 }
 
 // gridDims mirrors the reference: count of codes -> {cols, rows}.
@@ -180,6 +512,7 @@ function gridDims(n) {
 // buildTiles creates one tile per code, laid out per gridDims (1 → 1×1,
 // 2 → 1×2, 4 → 2×2). Classic mode passes cols*cols, decimen passes its code count.
 function buildTiles(codes, dims) {
+  releaseTiles();
   gridEl.innerHTML = '';
   gridEl.style.gridTemplateColumns = 'repeat(' + dims.cols + ', 1fr)';
   gridEl.style.gridTemplateRows = 'repeat(' + dims.rows + ', 1fr)';
@@ -192,7 +525,87 @@ function buildTiles(codes, dims) {
   }
 }
 
+// fitBudget returns the device-pixel budget for ONE code, estimated from the
+// viewport before the overlay is laid out (the grid has no box until it is
+// shown). The server turns it into an integer module size, so being off by a
+// few pixels only changes how large the code looks, never its correctness.
+function fitBudget(codesCount) {
+  const dims = gridDims(codesCount);
+  const compact = window.innerWidth <= 640;
+  const box = Math.min(window.innerWidth - (compact ? 56 : 100), window.innerHeight - (compact ? 244 : 210)) - 44;
+  const cell = Math.min(box / dims.cols, box / dims.rows) - 8;
+  return Math.max(0, Math.floor(cell * (window.devicePixelRatio || 1)));
+}
+
+// applyFrameSize shows every frame at exactly the size the server rendered it:
+// modules * ppm device pixels, never a viewport-relative stretch. This is the
+// whole point of the ppm plumbing — a barcode detector estimates one module
+// width and samples on a fixed grid, so a fractional module size (2.37 px, say)
+// leaves some modules 2 px and others 3 px, the grid drifts, and the frame
+// decodes or fails depending on the exact ratio. Measured at 1:1: 21 of 21
+// frame/size/margin combinations decoded; stretched to the viewport only ~60%
+// did, with whole runs of zero.
+function applyFrameSize() {
+  if (!session || !tiles.length || !session.modules || !session.ppm) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cell = tileBudget();
+
+  if (fitModeInput.value === 'scale') {
+    // The user asked for the image to fill the cell. This is the one mode where
+    // the browser resamples on purpose, so it costs reliability — it is here so
+    // the old behaviour is still reachable.
+    for (const t of tiles) {
+      t.style.width = '100%';
+      t.style.height = 'auto';
+      t.style.maxWidth = '';
+      t.style.maxHeight = '';
+    }
+    session.fitOk = true;
+    session.applied = 'scale';
+    return;
+  }
+
+  const css = (session.modules * session.ppm) / dpr;
+  // If the window shrank below what the frames were rendered for, the choice is
+  // clipping (undecodable) or scaling (uneven modules). Scale, and say so.
+  const fits = cell <= 0 || css <= cell + 0.5;
+  for (const t of tiles) {
+    t.style.width = css + 'px';
+    t.style.height = css + 'px';
+    t.style.maxWidth = fits ? '' : Math.floor(cell) + 'px';
+    t.style.maxHeight = fits ? '' : Math.floor(cell) + 'px';
+  }
+  session.fitOk = fits;
+  // Manual size is baked into the frames, so a changed number needs a re-encode.
+  session.applied = fitModeInput.value === 'manual' && clampPPM(ppmInput.value) !== session.ppm
+    ? 'pending'
+    : 'exact';
+}
+
+// tileBudget returns the CSS pixels actually available for one cell now.
+function tileBudget() {
+  const box = gridEl.getBoundingClientRect();
+  if (!box.width || !box.height) return 0;
+  const style = getComputedStyle(gridEl);
+  const px = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+  const py = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+  const bx = parseFloat(style.borderLeftWidth) + parseFloat(style.borderRightWidth);
+  const by = parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth);
+  const gap = parseFloat(style.gap) || 0;
+  const cols = session.dims.cols, rows = session.dims.rows;
+  const w = (box.width - bx - px - gap * (cols - 1)) / cols;
+  const h = (box.height - by - py - gap * (rows - 1)) / rows;
+  return Math.min(w, h);
+}
+
+let fitTimer = 0;
+window.addEventListener('resize', () => {
+  clearTimeout(fitTimer);
+  fitTimer = setTimeout(applyFrameSize, 120);
+});
+
 function showFileInfo() {
+  updateLimits();
   const file = fileInput.files[0];
   if (!file) { statusEl.textContent = ''; return; }
   const ready = session ? '（已编码，可「继续序列化」）' : '';
@@ -200,38 +613,26 @@ function showFileInfo() {
   statusEl.textContent = file.name + '  ' + bytesFmt(file.size) + ready + md5;
 }
 
-// Compute the file's MD5 locally via the server so it can be shown the
-// moment a file is picked, long before any serialization starts.
-async function updateFileMD5() {
-  const file = fileInput.files[0];
-  fileMD5 = '';
-  showFileInfo();
-  if (!file) return;
-  try {
-    const resp = await fetch('/md5', { method: 'POST', body: await file.arrayBuffer() });
-    if (!resp.ok) return;
-    const data = await resp.json();
-    if (fileInput.files[0] === file) {
-      fileMD5 = data.md5 || '';
-      showFileInfo();
-    }
-  } catch (e) { /* network hiccup: leave MD5 empty */ }
-}
-
-async function encodeFile() {
+async function encodeFile(generation) {
   const file = fileInput.files[0];
   if (!file) { statusEl.textContent = '请先选择文件'; return null; }
+  const policy = transferPolicy(file);
+  if (policy.error) { statusEl.textContent = policy.error; updateLimits(); return null; }
   const decimen = decimenModeInput.checked;
   // Decimen uses fixed reference parameters; only classic mode reads the knobs.
-  const fps = decimen ? DECIMEN_FPS : (parseFloat(fpsInput.value) || 15);
-  const cols = decimen ? DECIMEN_CODES : (parseInt(gridInput.value, 10) || 1);
+  const fps = decimen ? DECIMEN_FPS : Math.max(1, Math.min(120, parseFloat(fpsInput.value) || 30));
+  const cols = decimen ? DECIMEN_CODES : Math.max(1, Math.min(4, parseInt(gridInput.value, 10) || 1));
   const split = parseInt(splitInput.value, 10) || 1024;
   const codec = codecInput.value;
+  const prepareMode = prepareInput.checked ? 'all' : 'progressive';
   startBtn.disabled = false;
   startBtn.textContent = '取消序列化';
   encoding = true;
-  encodeAbort = new AbortController();
-  statusEl.textContent = '编码中...（点击「取消序列化」可中止）';
+  const controller = new AbortController();
+  encodeAbort = controller;
+  statusEl.textContent = prepareMode === 'all' ? '正在编码并预生成整轮二维码，可取消。' : '正在编码并准备首批二维码，可取消；后续帧将提前生成。';
+  const codesCount = decimen ? DECIMEN_CODES : cols * cols;
+  showPreparation(codesCount);
   try {
     let url;
     if (decimen) {
@@ -239,12 +640,26 @@ async function encodeFile() {
         + '&name=' + encodeURIComponent(file.name)
         + '&type=' + encodeURIComponent(file.type || 'application/octet-stream');
     } else {
-      url = '/encode?split=' + split + '&codec=' + codec;
+      url = '/encode?split=' + split + '&codec=' + codec + '&name=' + encodeURIComponent(file.name);
       if (colorModeInput.checked) url += '&mode=color';
     }
-    const resp = await fetch(url, { method: 'POST', body: await file.arrayBuffer(), signal: encodeAbort.signal });
+    // fixed  → tell the server how many device pixels one code may use
+    // manual → ask for exactly that many pixels per module
+    // scale  → let the server use its default module size; the page stretches
+    if (fitModeInput.value === 'fixed') {
+      url += '&fit=' + fitBudget(codesCount);
+    } else if (fitModeInput.value === 'manual') {
+      url += '&ppm=' + clampPPM(ppmInput.value);
+    }
+    url += '&prepare=' + encodeURIComponent(prepareMode);
+    const resp = await fetch(url, { method: 'POST', body: await file.arrayBuffer(), signal: controller.signal });
     if (!resp.ok) throw new Error(await resp.text());
     const data = await resp.json();
+    if (generation !== encodeGeneration) {
+      fetch('/cancel/' + data.id,{method:'DELETE'}).catch(() => {});
+      return null;
+    }
+    fileMD5 = data.md5 || '';
     statusEl.textContent = '编码完成：' + bytesFmt(file.size) + ' · MD5: ' + (data.md5 || '');
     return {
       id: data.id, count: data.count, total: data.total,
@@ -252,29 +667,45 @@ async function encodeFile() {
       codes: decimen ? DECIMEN_CODES : cols * cols,
       dims: gridDims(decimen ? DECIMEN_CODES : cols * cols),
       carousel: !!data.carousel, k: data.k, sessionId: data.sessionId, blockLen: data.blockLen || data.split || split,
+      modules: data.modules || 0, ppm: data.ppm || 0,
     };
   } catch (e) {
+    if (generation !== encodeGeneration) return null;
+    finishPreparation();
+    overlay.classList.remove('active');
     if (e && e.name === 'AbortError') {
       statusEl.textContent = '已取消序列化';
       return null;
     }
     statusEl.textContent = '编码失败: ' + e.message;
+    document.getElementById('logs-panel').open = true;
+    refreshSenderLogs();
     return null;
   } finally {
-    encoding = false;
-    encodeAbort = null;
-    startBtn.disabled = false;
-    startBtn.textContent = '序列化';
+    if (generation === encodeGeneration) {
+      encoding = false;
+      encodeAbort = null;
+      startBtn.disabled = false;
+      startBtn.textContent = '序列化';
+      updateLimits();
+    }
   }
 }
 
 async function start() {
+  const generation = ++encodeGeneration;
+  clearPlayback();
+  running = false;
   // re-encode always, so params/file changes take effect and stale session is dropped
   if (session) await cancelSession();
-  session = await encodeFile();
+  if (generation !== encodeGeneration) return;
+  const nextSession = await encodeFile(generation);
+  if (generation !== encodeGeneration) return;
+  session = nextSession;
   if (!session) return;
-  base = 0;
-  shownBytes = 0;
+  finishPreparation();
+  resetSendStats(performance.now());
+  presentedFrames = 0;
   seqCursor = 0;
   startTime = performance.now();
   paused = false;
@@ -282,89 +713,153 @@ async function start() {
   buildTiles(session.codes, session.dims);
   running = true;
   overlay.classList.add('active');
+  // Only measure once the overlay is visible: while it is display:none the grid
+  // has no box. The image size itself does not depend on this measurement.
+  applyFrameSize();
+  requestAnimationFrame(applyFrameSize);
   if (session.carousel) startDecimenLoop();
   else showFrame();
 }
 
-function showFrame() {
-  if (!running || paused) return;
-  const n = session.codes;
-  for (let i = 0; i < n; i++) {
-    const frameIdx = (base + i) % session.count;
-    tiles[i].src = '/frame/' + session.id + '/' + frameIdx;
+// Keep enough decoded images ahead to overlap network and Image.decode().
+// A single next image can miss a compositor turn and halve the displayed FPS.
+function showFrame() { startPlayback(); }
+function startDecimenLoop() { startPlayback(); }
+
+function startPlayback() {
+  clearPlayback();
+  if (!running || paused || !session) return;
+  const generation = playbackGeneration;
+  playbackEpoch = null;
+  resetSendWindow(performance.now());
+  updatePlaybackStats(performance.now(), true);
+  const phase = session.carousel ? 1000 / session.fps / session.codes : 0;
+  playbackCells = tiles.map((_, index) => ({index, phase: index * phase,
+    nextAt: null, slots: []}));
+  fillPrefetch(generation);
+  playbackRAF = requestAnimationFrame(time => playbackTick(time, generation));
+}
+
+function fillPrefetch(generation) {
+  if (generation !== playbackGeneration) return;
+  // Allocate sequences by depth then cell, preserving the usual systematic
+  // sweep across a grid while requests are allowed to complete independently.
+  for (let depth = 0; depth < PREFETCH_DEPTH; depth++) for (const cell of playbackCells) {
+    if (cell.slots.length > depth) continue;
+    const slot = {frameIndex: seqCursor++ % session.count, image: null, url: null,
+      controller: null, loading: false, ready: false, retryAt: 0, failures: 0};
+    cell.slots.push(slot);
+    prefetchFrame(slot, generation);
   }
-  base = (base + n) % session.count;
-  const elapsed = (performance.now() - startTime) / 1000;
-  shownBytes += session.split * n;
-  const rateFile = shownBytes / elapsed;
-  statsEl.textContent =
-    '帧 ' + (base + 1) + '/' + session.count +
-    ' | 网格 ' + session.dims.cols + 'x' + session.dims.rows +
-    ' | 已播放 ' + bytesFmt(shownBytes) +
-    ' | ' + bytesFmt(rateFile) + '/s';
-  setTimeout(showFrame, 1000 / session.fps);
+}
+
+async function prefetchFrame(slot, generation) {
+  if (slot.loading || slot.ready || generation !== playbackGeneration) return;
+  slot.loading = true;
+  slot.controller = new AbortController();
+  try {
+    const response = await fetch('/frame/' + session.id + '/' + slot.frameIndex,
+      {signal: slot.controller.signal, cache: 'no-store'});
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const payloadHeader = response.headers?.get('X-QRT-Payload-Bytes');
+    const payload = payloadHeader == null || payloadHeader === '' ? NaN : Number(payloadHeader);
+    slot.payloadBytes = Number.isSafeInteger(payload) && payload >= 0 && payload <= 2933 ? payload : null;
+    const blob = await response.blob();
+    if (generation !== playbackGeneration) return;
+    slot.image = new Image();
+    slot.url = URL.createObjectURL(blob);
+    slot.image.src = slot.url;
+    await slot.image.decode();
+    if (generation !== playbackGeneration) return;
+    slot.ready = true;
+    slot.failures = 0;
+    playbackError = '';
+  } catch (error) {
+    if (generation === playbackGeneration && error.name !== 'AbortError') {
+      slot.failures++;
+      slot.retryAt = performance.now() + Math.min(3000, 250 * 2 ** Math.min(4, slot.failures - 1));
+      playbackError = '取帧失败，正在重试：' + error.message;
+    }
+  } finally {
+    if (!slot.ready || generation !== playbackGeneration) releaseFrame(slot);
+    slot.loading = false;
+  }
+}
+
+function playbackTick(now, generation) {
+  if (generation !== playbackGeneration || !running || paused || !session) return;
+  playbackRAF = null;
+  if (playbackEpoch === null && playbackCells.some(cell => cell.slots[0]?.ready)) {
+    playbackEpoch = now;
+    for (const cell of playbackCells) cell.nextAt = now + cell.phase;
+  }
+  const interval = 1000 / session.fps;
+  for (const cell of playbackCells) {
+    for (const slot of cell.slots) if (!slot.loading && !slot.ready && now >= slot.retryAt) prefetchFrame(slot, generation);
+    const ready = cell.slots[0];
+    if (!ready?.ready || cell.nextAt === null || now + PRESENTATION_TOLERANCE_MS < cell.nextAt) continue;
+    const previous = tiles[cell.index];
+    ready.image.alt = 'QR';
+    ready.image.style.cssText = previous.style.cssText;
+    ready.image.qrtURL = ready.url;
+    ready.url = null;
+    previous.replaceWith(ready.image);
+    if (previous.qrtURL) URL.revokeObjectURL(previous.qrtURL);
+    tiles[cell.index] = ready.image;
+    cell.slots.shift();
+    // Advance the established timeline, rather than restarting the interval
+    // at a jittered RAF timestamp. This avoids 30->20 and 60->30 FPS rounding.
+    const intervals = Math.max(1, Math.floor((now + PRESENTATION_TOLERANCE_MS - cell.nextAt) / interval) + 1);
+    cell.nextAt += intervals * interval;
+    presentedFrames++;
+    recordPresentedFrame(now, ready.payloadBytes);
+    // All cells due in this refresh can update. Serializing an N-cell grid
+    // into one flip per refresh imposes an unintended N-fold throughput cap.
+  }
+  fillPrefetch(generation);
+  updatePlaybackStats(now);
+  playbackRAF = requestAnimationFrame(time => playbackTick(time, generation));
+}
+
+// sizeNote turns the current sizing state into one short phrase for the HUD, so
+// a mismatch (wrong mode for the frames being served) is visible rather than
+// silently resampled.
+function sizeNote() {
+  if (!session) return '';
+  if (session.applied === 'scale') return '铺满窗口（允许缩放）';
+  if (session.applied === 'pending') return '点「序列化」应用 ' + clampPPM(ppmInput.value) + 'px/模块';
+  if (!session.ppm) return '';
+  return session.ppm + 'px/模块' + (session.fitOk === false ? '，窗口偏小已缩放' : '');
 }
 
 function togglePause() {
   if (!running) return;
+  clearPlayback();
   paused = !paused;
   pauseBtn.textContent = paused ? '继续' : '暂停';
+  resetSendWindow(performance.now());
+  updatePlaybackStats(performance.now(), true);
   if (!paused) {
     if (session && session.carousel) startDecimenLoop();
     else showFrame();
   }
 }
 
-// Decimen stream loop: an endless carousel over the pre-rendered cycle.
-// Cells flip on staggered phases (cell j flips at j/N of the frame interval)
-// so a camera exposure that straddles a flip catches at most ONE code mid-
-// transition — with simultaneous flips the same exposure would lose them all.
-function startDecimenLoop() {
-  if (!session) return;
-  const n = session.codes;
-  const interval = 1000 / session.fps;
-  const sub = interval / n;
-  const now = performance.now();
-  cellNextAt = [];
-  for (let j = 0; j < n; j++) cellNextAt[j] = now + j * sub;
-  requestAnimationFrame(decimenTick);
-}
-
-function decimenTick(now) {
-  if (!running || paused || !session || !session.carousel) return;
-  const n = session.codes;
-  const interval = 1000 / session.fps;
-  const sub = interval / n;
-  let flipped = false;
-  for (let j = 0; j < n; j++) {
-    if (now < cellNextAt[j]) continue;
-    const seq = seqCursor++;
-    tiles[j].src = '/frame/' + session.id + '/' + (seq % session.count);
-    cellNextAt[j] += interval;
-    if (cellNextAt[j] <= now) cellNextAt[j] = now + sub; // catch up after a stall
-    flipped = true;
-  }
-  if (flipped) {
-    const elapsed = (performance.now() - startTime) / 1000;
-    shownBytes += session.blockLen * n;
-    const rateFile = shownBytes / elapsed;
-    statsEl.textContent =
-      '帧 ' + seqCursor +
-      ' | 网格 ' + session.dims.cols + 'x' + session.dims.rows +
-      ' | K=' + session.k + ' | ' + session.blockLen + 'B/帧' +
-      ' | 已播放 ' + bytesFmt(shownBytes) +
-      ' | ' + bytesFmt(rateFile) + '/s' +
-      ' | session ' + session.sessionId;
-  }
-  requestAnimationFrame(decimenTick);
-}
-
 function stop() {
+  if (encoding && encodeAbort) {
+    encodeAbort.abort();
+    finishPreparation();
+    overlay.classList.remove('active');
+    return;
+  }
   if (!running && !session) return;
+  clearPlayback();
+  finishPreparation();
   running = false;
   paused = false;
   pauseBtn.textContent = '暂停';
   overlay.classList.remove('active');
+  releaseTiles();
   gridEl.innerHTML = '';
   tiles = [];
   startBtn.textContent = '继续序列化';
@@ -380,16 +875,20 @@ async function cancelSession() {
 }
 
 async function cancel() {
+  const generation = ++encodeGeneration;
+  encoding = false;
   if (encodeAbort) encodeAbort.abort(); // abort any in-flight serialization
+  clearPlayback();
+  finishPreparation();
   running = false;
   paused = false;
   pauseBtn.textContent = '暂停';
   overlay.classList.remove('active');
+  releaseTiles();
   gridEl.innerHTML = '';
   tiles = [];
   await cancelSession();
-  base = 0;
-  shownBytes = 0;
+  if (generation !== encodeGeneration) return;
   startBtn.textContent = '序列化';
   showFileInfo();
 }
@@ -397,7 +896,8 @@ async function cancel() {
 fileInput.addEventListener('change', function () {
   // re-selected file: drop the old session so everything is fresh
   cancel();
-  updateFileMD5();
+  fileMD5 = '';
+  showFileInfo();
 });
 
 startBtn.addEventListener('click', function () {
@@ -407,12 +907,18 @@ startBtn.addEventListener('click', function () {
 pauseBtn.addEventListener('click', togglePause);
 stopBtn.addEventListener('click', stop);
 cancelBtn.addEventListener('click', cancel);
+document.getElementById('refresh-logs').addEventListener('click', refreshSenderLogs);
 document.addEventListener('keydown', function (e) {
   if (e.key === 'Escape') stop();
-  else if (e.key === ' ') { e.preventDefault(); togglePause(); }
+  else if (e.key === ' ' && overlay.classList.contains('active')) { e.preventDefault(); togglePause(); }
   else if (e.key === 's' || e.key === 'S') stop();
   else if (e.key === 'c' || e.key === 'C') cancel();
 });
+for (const control of [splitInput, codecInput, colorModeInput, decimenModeInput]) {
+  control.addEventListener('input', updateLimits);
+  control.addEventListener('change', updateLimits);
+}
+updateLimits();
 </script>
 
 </body>

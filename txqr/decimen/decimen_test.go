@@ -19,7 +19,7 @@ func TestHeaderGolden(t *testing.T) {
 		Seq:        0x01020304,
 		K:          0x0111,
 		BlockLen:   6,
-		TotalLen:   0x00fedcba,
+		TotalLen:   0x00000662,
 		PayloadFnv: 0x89abcdef,
 	}, []byte{1, 2, 3, 4, 5, 6})
 
@@ -29,7 +29,7 @@ func TestHeaderGolden(t *testing.T) {
 		0x04, 0x03, 0x02, 0x01,
 		0x11, 0x01,
 		0x06, 0x00,
-		0xba, 0xdc, 0xfe, 0x00,
+		0x62, 0x06, 0x00, 0x00,
 		0xef, 0xcd, 0xab, 0x89,
 		0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
 	}
@@ -46,7 +46,7 @@ func TestHeaderGolden(t *testing.T) {
 	}
 	if parsed.Header.SessionId != 0xbeef || parsed.Header.Seq != 0x01020304 ||
 		parsed.Header.K != 0x0111 || parsed.Header.BlockLen != 6 ||
-		parsed.Header.TotalLen != 0x00fedcba || parsed.Header.PayloadFnv != 0x89abcdef {
+		parsed.Header.TotalLen != 0x00000662 || parsed.Header.PayloadFnv != 0x89abcdef {
 		t.Fatalf("header round-trip mismatch: %+v", parsed.Header)
 	}
 	if !bytes.Equal(parsed.Payload, []byte{1, 2, 3, 4, 5, 6}) {

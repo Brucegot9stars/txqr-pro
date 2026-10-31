@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,8 +14,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/divan/txqr/internal/w32"
 )
 
 // Rect is captured in virtual-screen coordinates. It duplicates w32.Rect rather
@@ -39,13 +38,9 @@ func (r Rect) H() int32 {
 }
 
 // CaptureFunc grabs a screen rectangle and returns both an RGBA image for
-// decoding and the raw BGRA bytes for the preview pane.
+// decoding and the raw BGRA bytes for the preview pane. Returned buffers must
+// remain immutable: decode workers and the preview consume them asynchronously.
 type CaptureFunc func(r Rect) (*image.RGBA, []byte, error)
-
-// DefaultCapture captures through the Win32 screen DC.
-func DefaultCapture(r Rect) (*image.RGBA, []byte, error) {
-	return w32.Capture(w32.Rect{L: r.L, T: r.T, R: r.R, B: r.B})
-}
 
 // FrameInterval is the capture cadence (~60 fps). A frame that overruns simply
 // skips the next tick rather than queueing behind itself.
@@ -89,12 +84,14 @@ type Manager struct {
 	mu      sync.Mutex
 	regions []*region
 	nextID  int
+	closing bool
 
 	// progressByBlocks toggles the decimen flavour: solved blocks vs frames.
 	progressByBlocks bool
 	saveFails        bool
 
 	saveDir string
+	audit   *Audit
 
 	decQueue  chan decJob
 	saveQueue chan saveJob
@@ -134,9 +131,10 @@ type region struct {
 }
 
 type decJob struct {
-	r    *region
-	gen  int
-	rgba *image.RGBA
+	r      *region
+	gen    int
+	rgba   *image.RGBA
+	qrHint string
 }
 
 type saveJob struct {
@@ -162,6 +160,14 @@ func New(capture CaptureFunc, opts Options) *Manager {
 		cancel:    cancel,
 	}
 	m.saveDir = m.resolveSaveDir(opts.SaveDir)
+	// The diagnostic log lives next to the received files (in a logs/ subdir) so
+	// it is findable without hunting through the OS temp dir. OpenAudit never
+	// fails: if the file cannot be created the receiver still runs and the ring
+	// buffer still answers "why did it fail".
+	m.audit = OpenAudit(filepath.Join(m.saveDir, "logs", "receiver.log"))
+	m.audit.Always(0, AuditInfo, "app.start", fmt.Sprintf(
+		"保存目录 %s；decode worker %d 个；日志 %s",
+		m.saveDir, decodeWorkers(), m.audit.Path()))
 
 	n := decodeWorkers()
 	m.wg.Add(n + 1) // n decode workers + the saver
@@ -218,7 +224,21 @@ func (m *Manager) resolveSaveDir(want string) string {
 }
 
 // SaveDir reports where transfers land.
-func (m *Manager) SaveDir() string { return m.saveDir }
+func (m *Manager) SaveDir() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.saveDir
+}
+
+// AuditPath reports where the diagnostic log is written ("" when file logging
+// is unavailable, for example on a read-only save dir).
+func (m *Manager) AuditPath() string { return m.audit.Path() }
+
+// AuditFileError explains why file logging is off, or "".
+func (m *Manager) AuditFileError() string { return m.audit.FileError() }
+
+// AuditEntries returns the newest diagnostic entries, oldest first.
+func (m *Manager) AuditEntries(n int) []AuditEntry { return m.audit.Entries(n) }
 
 // SetSaveDir switches the destination; existing files are untouched.
 func (m *Manager) SetSaveDir(dir string) {
@@ -274,9 +294,12 @@ func (m *Manager) AddRegion(r Rect) int {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closing {
+		return -1
+	}
 	m.nextID++
 	id := m.nextID
-	st := &decodeState{}
+	st := &decodeState{id: id, audit: m.audit}
 	st.SaveFails.Set(m.saveFails)
 	reg := &region{
 		id:          id,
@@ -285,6 +308,9 @@ func (m *Manager) AddRegion(r Rect) int {
 		labelDetail: fmt.Sprintf("%dx%d", r.W(), r.H()),
 	}
 	m.regions = append(m.regions, reg)
+	m.audit.Always(id, AuditInfo, "region.start", fmt.Sprintf(
+		"新增扫描区域：%dx%d @ (%d,%d)-(%d,%d)",
+		r.W(), r.H(), r.L, r.T, r.R, r.B))
 	return id
 }
 
@@ -325,14 +351,23 @@ func (m *Manager) Clear() {
 func (m *Manager) Start(id int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closing {
+		return errors.New("scanner is closed")
+	}
 	r := m.byIDLocked(id)
 	if r == nil {
 		return fmt.Errorf("unknown region %d", id)
 	}
-	if r.scanning {
+	r.st.mu.Lock()
+	failed := r.st.failed != ""
+	r.st.mu.Unlock()
+	if r.scanning && !failed {
 		return nil
 	}
-	if r.done {
+	if failed {
+		m.stopRegionLocked(r)
+	}
+	if r.done || failed {
 		r.st.reset()
 		r.done = false
 		r.doneOnce.Store(0)
@@ -342,6 +377,7 @@ func (m *Manager) Start(id int) error {
 	ctx, cancel := context.WithCancel(m.ctx)
 	r.cancelCap = cancel
 	r.scanning = true
+	m.wg.Add(1)
 	go m.runCapture(r, gen, ctx)
 	return nil
 }
@@ -359,8 +395,21 @@ func (m *Manager) Stop(id int) {
 // which is what the toolbar button means after adding a box.
 func (m *Manager) StartAll() error {
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return errors.New("scanner is closed")
+	}
 	var first error
 	for _, r := range m.regions {
+		r.st.mu.Lock()
+		failed := r.st.failed != ""
+		r.st.mu.Unlock()
+		if failed {
+			m.stopRegionLocked(r)
+			r.st.reset()
+			r.done = false
+			r.doneOnce.Store(0)
+		}
 		if r.scanning || r.done {
 			continue
 		}
@@ -369,6 +418,7 @@ func (m *Manager) StartAll() error {
 		ctx, cancel := context.WithCancel(m.ctx)
 		r.cancelCap = cancel
 		r.scanning = true
+		m.wg.Add(1)
 		go m.runCapture(r, gen, ctx)
 	}
 	m.mu.Unlock()
@@ -440,26 +490,28 @@ func (m *Manager) Snapshots() []Snapshot {
 	out := make([]Snapshot, 0, len(regions))
 	for _, r := range regions {
 		p, status, done := r.st.snapshot(byBlocks)
-		speed, avg, nbytes, frames, captured, failed, mode := r.st.stats()
+		speed, avg, nbytes, frames, captured, failed, mode, lastIssue := r.st.stats()
 		m.mu.Lock()
 		scanning := r.scanning
+		regionDone := r.done
 		m.mu.Unlock()
 		s := Snapshot{
-			ID:       r.id,
-			Label:    fmt.Sprintf("区域 %d · %s", r.id, r.labelDetail),
-			W:        int(r.rect.W()),
-			H:        int(r.rect.H()),
-			Scanning: scanning,
-			Done:     done || r.done,
-			Progress: clampPct(p),
-			Status:   status,
-			Mode:     mode,
-			Speed:    speed,
-			AvgSpeed: avg,
-			Bytes:    nbytes,
-			Frames:   frames,
-			Captured: captured,
-			Failed:   failed,
+			ID:        r.id,
+			Label:     fmt.Sprintf("区域 %d · %s", r.id, r.labelDetail),
+			W:         int(r.rect.W()),
+			H:         int(r.rect.H()),
+			Scanning:  scanning,
+			Done:      done || regionDone,
+			Progress:  clampPct(p),
+			Status:    status,
+			Mode:      mode,
+			LastIssue: lastIssue,
+			Speed:     speed,
+			AvgSpeed:  avg,
+			Bytes:     nbytes,
+			Frames:    frames,
+			Captured:  captured,
+			Failed:    failed,
 		}
 		out = append(out, s)
 	}
@@ -516,7 +568,7 @@ func (m *Manager) SaveResult(id int, path string) error {
 	if !ok || len(data) == 0 {
 		return errors.New("该区域没有已完成的传输")
 	}
-	return os.WriteFile(path, data, 0o644)
+	return writeAtomic(path, data, true)
 }
 
 // ---------------------------------------------------------------- pipeline
@@ -531,13 +583,22 @@ func (m *Manager) notifyUpdate() {
 // worker pool, so one slow frame never stalls the timer. Frames are dropped when
 // every worker is busy: a stale frame is worth less than the next one.
 func (m *Manager) runCapture(r *region, gen int, ctx context.Context) {
+	defer m.wg.Done()
 	ticker := time.NewTicker(FrameInterval)
 	defer ticker.Stop()
+	var previous *image.RGBA
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		}
+		// Check the bounded name grace period even when capture/QR recognition
+		// produces nothing. This uses the existing capture lifecycle, no timer leak.
+		if result, ok := m.finishPendingName(r, gen, time.Now()); ok {
+			m.submitSave(result)
+			m.notifyUpdate()
+			return
 		}
 		m.mu.Lock()
 		current := r.serial == gen && r.scanning
@@ -561,21 +622,31 @@ func (m *Manager) runCapture(r *region, gen int, ctx context.Context) {
 			m.previewID = r.id
 			m.previewMu.Unlock()
 		}
-		m.submitDecode(decJob{r: r, gen: gen, rgba: rgba})
+		// Screen capture normally runs faster than presentation. Identical
+		// pixels cannot add a fountain equation, so avoid decoding them again.
+		// Remember only accepted jobs: a full queue must allow a later retry.
+		if rgba != nil && (previous == nil || rgba.Rect != previous.Rect ||
+			rgba.Stride != previous.Stride || !bytes.Equal(rgba.Pix, previous.Pix)) {
+			if m.submitDecode(decJob{r: r, gen: gen, rgba: rgba}) {
+				previous = rgba
+			}
+		}
 		m.notifyUpdate()
 	}
 }
 
 // submitDecode never blocks the capture loop and never panics on shutdown.
-func (m *Manager) submitDecode(j decJob) {
+func (m *Manager) submitDecode(j decJob) bool {
 	m.qMu.RLock()
 	defer m.qMu.RUnlock()
 	if m.closed {
-		return
+		return false
 	}
 	select {
 	case m.decQueue <- j:
+		return true
 	default: // every worker busy: drop this frame
+		return false
 	}
 }
 
@@ -593,29 +664,54 @@ func (m *Manager) decWorker() {
 		if stale {
 			continue // frame from a stopped or restarted scan
 		}
-		payload := job.r.st.decode(job.rgba)
+		payload, hint := job.r.st.decode(job.rgba)
 		if payload == nil {
 			continue
 		}
-		if !job.r.st.feedPayload(payload) {
-			continue
+		job.qrHint = hint
+		if result, ok := m.commitPayload(job, payload); ok {
+			m.submitSave(result)
 		}
-		// The CAS makes "who saves" exactly-once even though several workers may
-		// observe completion in the same instant.
-		if !job.r.doneOnce.CompareAndSwap(0, 1) {
-			continue
-		}
-		m.mu.Lock()
-		job.r.done = true
-		m.mu.Unlock()
-		m.Stop(job.r.id)
-
-		data, name, ok := job.r.st.completedResult()
-		if !ok || len(data) == 0 {
-			continue
-		}
-		m.submitSave(saveJob{data: data, name: name, mode: "auto"})
 	}
+}
+
+// commitPayload excludes Start/Stop between the generation check and mutation.
+func (m *Manager) commitPayload(job decJob, payload []byte) (saveJob, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if job.r.serial != job.gen || !job.r.scanning || m.closing {
+		return saveJob{}, false
+	}
+	// Publish the hint only after the same generation check as the payload.
+	// Old workers cannot teach a restarted scan their previous geometry.
+	if job.qrHint != "" && job.rgba != nil {
+		job.r.st.mu.Lock()
+		job.r.st.qrHint, job.r.st.qrHintSize = job.qrHint, job.rgba.Bounds().Size()
+		job.r.st.mu.Unlock()
+	}
+	if !job.r.st.feedPayload(payload) || !job.r.doneOnce.CompareAndSwap(0, 1) {
+		return saveJob{}, false
+	}
+	return m.completeRegionLocked(job.r)
+}
+
+func (m *Manager) finishPendingName(r *region, gen int, now time.Time) (saveJob, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r.serial != gen || !r.scanning || m.closing || r.st == nil {
+		return saveJob{}, false
+	}
+	if !r.st.finishNameWait(now) || !r.doneOnce.CompareAndSwap(0, 1) {
+		return saveJob{}, false
+	}
+	return m.completeRegionLocked(r)
+}
+
+func (m *Manager) completeRegionLocked(r *region) (saveJob, bool) {
+	r.done = true
+	m.stopRegionLocked(r)
+	data, name, ok := r.st.completedResult()
+	return saveJob{data: data, name: name, mode: "auto"}, ok && len(data) > 0
 }
 
 func (m *Manager) submitSave(j saveJob) {
@@ -647,6 +743,11 @@ func (m *Manager) saver() {
 		}
 		if err != nil {
 			rec.Err = err.Error()
+			m.audit.Note(0, AuditError, "save.error",
+				fmt.Sprintf("写入 %s 失败：%v", path, err))
+		} else {
+			m.audit.Always(0, AuditInfo, "result.complete", fmt.Sprintf(
+				"已保存 %s（%d 字节）", rec.Name, rec.Size))
 		}
 		m.savedMu.Lock()
 		m.saved = append(m.saved, rec)
@@ -672,11 +773,17 @@ func (m *Manager) writeToDisk(job saveJob) (string, error) {
 		return "", fmt.Errorf("创建保存目录 %s: %w", dir, err)
 	}
 	name := SanitizeFileName(job.name, filepath.Join(dir, "received.bin"))
-	path := uniquePath(filepath.Join(dir, name))
-	if err := os.WriteFile(path, job.data, 0o644); err != nil {
-		return path, fmt.Errorf("写入 %s: %w", path, err)
+	for attempt := 0; attempt < 1000; attempt++ {
+		path := uniquePath(filepath.Join(dir, name))
+		if err := writeAtomic(path, job.data, false); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				continue
+			}
+			return path, fmt.Errorf("写入 %s: %w", path, err)
+		}
+		return path, nil
 	}
-	return path, nil
+	return "", errors.New("无法分配未使用的文件名")
 }
 
 // uniquePath avoids silently overwriting an earlier receive of the same file:
@@ -725,8 +832,12 @@ func SanitizeFileName(name, fallback string) string {
 	}
 	if len([]rune(out)) > 120 {
 		runes := []rune(out)
-		ext := filepath.Ext(out)
-		stem := string(runes[:120-len([]rune(ext))])
+		extRunes := []rune(filepath.Ext(out))
+		if len(extRunes) > 32 {
+			extRunes = extRunes[:32]
+		}
+		ext := string(extRunes)
+		stem := string(runes[:120-len(extRunes)])
 		out = stem + ext
 	}
 	return out
@@ -751,6 +862,7 @@ func isReservedName(s string) bool {
 // Close stops every region and releases the worker pools. Safe to call twice.
 func (m *Manager) Close() error {
 	m.mu.Lock()
+	m.closing = true
 	for _, r := range m.regions {
 		m.stopRegionLocked(r)
 	}
@@ -769,5 +881,7 @@ func (m *Manager) Close() error {
 	m.qMu.Unlock()
 
 	m.wg.Wait()
+	m.audit.Always(0, AuditInfo, "region.stop", "接收端退出")
+	m.audit.Close()
 	return nil
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/divan/txqr/internal/scanner"
 	"github.com/divan/txqr/internal/sender"
 	"github.com/divan/txqr/internal/uikit"
+	"github.com/divan/txqr/internal/version"
 	"github.com/divan/txqr/internal/w32"
 )
 
@@ -55,12 +56,18 @@ const (
 	idNavSender uikit.ControlID = 100 + iota
 	idNavReceiver
 	idNavFiles
+	idNavDiag
 )
 
 // Sender view ids.
 const (
 	idSenderToggle uikit.ControlID = 200 + iota
 	idSenderOpenPage
+)
+
+// Diagnostics view ids.
+const (
+	idOpenLogDir uikit.ControlID = 400 + iota
 )
 
 // Receiver view ids.
@@ -102,6 +109,12 @@ type app struct {
 	status  string
 	lastErr string
 	started time.Time
+
+	// regions/files are the scroll state of the two list views. They live on
+	// the UI thread only (paint records the viewport, wheel/drag consumes it).
+	regions scrollList
+	files   scrollList
+	diag    scrollList
 
 	// senderBusy guards the start/stop network operation, which runs off the
 	// message thread: binding a wildcard address can take seconds on some
@@ -156,7 +169,7 @@ func (a *app) createWindows() bool {
 	w32.RegisterClass(overlayClass, cb(a.overlayProc), w32.IDCCross)
 
 	style := uintptr(w32.WSOverlappedWindow|w32.WSVisible|w32.WSClipChildren) & ^uintptr(w32.WSMaximizeBox)
-	hwnd := w32.CreateWindow(mainClass, "QRT Pro · 光传输工具箱", style, 0,
+	hwnd := w32.CreateWindow(mainClass, "QRT Pro v"+version.Number+" · 光传输工具箱", style, 0,
 		w32.Scale(120), w32.Scale(80), w32.Scale(1080), w32.Scale(720), 0)
 	if hwnd == 0 {
 		w32.MessageBox(0, "创建主窗口失败", "QRT Pro", w32.MBIconError)
@@ -324,7 +337,7 @@ func (a *app) drawNav(r w32.Rect) {
 	u := a.theme.Unit
 	// Brand block
 	title := "QRT Pro"
-	sub := "收发一体·一步到位"
+	sub := "v" + version.Number + " · 光传输工具箱"
 	brandTop := r.T + a.px(22)
 	a.ui.Text(w32.Rect{L: r.L + u*4, T: brandTop, R: r.R - u*2, B: brandTop + a.px(26)}, title, uikit.FontTitle, a.theme.Text, uikit.AlignLeft)
 	a.ui.Text(w32.Rect{L: r.L + u*4, T: brandTop + a.px(28), R: r.R - u*2, B: brandTop + a.px(46)}, sub, uikit.FontCaption, a.theme.TextDim, uikit.AlignLeft)
@@ -338,6 +351,7 @@ func (a *app) drawNav(r w32.Rect) {
 		{idNavSender, "↑", "发送端"},
 		{idNavReceiver, "↓", "接收端"},
 		{idNavFiles, "≡", "已收文件"},
+		{idNavDiag, "◎", "诊断日志"},
 	} {
 		itemR := w32.Rect{L: r.L + u*2, T: y, R: r.R - u*2, B: y + a.px(42)}
 		a.ui.NavItem(item.id, itemR, item.glyph, item.label, a.tab == i)
@@ -377,8 +391,10 @@ func (a *app) drawContent(r w32.Rect) {
 		a.drawSenderView(r)
 	case 1:
 		a.drawReceiverView(r)
-	default:
+	case 2:
 		a.drawFilesView(r)
+	default:
+		a.drawDiagView(r)
 	}
 }
 
@@ -417,6 +433,9 @@ func (a *app) statCard(r w32.Rect, caption, value string, accent w32.Color) {
 // ---------------------------------------------------------------- input
 
 func (a *app) onMouseMove(p w32.Point) {
+	if a.dragLists(p) {
+		w32.Invalidate(a.hwnd)
+	}
 	id := a.ui.HitTest(p.X, p.Y)
 	if id != a.ui.Hover() {
 		a.ui.SetHover(id)
@@ -425,11 +444,18 @@ func (a *app) onMouseMove(p w32.Point) {
 }
 
 func (a *app) onPress(p w32.Point) {
-	a.ui.Press(a.ui.HitTest(p.X, p.Y))
+	id := a.ui.HitTest(p.X, p.Y)
+	a.ui.Press(id)
+	// Pressing the empty part of a list starts a scroll drag. Controls win,
+	// so the buttons inside a row stay clickable.
+	if id == uikit.NoControl {
+		a.beginListDrag(p)
+	}
 	w32.Invalidate(a.hwnd)
 }
 
 func (a *app) onRelease(p w32.Point) {
+	a.endListDrag()
 	hit := a.ui.HitTest(p.X, p.Y)
 	armed := a.ui.Release()
 	// Only a press that began and ended on the same control is a click; this is
@@ -462,6 +488,8 @@ func (a *app) handleClick(id uikit.ControlID) {
 		a.tab = 1
 	case idNavFiles:
 		a.tab = 2
+	case idNavDiag:
+		a.tab = 3
 	case idSenderToggle:
 		a.toggleSender()
 	case idSenderOpenPage:
@@ -476,6 +504,12 @@ func (a *app) handleClick(id uikit.ControlID) {
 		a.scan.Clear()
 	case idReopenFolder:
 		a.openFolder(a.scan.SaveDir())
+	case idOpenLogDir:
+		if p := a.scan.AuditPath(); p != "" {
+			a.openFolder(filepath.Dir(p))
+		} else {
+			a.setError("日志未落盘：" + a.scan.AuditFileError())
+		}
 	case idToggleFails:
 		a.scan.SetSaveFails(!a.scan.SaveFails())
 	case idToggleProgressMode:

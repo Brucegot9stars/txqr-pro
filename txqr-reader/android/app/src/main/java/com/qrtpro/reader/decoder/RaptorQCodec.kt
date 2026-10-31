@@ -936,7 +936,9 @@ private fun findRawParams(k: Int): IntArray {
 }
 
 private fun calcParams(dataSize: Int, symbolSz: Int): RaptorQParams {
-    val k = (dataSize + symbolSz - 1) / symbolSz
+    require(dataSize in 1..TransferFrame.MAX_TRANSFER_BYTES && symbolSz in 1..TransferFrame.MAX_CHUNK_BYTES)
+    val k = numberOfChunks(dataSize, symbolSz)
+    require(k in 1..TransferFrame.MAX_SOURCE_BLOCKS)
     val raw = findRawParams(k)
     val l = raw[0] + raw[2] + raw[3]
     val b = raw[4] - raw[2]
@@ -970,6 +972,7 @@ class RaptorQDecoder(private val codec: RaptorQCodec) {
 
     fun addBlocks(blocks: List<LTBlock>): Boolean {
         for (block in blocks) {
+            require(block.blockCode in 0..TransferFrame.MAX_BLOCK_CODE && block.data.size == symbolSz)
             val id = block.blockCode.toInt()
             val data = block.data
             if (id < params.K) {

@@ -3,8 +3,8 @@ package com.qrtpro.reader.decoder
 import org.junit.Assert.assertArrayEquals
 import org.junit.Before
 import org.junit.Test
-import java.io.File
-import java.nio.file.Files
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 
 class ColorMatrixDecoderTest {
 
@@ -15,16 +15,11 @@ class ColorMatrixDecoderTest {
 
     @Before
     fun setup() {
-        val tmp = File(System.getProperty("java.io.tmpdir"))
-        val bin = tmp.listFiles { f -> f.name == "rgba.bin" }?.firstOrNull()
-            ?: throw IllegalStateException("rgba.bin not found in ${tmp.absolutePath}")
-        val pay = tmp.listFiles { f -> f.name == "payload.bin" }?.firstOrNull()
-            ?: throw IllegalStateException("payload.bin not found")
-        rgba = Files.readAllBytes(bin.toPath())
-        payload = Files.readAllBytes(pay.toPath())
-        val side = kotlin.math.sqrt((rgba.size / 4).toDouble()).toInt()
-        width = side
-        height = side
+        width = ColorMatrixDecoder.MATRIX_SIZE
+        height = ColorMatrixDecoder.MATRIX_SIZE
+        rgba = requireNotNull(javaClass.getResourceAsStream("/regression/color.rgba")).use { it.readBytes() }
+        assertEquals(width * height * 4, rgba.size)
+        payload=requireNotNull(javaClass.getResourceAsStream("/regression/color-payload.bin")).use{it.readBytes()}
     }
 
     private fun sampler() = { x: Int, y: Int ->
@@ -43,7 +38,7 @@ class ColorMatrixDecoderTest {
     @Test
     fun maximalPayloadSize() {
         val capacity = ColorMatrixDecoder.MAX_PAYLOAD_BYTES
-        assert(capacity == 1932) { "expected 1932, got $capacity" }
+        assertEquals(1587,capacity)
     }
 
     @Test
@@ -54,6 +49,6 @@ class ColorMatrixDecoderTest {
         } catch (e: ColorMatrixDecodeException) {
             true
         }
-        assert(threw) { "expected ColorMatrixDecodeException" }
+        assertTrue("expected ColorMatrixDecodeException",threw)
     }
 }

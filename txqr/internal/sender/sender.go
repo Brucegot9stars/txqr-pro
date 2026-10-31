@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/divan/txqr"
@@ -55,16 +56,30 @@ const (
 // DefaultMaxUpload caps request bodies. Without a cap a client can pin the
 // whole machine's memory with one POST (the classic pipeline also copies the
 // body into a string, roughly doubling the transient footprint).
-const DefaultMaxUpload = 256 << 20
+const DefaultMaxUpload = txqr.MaxTransferBytes
 
 // session is one encoded transfer waiting to be played out frame by frame.
 type session struct {
-	frames    [][]byte
-	pngs      [][]byte
-	total     int
-	split     int    // effective payload bytes per frame, after any mode clamp
-	mode      string // "qr", "color" or "decimen"
-	createdAt time.Time
+	frames             [][]byte
+	pngs               [][]byte
+	total              int
+	split              int    // effective payload bytes per frame, after any mode clamp
+	modules            int    // symbol modules per side, quiet zone included
+	ppm                int    // device pixels per module the frames were rendered at
+	mode               string // "qr", "color" or "decimen"
+	createdAt          time.Time
+	lastUsed           time.Time
+	renderBudget       int64
+	renderExceeded     atomic.Bool
+	cacheReady         bool
+	rawBytes, pngBytes int64
+	pngOrder           []int
+	pngHead            int
+	pending            map[int]*frameRender
+	prefetchCancel     context.CancelFunc
+	prefetchContext    context.Context
+	prefetchJobs       chan int
+	prefetchQueued     map[int]bool
 
 	// decimen mode: fountain metadata echoed to the UI
 	carousel  bool
@@ -72,8 +87,11 @@ type session struct {
 	sessionID uint16
 	blockLen  int
 
-	name string
-	size int
+	name                         string
+	size                         int
+	encodingMillis, warmupMillis int64
+	preparedFrames               int
+	firstFrameReported           bool
 }
 
 // Event records one completed encode so the host UI can show recent transfers.
@@ -97,9 +115,10 @@ type Stats struct {
 
 // Server is the sender HTTP service. Zero value is unusable; use New.
 type Server struct {
-	mu       sync.Mutex
-	sessions map[string]*session
-	events   []Event
+	lifecycle sync.Mutex
+	mu        sync.Mutex
+	sessions  map[string]*session
+	events    []Event
 
 	transfers int
 	bytesSent int64
@@ -109,17 +128,27 @@ type Server struct {
 	mux      *http.ServeMux
 	// done belongs to the current run: Start replaces it, so a stop/start
 	// cycle never reuses (and re-closes) a channel that is already closed.
-	done      chan struct{}
-	maxUpload int64
+	done        chan struct{}
+	maxUpload   int64
+	encodeSlot  chan struct{}
+	renderSlots chan struct{}
+	prefetchWG  sync.WaitGroup
+	stopped     bool
+	diagnostics *senderDiagnostics
+	renderFn    func(string, []byte, int, int) []byte
 }
 
 // New builds a Server with no network activity.
 func New() *Server {
 	s := &Server{
-		sessions:  map[string]*session{},
-		done:      make(chan struct{}),
-		maxUpload: DefaultMaxUpload,
+		sessions:    map[string]*session{},
+		done:        make(chan struct{}),
+		maxUpload:   DefaultMaxUpload,
+		encodeSlot:  make(chan struct{}, 1),
+		renderSlots: make(chan struct{}, 8),
 	}
+	s.diagnostics = newSenderDiagnostics()
+	s.note("info", "app.start", map[string]any{"initialFrames": initialFrames, "renderWorkers": cap(s.renderSlots)})
 	// Before the first Start nothing runs, so Done() must report that instead
 	// of blocking a caller that selects on it.
 	close(s.done)
@@ -129,6 +158,7 @@ func New() *Server {
 	s.mux.HandleFunc("/md5", s.handleMD5)
 	s.mux.HandleFunc("/frame/", s.handleFrame)
 	s.mux.HandleFunc("/cancel/", s.handleCancel)
+	s.mux.HandleFunc("/logs", s.handleLogs)
 	return s
 }
 
@@ -143,6 +173,8 @@ func (s *Server) SetMaxUpload(n int64) {
 // pick a free port; read Addr afterwards. Start is a no-op when already running.
 // Start may be called again after Close: every run gets its own done channel.
 func (s *Server) Start(addr string) error {
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
 	s.mu.Lock()
 	running := s.listener != nil
 	s.mu.Unlock()
@@ -162,6 +194,7 @@ func (s *Server) Start(addr string) error {
 	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
+		s.note("error", "server.start", map[string]any{"addr": addr, "error": err.Error()})
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
 
@@ -173,6 +206,7 @@ func (s *Server) Start(addr string) error {
 		return nil
 	}
 	s.listener = ln
+	s.stopped = false
 	s.srv = srv
 	s.done = done
 	s.mu.Unlock()
@@ -181,6 +215,7 @@ func (s *Server) Start(addr string) error {
 		defer close(done)
 		err := srv.Serve(ln)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.note("error", "server.serve", map[string]any{"error": err.Error()})
 			log.Printf("sender: serve stopped: %v", err)
 		}
 	}()
@@ -262,10 +297,19 @@ func (s *Server) LANURLs() []string {
 // a restart silently did nothing and the port stayed open while the UI claimed
 // the service had stopped.
 func (s *Server) Close() error {
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
 	s.mu.Lock()
+	s.stopped = true
+	for _, sess := range s.sessions {
+		if sess.prefetchCancel != nil {
+			sess.prefetchCancel()
+		}
+	}
 	srv, ln, done := s.srv, s.listener, s.done
 	s.srv, s.listener = nil, nil
 	s.mu.Unlock()
+	s.prefetchWG.Wait()
 	if srv == nil && ln == nil {
 		return nil // nothing running
 	}
@@ -359,7 +403,14 @@ func (s *Server) cleanup(done <-chan struct{}) {
 		case <-t.C:
 			s.mu.Lock()
 			for k, v := range s.sessions {
-				if time.Since(v.createdAt) > 30*time.Minute {
+				last := v.lastUsed
+				if last.IsZero() {
+					last = v.createdAt
+				}
+				if time.Since(last) > 30*time.Minute {
+					if v.prefetchCancel != nil {
+						v.prefetchCancel()
+					}
 					delete(s.sessions, k)
 				}
 			}
@@ -377,25 +428,77 @@ func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
-	_, _ = w.Write(indexHTML)
+	config, err := json.Marshal(s.pageConfig())
+	if err != nil {
+		http.Error(w, "page configuration unavailable", http.StatusInternalServerError)
+		return
+	}
+	_, _ = w.Write(bytes.Replace(indexHTML, []byte("/*APP_CONFIG*/ {}"), config, 1))
 }
 
 func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	response := &encodeResponse{ResponseWriter: w}
+	w = response
+	defer func() {
+		fields := map[string]any{"mode": r.URL.Query().Get("mode"), "codec": r.URL.Query().Get("codec"), "split": r.URL.Query().Get("split"), "inputBytes": r.ContentLength, "elapsedMs": time.Since(start).Milliseconds(), "status": response.status}
+		if r.Context().Err() != nil {
+			fields["error"] = r.Context().Err().Error()
+			s.note("info", "encode.cancel", fields)
+		} else if response.status >= 400 {
+			fields["error"] = response.message.String()
+			s.note("error", "encode.error", fields)
+		}
+	}()
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
 
+	select {
+	case s.encodeSlot <- struct{}{}:
+		defer func() { <-s.encodeSlot }()
+	default:
+		http.Error(w, "another encode is in progress", http.StatusTooManyRequests)
+		return
+	}
+	s.mu.Lock()
+	sessionsFull := len(s.sessions) >= maxActiveSessions
+	retained := s.retainedLocked()
+	s.mu.Unlock()
+	if sessionsFull || retained >= maxSessionBytes {
+		http.Error(w, "cancel an existing transfer before encoding another", http.StatusTooManyRequests)
+		return
+	}
 	split := 1024
 	if v := r.URL.Query().Get("split"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= txqr.MaxChunkBytes {
 			split = n
+		} else {
+			http.Error(w, "invalid split", http.StatusBadRequest)
+			return
 		}
 	}
 
 	mode := "qr"
 	if v := r.URL.Query().Get("mode"); v == "color" || v == "decimen" {
 		mode = v
+	}
+
+	// fit is the device-pixel budget the page has for one code. It only decides
+	// how many pixels each module gets; the page then displays the image at
+	// exactly that size, so the browser never resamples it.
+	size := frameSize{}
+	if v := r.URL.Query().Get("fit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			size.fit = n
+		}
+	}
+	// ppm is the explicit form: the user picked a module size in the UI.
+	if v := r.URL.Query().Get("ppm"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			size.ppm = n
+		}
 	}
 
 	// The color matrix holds far fewer bytes per frame than a QR symbol, and
@@ -406,7 +509,17 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 		split = clampColorSplit(split)
 	}
 
-	codec := txqr.ParseCodec(r.URL.Query().Get("codec"))
+	codecTag := r.URL.Query().Get("codec")
+	prepare := r.URL.Query().Get("prepare")
+	if prepare != "" && prepare != "progressive" && prepare != "all" {
+		http.Error(w, "无效的二维码准备方式", http.StatusBadRequest)
+		return
+	}
+	codec := txqr.ParseCodec(codecTag)
+	if codecTag != "" && codecTag != "lt" && string(codec) != codecTag {
+		http.Error(w, "invalid codec", http.StatusBadRequest)
+		return
+	}
 
 	body, err := s.readBody(w, r)
 	if err != nil {
@@ -416,43 +529,51 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "empty request body", http.StatusBadRequest)
 		return
 	}
+	if mode != "decimen" {
+		if err := validateClassicRequest(len(body), split, mode, codec, r.URL.Query().Get("name")); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 
 	sum := md5.Sum(body)
+	s.note("info", "encode.start", map[string]any{"bytes": len(body), "mode": mode, "codec": codec, "split": split, "uploadMs": time.Since(start).Milliseconds()})
 
-	var sess *session
-	switch mode {
-	case "decimen":
-		sess, err = encodeDecimen(r, body)
-	default:
-		sess, err = encodeClassic(body, split, mode, codec)
-	}
+	sess, err := encodeIsolated(r.Context(), workerRequest{
+		RenderAll: prepare == "all",
+		Mode:      mode, Codec: codec, Name: r.URL.Query().Get("name"), MediaType: r.URL.Query().Get("type"),
+		Split: split, Fit: size.fit, PPM: size.ppm, Size: len(body), MemoryBytes: workerMemoryBytes, CacheBytes: maxSessionBytes - retained,
+	}, body, nil)
 	if err != nil {
-		http.Error(w, "encode: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	sess.name = r.URL.Query().Get("name")
-	sess.size = len(body)
-
-	// Render every frame up front across all cores; the play loop then serves
-	// pre-baked PNGs. The client's context aborts the render on cancel.
-	renderFrames(sess, r.Context())
-	if renderFailed(sess) {
-		if r.Context().Err() != nil {
-			return // client aborted; nothing usable to report
+		var processError *workerProcessError
+		if errors.As(err, &processError) && processError.stderr != "" {
+			s.note("error", "worker.stderr", map[string]any{"error": err.Error(), "stderr": processError.stderr})
 		}
-		http.Error(w, "encode: QR render failed", http.StatusInternalServerError)
+		if r.Context().Err() != nil {
+			return
+		}
+		http.Error(w, "encode: "+err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
 	if r.Context().Err() != nil {
-		return // dropped mid-flight: don't publish the partial session
+		return
 	}
+	sess.name = r.URL.Query().Get("name")
+	sess.lastUsed = time.Now()
+	sess.size = len(body)
 
 	id := newID()
 	s.mu.Lock()
+	if err := s.admitLocked(sess); err != nil {
+		s.mu.Unlock()
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
+		return
+	}
 	s.sessions[id] = sess
 	s.transfers++
 	s.bytesSent += int64(len(body))
 	s.mu.Unlock()
+	s.note("info", "encode.ready", map[string]any{"session": id, "frames": len(sess.frames), "initialFrames": sess.preparedFrames, "encodingMs": sess.encodingMillis, "warmupMs": sess.warmupMillis, "totalMs": time.Since(start).Milliseconds()})
 	s.recordEvent(Event{
 		Time:   time.Now(),
 		Name:   truncateName(sess.name, 96),
@@ -463,13 +584,22 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 	})
 
 	resp := map[string]any{
-		"id":    id,
-		"count": len(sess.frames),
-		"total": sess.total,
-		"md5":   hex.EncodeToString(sum[:]),
+		"prepared": sess.preparedFrames,
+		"id":       id,
+		"count":    len(sess.frames),
+		"total":    sess.total,
+		"md5":      hex.EncodeToString(sum[:]),
 		// Echo the payload size actually used: a mode clamp can make it
 		// smaller than what the client asked for.
 		"split": sess.split,
+		// modules lets the page size the <img> to a whole number of device
+		// pixels per module instead of scaling it to the viewport. See
+		// fitFrames() in index.html: any integer module size decodes, any
+		// fractional one is a lottery.
+		"modules": sess.modules,
+		// ppm is how many device pixels each module occupies in the frames the
+		// server is serving; the page displays them at exactly modules*ppm.
+		"ppm": sess.ppm,
 	}
 	if mode == "decimen" {
 		resp["carousel"] = true
@@ -487,7 +617,10 @@ func (s *Server) handleEncode(w http.ResponseWriter, r *http.Request) {
 // actionable) from a broken pipe or cancel (400). Also writing its own error
 // response lets callers keep a single-exit read path.
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.maxUpload))
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(time.Now().Add(30 * time.Second))
+	defer controller.SetReadDeadline(time.Time{})
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, min(s.maxUpload, int64(txqr.MaxTransferBytes))))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
@@ -508,10 +641,10 @@ func truncateName(s string, n int) string {
 	return s[:n] + "…"
 }
 
-// colorFrameOverhead is the longest "blockCode/chunkLen/total/codec|" header
-// the classic pipeline can prepend. It is reserved out of the matrix capacity
+// colorFrameOverhead reserves the maximum QRT2 header and its separator.
+// It is reserved out of the matrix capacity
 // so a color frame can never exceed what ColorMatrixEncode accepts.
-const colorFrameOverhead = 48
+const colorFrameOverhead = txqr.MaxFrameOverhead + 1
 
 // clampColorSplit caps the payload size to what one color matrix frame can
 // carry. The sender renders "header|payload" as a whole frame, so the header
@@ -528,10 +661,24 @@ func clampColorSplit(split int) int {
 }
 
 // encodeClassic is the text-based pipeline (QR/color, LT/Raptor/…).
-func encodeClassic(body []byte, split int, mode string, codec txqr.CodecType) (*session, error) {
+func encodeClassic(body []byte, split int, mode string, codec txqr.CodecType, size frameSize, names ...string) (*session, error) {
+	return encodeClassicContext(context.Background(), body, split, mode, codec, size, names...)
+}
+
+func encodeClassicContext(ctx context.Context, body []byte, split int, mode string, codec txqr.CodecType, size frameSize, names ...string) (*session, error) {
+	name := ""
+	if len(names) > 0 {
+		name = names[0]
+	}
+	if err := validateClassicRequest(len(body), split, mode, codec, name); err != nil {
+		return nil, err
+	}
 	str := string(body)
 	encoder := txqr.NewEncoder(split, codec)
-	frames, err := encoder.Encode(str)
+	if len(names) > 0 {
+		encoder.SetFileName(names[0])
+	}
+	frames, err := encoder.EncodeContext(ctx, str)
 	if err != nil {
 		return nil, err
 	}
@@ -546,14 +693,41 @@ func encodeClassic(body []byte, split int, mode string, codec txqr.CodecType) (*
 	for i, f := range frames {
 		s.frames[i] = []byte(f)
 	}
+	s.modules = frameModules(mode, s.frames)
+	s.ppm = size.forModules(s.modules)
 	return s, nil
+}
+
+// frameModules reports the symbol's modules per side, quiet zone included, so
+// the page can size the <img> to a whole number of device pixels per module.
+// Zero means "unknown", which the page treats as "fall back to viewport width".
+func frameModules(mode string, frames [][]byte) int {
+	switch mode {
+	case "color":
+		return qr.ColorMatrixSize
+	case "decimen":
+		// Pinned V40: 177 data modules plus the 4-module quiet zone per side.
+		return 21 + 4*(DecimenQRVersion-1) + 8
+	}
+	if len(frames) == 0 {
+		return 0
+	}
+	// Header digit counts and metadata length vary; force every symbol to
+	// the largest version required by any frame in this session.
+	maxLen := 0
+	for _, frame := range frames {
+		if len(frame) > maxLen {
+			maxLen = len(frame)
+		}
+	}
+	return qr.ModulesForBytes(maxLen)
 }
 
 // encodeDecimen builds the DCF2 container plus one full carousel cycle (2k
 // frames: a systematic sweep then k repair frames). Replaying the cycle forever
 // lets the receiver finish from any starting point; repeats are counted as
 // duplicates, never as corruption.
-func encodeDecimen(r *http.Request, body []byte) (*session, error) {
+func encodeDecimen(r *http.Request, body []byte, size frameSize) (*session, error) {
 	name := r.URL.Query().Get("name")
 	mediaType := r.URL.Query().Get("type")
 	if mediaType == "" {
@@ -600,10 +774,15 @@ func encodeDecimen(r *http.Request, body []byte) (*session, error) {
 		blockLen:  DecimenBlockLen,
 	}
 	for seq := 0; seq < cycle; seq++ {
+		if err := r.Context().Err(); err != nil {
+			return nil, err
+		}
 		h := hdr
 		h.Seq = uint32(seq)
 		s.frames[seq] = decimen.PackFrame(h, enc.Encode(uint32(seq)))
 	}
+	s.modules = frameModules("decimen", nil)
+	s.ppm = size.forModules(s.modules)
 	return s, nil
 }
 
@@ -632,6 +811,13 @@ func (s *Server) handleMD5(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
+	select {
+	case s.encodeSlot <- struct{}{}:
+		defer func() { <-s.encodeSlot }()
+	default:
+		http.Error(w, "another upload is in progress", http.StatusTooManyRequests)
+		return
+	}
 	body, err := s.readBody(w, r)
 	if err != nil {
 		return
@@ -654,44 +840,70 @@ func (s *Server) handleFrame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	sess, ok := s.sessions[id]
-	var pngBytes []byte
-	badIndex := false
-	switch {
-	case !ok:
-	case idx < 0 || idx >= len(sess.frames):
-		// Index bound to the frame slice; pngs has identical length. Answering
-		// 400 here keeps "no such frame" distinct from "frame failed to render".
-		badIndex = true
-	case sess.pngs[idx] == nil:
-		pngBytes = renderByMode(sess.mode, sess.frames[idx])
-		if pngBytes != nil {
-			sess.pngs[idx] = pngBytes
+	pngBytes, err := s.framePNG(r.Context(), id, idx)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, errMissingSession) {
+			status = http.StatusNotFound
+		} else if errors.Is(err, errFrameIndex) {
+			status = http.StatusBadRequest
 		}
-	default:
-		pngBytes = sess.pngs[idx]
+		if !errors.Is(err, context.Canceled) {
+			s.note("error", "frame.request", map[string]any{"session": id, "frame": idx, "status": status, "error": err.Error()})
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	s.prefetch(id, idx)
+	// Count the encoded optical payload, rather than PNG or HTTP bytes. Frames
+	// are immutable; retain the slice while looking up the session under mu.
+	s.mu.Lock()
+	var raw []byte
+	var mode string
+	if source := s.sessions[id]; source != nil && idx < len(source.frames) {
+		raw, mode = source.frames[idx], source.mode
 	}
 	s.mu.Unlock()
-
-	if !ok {
-		http.Error(w, "session not found", http.StatusNotFound)
-		return
-	}
-	if badIndex {
-		http.Error(w, "bad index", http.StatusBadRequest)
-		return
-	}
-	if pngBytes == nil {
-		// The old handler answered 200 with an empty body here, which the
-		// player silently rendered as a blank frame and then hung waiting for
-		// the next one. Failing loudly lets the UI retry or stop.
-		http.Error(w, "frame render failed", http.StatusInternalServerError)
-		return
+	if n, ok := framePayloadBytes(raw, mode); ok {
+		w.Header().Set("X-QRT-Payload-Bytes", strconv.Itoa(n))
 	}
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write(pngBytes)
+	_, writeErr := w.Write(pngBytes)
+	if writeErr != nil {
+		s.note("error", "frame.response", map[string]any{"session": id, "frame": idx, "error": writeErr.Error()})
+		return
+	}
+	s.mu.Lock()
+	sess := s.sessions[id]
+	first := sess != nil && !sess.firstFrameReported
+	if first {
+		sess.firstFrameReported = true
+	}
+	s.mu.Unlock()
+	if first {
+		s.note("info", "frame.first", map[string]any{"session": id, "frame": idx, "pngBytes": len(pngBytes), "sinceSessionMs": time.Since(sess.createdAt).Milliseconds()})
+	}
+}
+
+// Metadata frames carry a filename, not file data. Fountain payloads include
+// coding redundancy and padding, so this is not receiver-verified goodput.
+func framePayloadBytes(raw []byte, mode string) (int, bool) {
+	if mode == "decimen" {
+		f := decimen.ParseFrame(raw)
+		if f == nil {
+			return 0, false
+		}
+		return len(f.Payload), true
+	}
+	f, err := txqr.ParseFrame(string(raw))
+	if err != nil {
+		return 0, false
+	}
+	if f.Name {
+		return 0, true
+	}
+	return len(f.Payload), true
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
@@ -705,6 +917,9 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
+	if sess := s.sessions[id]; sess != nil && sess.prefetchCancel != nil {
+		sess.prefetchCancel()
+	}
 	delete(s.sessions, id)
 	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
@@ -712,19 +927,79 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 
 // ---------------------------------------------------------------- rendering
 
-func renderByMode(mode string, frame []byte) []byte {
+func renderByMode(mode string, frame []byte, ppm int, modules ...int) []byte {
 	switch mode {
 	case "color":
-		return renderColorPNG(frame)
+		return renderColorPNG(frame, ppm)
 	case "decimen":
-		return renderDecimenPNG(frame)
+		return renderDecimenPNG(frame, ppm)
 	default:
-		return renderPNG(frame)
+		if len(modules) > 0 && modules[0] > 0 {
+			mods := modules[0]
+			img, err := qr.EncodeVersioned(string(frame), ppm*mods, qr.Medium, (mods-25)/4, -1)
+			if err != nil {
+				return nil
+			}
+			return encodePNG(img)
+		}
+		return renderPNG(frame, ppm)
 	}
 }
 
-func renderPNG(frame []byte) []byte {
-	img, err := qr.Encode(string(frame), 512, qr.Medium)
+// Module rendering: frames are rendered at an exact whole number of device
+// pixels per module, and the page displays them at exactly that size. A barcode
+// detector estimates one module width and then samples on a fixed grid, so any
+// fractional module size makes some modules a pixel wider than others and the
+// grid drifts; at whole-pixel modules every sample lands where it should.
+// Measured at 1:1: 21 of 21 frame/size/margin combinations decoded, versus ~60%
+// when the browser stretched the image to the viewport.
+const (
+	defaultPPM = 4 // used when the client does not ask for a specific fit
+	minPPM     = 2 // below this a module is unreadable no matter the layout
+	maxPPM     = 8 // beyond this the gain is nil and the PNG gets large
+)
+
+// frameSize is how the client asked for the frames to be rendered. Both fields
+// are hints: ppm wins when given, otherwise the fit budget decides how many
+// device pixels each module gets.
+type frameSize struct {
+	fit int // device-pixel budget for one code; 0 = unspecified
+	ppm int // explicit device pixels per module; 0 = derive from fit
+}
+
+// forModules resolves the module size for a symbol of the given width. Any
+// positive ppm is honoured (clamped into the usable range) — a value of 1 is a
+// request for "as small as possible", not for "no opinion".
+func (f frameSize) forModules(modules int) int {
+	if f.ppm > 0 {
+		if f.ppm < minPPM {
+			return minPPM
+		}
+		if f.ppm > maxPPM {
+			return maxPPM
+		}
+		return f.ppm
+	}
+	return pickPPM(f.fit, modules)
+}
+
+// pickPPM chooses the module size that best fills fitPixels without scaling.
+func pickPPM(fitPixels, modules int) int {
+	if fitPixels <= 0 || modules <= 0 {
+		return defaultPPM
+	}
+	ppm := fitPixels / modules
+	if ppm < minPPM {
+		ppm = minPPM
+	}
+	if ppm > maxPPM {
+		ppm = maxPPM
+	}
+	return ppm
+}
+
+func renderPNG(frame []byte, ppm int) []byte {
+	img, err := qr.Encode(string(frame), -ppm, qr.Medium)
 	if err != nil {
 		log.Printf("QR encode error: %v", err)
 		return nil
@@ -735,8 +1010,9 @@ func renderPNG(frame []byte) []byte {
 // renderDecimenPNG pins V40-L with a fixed mask: identical length, ECC and mask
 // mean identical geometry across frames — required for grid tiling — and the
 // pinned mask skips the spec's 8-way mask evaluation.
-func renderDecimenPNG(frame []byte) []byte {
-	img, err := qr.EncodeVersioned(string(frame), 512, qr.Low, DecimenQRVersion, DecimenQRMask)
+func renderDecimenPNG(frame []byte, ppm int) []byte {
+	mods := frameModules("decimen", nil)
+	img, err := qr.EncodeVersioned(string(frame), ppm*mods, qr.Low, DecimenQRVersion, DecimenQRMask)
 	if err != nil {
 		log.Printf("decimen QR encode error: %v", err)
 		return nil
@@ -745,8 +1021,9 @@ func renderDecimenPNG(frame []byte) []byte {
 }
 
 // renderColorPNG renders a frame as a 4-colour matrix (2 bit/module).
-func renderColorPNG(frame []byte) []byte {
-	img, err := qr.ColorMatrixEncode(frame, 512)
+func renderColorPNG(frame []byte, ppm int) []byte {
+	// ColorMatrixEncode floors to a whole number of pixels per cell itself.
+	img, err := qr.ColorMatrixEncode(frame, ppm*qr.ColorMatrixSize)
 	if err != nil {
 		log.Printf("color encode error: %v", err)
 		return nil
@@ -756,7 +1033,8 @@ func renderColorPNG(frame []byte) []byte {
 
 func encodePNG(img image.Image) []byte {
 	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
+	encoder := png.Encoder{CompressionLevel: png.BestSpeed}
+	if err := encoder.Encode(&buf, img); err != nil {
 		log.Printf("PNG encode error: %v", err)
 		return nil
 	}
@@ -765,18 +1043,20 @@ func encodePNG(img image.Image) []byte {
 
 // renderFrames pre-renders every frame across available CPUs, stopping early
 // when the request is cancelled so an aborted upload doesn't burn the pool.
-func renderFrames(s *session, ctx context.Context) {
-	n := len(s.frames)
+func renderFrames(s *session, ctx context.Context) { renderFrameCount(s, ctx, len(s.frames)) }
+
+func renderFrameCount(s *session, ctx context.Context, n int) {
 	if n == 0 {
 		return
 	}
-	workers := runtime.GOMAXPROCS(0)
+	workers := min(8, runtime.GOMAXPROCS(0))
 	if workers < 1 {
 		workers = 1
 	}
 	if workers > n {
 		workers = n
 	}
+	var renderedBytes atomic.Int64
 	jobs := make(chan int, workers)
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -784,10 +1064,15 @@ func renderFrames(s *session, ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				if ctx.Err() != nil {
-					return
+				if ctx.Err() != nil || s.renderExceeded.Load() {
+					continue
 				}
-				s.pngs[i] = renderByMode(s.mode, s.frames[i])
+				png := renderByMode(s.mode, s.frames[i], s.ppm, s.modules)
+				if s.renderBudget > 0 && renderedBytes.Add(int64(len(png))) > s.renderBudget {
+					s.renderExceeded.Store(true)
+					continue
+				}
+				s.pngs[i] = png
 			}
 		}()
 	}

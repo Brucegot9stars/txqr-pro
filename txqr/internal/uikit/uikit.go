@@ -157,6 +157,18 @@ type Ctx struct {
 	focused ControlID
 
 	curFont *w32.Font
+
+	// clip is the region currently visible (a scroll viewport). Controls whose
+	// centre falls outside it are not registered: a row half scrolled out of
+	// the list must not be clickable from outside the list.
+	clip    w32.Rect
+	clipOn  bool
+	clipStk []clipState
+}
+
+type clipState struct {
+	rect w32.Rect
+	on   bool
 }
 
 // NewCtx prepares a context whose layout starts empty.
@@ -177,6 +189,8 @@ func (c *Ctx) BeginPaint(dc *w32.DC, w, h int32) {
 	c.dc = dc
 	c.W, c.H = w, h
 	c.curFont = nil
+	c.clipOn = false
+	c.clipStk = c.clipStk[:0]
 	if c.dc != nil {
 		c.dc.SetBkMode(w32.Transparent)
 	}
@@ -514,10 +528,47 @@ func (c *Ctx) NavItem(id ControlID, r w32.Rect, glyph, label string, active bool
 // register records a control's rectangle for hit testing. The arrow/hand cursor
 // hints are advisory: the app sets the cursor on WM_SETCURSOR from here.
 func (c *Ctx) register(id ControlID, r w32.Rect, cursor uintptr) {
+	if c.clipOn {
+		cx, cy := (r.L+r.R)/2, (r.T+r.B)/2
+		if cx < c.clip.L || cx >= c.clip.R || cy < c.clip.T || cy >= c.clip.B {
+			return
+		}
+	}
 	if _, seen := c.layout[id]; !seen {
 		c.order = append(c.order, id)
 	}
 	c.layout[id] = control{id: id, rect: r, cursor: cursor}
+}
+
+// PushClip restricts drawing and control registration to r. Nesting is
+// supported; every call needs a matching PopClip.
+func (c *Ctx) PushClip(r w32.Rect) {
+	c.clipStk = append(c.clipStk, clipState{rect: c.clip, on: c.clipOn})
+	if c.clipOn {
+		// Intersect with the enclosing clip so a list inside a panel still
+		// respects the panel's bounds.
+		r = w32.Rect{
+			L: max32(r.L, c.clip.L), T: max32(r.T, c.clip.T),
+			R: min32(r.R, c.clip.R), B: min32(r.B, c.clip.B),
+		}
+	}
+	c.clip, c.clipOn = r, true
+	if c.dc != nil {
+		c.dc.PushClip(r)
+	}
+}
+
+// PopClip undoes the matching PushClip.
+func (c *Ctx) PopClip() {
+	if len(c.clipStk) == 0 {
+		return
+	}
+	if c.dc != nil {
+		c.dc.PopClip()
+	}
+	prev := c.clipStk[len(c.clipStk)-1]
+	c.clipStk = c.clipStk[:len(c.clipStk)-1]
+	c.clip, c.clipOn = prev.rect, prev.on
 }
 
 // CursorFor reports whether a control wants the hand cursor.
@@ -592,4 +643,18 @@ func FirstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+func min32(a, b int32) int32 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max32(a, b int32) int32 {
+	if a > b {
+		return a
+	}
+	return b
 }

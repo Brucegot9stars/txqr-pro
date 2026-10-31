@@ -214,6 +214,27 @@ func LParamPoint(l uintptr) Point {
 	return Point{X: int32(int16(l & 0xFFFF)), Y: int32(int16((l >> 16) & 0xFFFF))}
 }
 
+// clientPoint mirrors the Win32 POINT the client-coordinate conversions take
+// by pointer.
+type clientPoint struct{ X, Y int32 }
+
+var procScreenToClient = user32.NewProc("ScreenToClient")
+
+// ScreenToClient converts a screen point (what WM_MOUSEWHEEL reports) into the
+// client coordinates the layout and hit test use.
+func ScreenToClient(hwnd uintptr, p Point) Point {
+	cp := clientPoint{X: p.X, Y: p.Y}
+	procScreenToClient.Call(hwnd, uintptr(unsafe.Pointer(&cp)))
+	return Point{X: cp.X, Y: cp.Y}
+}
+
+// WheelDelta returns the signed distance of a WM_MOUSEWHEEL, in the multiples
+// of 120 that Windows defines as one notch. Hi-res wheels send smaller values,
+// so callers must treat any non-zero value as at least one step.
+func WheelDelta(wParam uintptr) int32 {
+	return int32(int16(uint16(wParam >> 16)))
+}
+
 // ---------------------------------------------------------------- DPI
 
 const (
@@ -349,6 +370,9 @@ type DC struct {
 	old        map[uintptr]uintptr
 	stockBrush uintptr
 	stockPen   uintptr
+	// clips holds the SaveDC tokens of the active PushClip calls, so PopClip
+	// can put the previous clip back exactly (lists nest: panel → viewport).
+	clips []uintptr
 }
 
 const (
@@ -823,6 +847,8 @@ func NewPenOrNull(c Color, width int32) *Pen {
 const (
 	nullBrush = 5
 	nullPen   = 8
+	// rgnAnd is RGN_AND, the combine mode that intersects two regions.
+	rgnAnd = 1
 )
 
 var procGetStockObject = gdi32.NewProc("GetStockObject")
@@ -848,9 +874,22 @@ func (d *DC) RoundRectGradient(r Rect, top, bottom Color, radius int32, stroke C
 	rgn, _, _ := procCreateRoundRectRgn.Call(uintptr(r.L), uintptr(r.T), uintptr(r.R+1), uintptr(r.B+1),
 		uintptr(radius*2), uintptr(radius*2))
 	if rgn != 0 {
-		procSelectClipRgn.Call(d.h, rgn)
+		// Save the *whole* DC state and restore it afterwards instead of
+		// clearing the clip with SelectClipRgn(h, 0): these panels are drawn
+		// inside a list viewport that has its own clip, and clearing it here
+		// would let the rows paint over everything below the list.
+		saved, _, _ := procSaveDC.Call(d.h)
+		// ExtSelectClipRgn with RGN_AND *intersects* with the clip already in
+		// effect. Plain SelectClipRgn replaces it, which let a panel drawn
+		// inside a scrolled list punch its own full-size clip through the
+		// viewport and paint the rows below the list's edge.
+		procExtSelectClipRgn.Call(d.h, rgn, rgnAnd)
 		defer func() {
-			procSelectClipRgn.Call(d.h, 0)
+			if saved != 0 {
+				procRestoreDC.Call(d.h, saved)
+			} else {
+				procSelectClipRgn.Call(d.h, 0)
+			}
 			procDeleteObject.Call(rgn)
 		}()
 	}
@@ -865,7 +904,35 @@ func (d *DC) RoundRectGradient(r Rect, top, bottom Color, radius int32, stroke C
 var (
 	procCreateRoundRectRgn = gdi32.NewProc("CreateRoundRectRgn")
 	procSelectClipRgn      = gdi32.NewProc("SelectClipRgn")
+	procSaveDC             = gdi32.NewProc("SaveDC")
+	procExtSelectClipRgn   = gdi32.NewProc("ExtSelectClipRgn")
+	procRestoreDC          = gdi32.NewProc("RestoreDC")
+	procIntersectClipRect  = gdi32.NewProc("IntersectClipRect")
 )
+
+// PushClip narrows all subsequent drawing on this DC to r. Every call must be
+// paired with PopClip; nesting is supported and restores the previous clip
+// exactly (a scroll viewport clips, and so does each rounded panel inside it).
+func (d *DC) PushClip(r Rect) {
+	if d == nil || d.h == 0 {
+		return
+	}
+	saved, _, _ := procSaveDC.Call(d.h)
+	procIntersectClipRect.Call(d.h, uintptr(r.L), uintptr(r.T), uintptr(r.R), uintptr(r.B))
+	d.clips = append(d.clips, saved)
+}
+
+// PopClip undoes the matching PushClip.
+func (d *DC) PopClip() {
+	if d == nil || len(d.clips) == 0 {
+		return
+	}
+	saved := d.clips[len(d.clips)-1]
+	d.clips = d.clips[:len(d.clips)-1]
+	if saved != 0 {
+		procRestoreDC.Call(d.h, saved)
+	}
+}
 
 // Line draws a 1px line.
 func (d *DC) Line(x1, y1, x2, y2 int32, c Color, width int32) {
@@ -1012,6 +1079,7 @@ const (
 	WMSetCursor     = 0x0020
 	WMMouseHover    = 0x02A1
 	WMMouseLeave    = 0x02A3
+	WMMouseWheel    = 0x020A
 	WMActivate      = 0x0006
 	WMSetFocus      = 0x0007
 	WMKillFocus     = 0x0008
@@ -1190,7 +1258,12 @@ func Capture(r Rect) (*image.RGBA, []byte, error) {
 	}
 	defer bmp.Close()
 	mem.Select(bmp.Handle())
-	procBitBlt.Call(mem.Handle(), 0, 0, uintptr(w), uintptr(h), screen, uintptr(r.L), uintptr(r.T), SrcCopy)
+	defer mem.Restore()
+	if ok, _, _ := procBitBlt.Call(mem.Handle(), 0, 0, uintptr(w), uintptr(h), screen, uintptr(r.L), uintptr(r.T), SrcCopy); ok == 0 {
+		return nil, nil, fmt.Errorf("BitBlt failed")
+	}
+	// GetDIBits and DeleteObject both require the bitmap to be deselected.
+	mem.Restore()
 
 	buf := make([]byte, int(w)*int(h)*4)
 	bi := bitmapInfo{bmiHeader: bitmapInfoHeader{
@@ -1201,7 +1274,7 @@ func Capture(r Rect) (*image.RGBA, []byte, error) {
 		biBitCount: 32,
 	}}
 	if n, _, _ := procGetDIBits.Call(mem.Handle(), bmp.Handle(), 0, uintptr(h),
-		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&bi)), DibRGBColors); n == 0 {
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&bi)), DibRGBColors); n != uintptr(h) {
 		return nil, nil, fmt.Errorf("GetDIBits failed")
 	}
 	rgba := image.NewRGBA(image.Rect(0, 0, int(w), int(h)))

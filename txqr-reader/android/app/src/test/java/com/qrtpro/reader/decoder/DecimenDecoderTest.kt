@@ -109,23 +109,41 @@ class DecimenDecoderTest {
     }
 
     @Test
-    fun streamResetOnNewSession() {
-        val payload = testPayload(20000)
-        val container = DecimenContainer.pack("a.bin", "application/octet-stream", payload)
-        val enc1 = TestEncoder(container, 1445, 21)
-        val enc2 = TestEncoder(container, 1445, 22)
-        val dec = DecimenDecoder()
-        // frames from session 21
-        for (seq in 0 until enc1.k) dec.addFrame(enc1.frameAt(seq))
-        assertTrue(dec.isComplete)
-        // a new session id must reset and rebuild, not corrupt
-        for (seq in 0 until enc2.k) {
-            dec.addFrame(enc2.frameAt(seq))
-            if (dec.isComplete) break
-        }
-        assertTrue(dec.isComplete)
-        val recovered = dec.assemble()
-        assertTrue(container.contentEquals(recovered))
+    fun foreignSessionIgnoredUntilReset() {
+        val first=DecimenContainer.pack("a.bin","application/octet-stream",testPayload(20000))
+        val second=DecimenContainer.pack("b.bin","application/octet-stream",testPayload(21000))
+        val enc1=TestEncoder(first,1445,21);val enc2=TestEncoder(second,1445,22)
+        val dec=DecimenDecoder()
+        dec.addFrame(enc1.frameAt(0));dec.addFrame(enc2.frameAt(1))
+        assertEquals(1,dec.framesNew)
+        for(seq in 1 until enc1.k) dec.addFrame(enc1.frameAt(seq))
+        assertTrue(first.contentEquals(dec.assemble()))
+        dec.reset()
+        for(seq in 0 until enc2.k) dec.addFrame(enc2.frameAt(seq))
+        assertTrue(second.contentEquals(dec.assemble()))
+        assertEquals("b.bin",dec.verifiedResult()!!.name)
+    }
+
+    @Test
+    fun corruptContainerFailsOnceAndRequiresRescan() {
+        val file=testPayload(500)
+        val container=DecimenContainer.pack("a.bin","application/octet-stream",file)
+        val enc=TestEncoder(container,1445,21)
+        val bad=enc.frameAt(0);bad[20+49]=(bad[20+49].toInt() xor 1).toByte()
+        val dec=DecimenDecoder();dec.addFrame(bad)
+        assertNull(dec.verifiedResult());assertNotNull(dec.failure)
+        val frames=dec.framesNew
+        dec.addFrame(enc.frameAt(2));assertEquals(frames,dec.framesNew)
+        assertNull(dec.verifiedResult())
+        dec.reset();dec.addFrame(enc.frameAt(0));assertTrue(file.contentEquals(dec.verifiedResult()!!.bytes))
+    }
+
+    @Test
+    fun rejectsInconsistentHeaderBeforeAllocation() {
+        val enc=TestEncoder(byteArrayOf(1),1,1)
+        val frame=enc.frameAt(0)
+        frame[12]=0x40;frame[13]=0x42;frame[14]=0x0f // total 1,000,000 vs K=1 B=1
+        val dec=DecimenDecoder();assertNull(dec.parseFrame(frame));assertFalse(dec.addFrame(frame));assertNull(dec.assemble())
     }
 
     @Test

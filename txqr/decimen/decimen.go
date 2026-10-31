@@ -73,10 +73,17 @@ func ParseHeader(b []byte) (Header, bool) {
 		TotalLen:   binary.LittleEndian.Uint32(b[12:]),
 		PayloadFnv: binary.LittleEndian.Uint32(b[16:]),
 	}
-	if h.K == 0 || h.BlockLen == 0 || h.TotalLen == 0 {
+	if !validHeader(h) {
 		return Header{}, false
 	}
 	return h, true
+}
+
+func validHeader(h Header) bool {
+	return h.K > 0 && h.BlockLen > 0 && h.BlockLen <= 2933 && h.TotalLen > 0 &&
+		uint64(h.TotalLen) <= MaxFileBytes+49+2*65535 &&
+		uint64(h.TotalLen) <= uint64(h.K)*uint64(h.BlockLen) &&
+		uint64(h.TotalLen) > uint64(h.K-1)*uint64(h.BlockLen)
 }
 
 // FrameHeader is the header for a full wire frame (header + payload).
@@ -206,7 +213,13 @@ type LTEncoder struct {
 
 // NewEncoder builds an encoder for payload split into BlockLen-byte blocks.
 func NewEncoder(payload []byte, blockLen int, sessionId uint16) *LTEncoder {
+	if len(payload) == 0 || len(payload) > MaxFileBytes+49+2*65535 || blockLen <= 0 || blockLen > 2933 {
+		return nil
+	}
 	k := (len(payload) + blockLen - 1) / blockLen
+	if k > 65535 {
+		return nil
+	}
 	if k < 1 {
 		k = 1
 	}
@@ -282,6 +295,9 @@ type LTDecoder struct {
 
 // NewDecoder inits a decoder from the wire header.
 func NewDecoder(h Header) *LTDecoder {
+	if !validHeader(h) {
+		return nil
+	}
 	return &LTDecoder{
 		K:         int(h.K),
 		BlockLen:  int(h.BlockLen),
@@ -309,6 +325,9 @@ func (d *LTDecoder) xorInto(dst, src []uint32) {
 // AddFrame feeds one decoded frame payload. Returns true when the transfer
 // just completed.
 func (d *LTDecoder) AddFrame(seq uint32, block []byte) bool {
+	if len(block) != d.BlockLen || d.IsComplete() {
+		return false
+	}
 	if _, dup := d.seen[seq]; dup {
 		d.FramesDup++
 		return false
@@ -434,20 +453,20 @@ var containerMagic = []byte("DCF2")
 
 // precompressedTypes mirrors the reference's PRECOMPRESSED_TYPES set.
 var precompressedTypes = map[string]bool{
-	"application/gzip":                 true,
-	"application/java-archive":         true,
-	"application/vnd.rar":              true,
-	"application/x-7z-compressed":      true,
-	"application/x-brotli":             true,
-	"application/x-bzip":               true,
-	"application/x-bzip2":              true,
-	"application/x-gzip":               true,
-	"application/x-lzma":               true,
-	"application/x-rar-compressed":     true,
-	"application/x-xz":                 true,
-	"application/x-zip-compressed":     true,
-	"application/zip":                  true,
-	"application/zstd":                 true,
+	"application/gzip":             true,
+	"application/java-archive":     true,
+	"application/vnd.rar":          true,
+	"application/x-7z-compressed":  true,
+	"application/x-brotli":         true,
+	"application/x-bzip":           true,
+	"application/x-bzip2":          true,
+	"application/x-gzip":           true,
+	"application/x-lzma":           true,
+	"application/x-rar-compressed": true,
+	"application/x-xz":             true,
+	"application/x-zip-compressed": true,
+	"application/zip":              true,
+	"application/zstd":             true,
 }
 
 // IsPrecompressedType reports whether a media type is already entropy-coded

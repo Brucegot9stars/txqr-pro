@@ -33,6 +33,10 @@ class DecimenDecoder {
         val payloadFnv: Long,
     )
 
+    var failure: String? = null
+        private set
+    private var verifiedFile: UnpackedFile? = null
+
     var framesNew = 0
         private set
     var framesDup = 0
@@ -58,6 +62,9 @@ class DecimenDecoder {
 
     private class PendingFrame(var idx: MutableList<Int>, val words: IntArray)
 
+    val totalByteCount: Long get() = header?.totalLen ?: 0L
+    val sourceByteCount: Long get() = sourceBytesRead
+
     val isComplete: Boolean get() = completed
 
     fun isDecimenFrame(bytes: ByteArray): Boolean =
@@ -76,7 +83,9 @@ class DecimenDecoder {
             totalLen = leU32(bytes, 12),
             payloadFnv = leU32(bytes, 16),
         )
-        if (h.k == 0 || h.blockLen == 0 || h.totalLen == 0L) return null
+        if (h.k == 0 || h.blockLen !in 1..2933 || h.totalLen <= 0L ||
+            h.totalLen > MAX_FILE_BYTES + 49L + 2L * 65535 ||
+            h.totalLen > h.k.toLong()*h.blockLen || h.totalLen <= (h.k-1L)*h.blockLen) return null
         if (bytes.size != HEADER_LEN + h.blockLen) return null
         return h
     }
@@ -84,11 +93,12 @@ class DecimenDecoder {
     /** Feed one decoded frame's raw bytes (the whole QR payload). Returns true
      *  when the transfer just completed. */
     fun addFrame(bytes: ByteArray): Boolean {
+        if (failure != null || completed) return completed
         val h = parseFrame(bytes) ?: return completed
         if (header == null) {
             initStream(h)
         } else if (!sameStream(header!!, h)) {
-            initStream(h) // new session id or a stream-identity mismatch: reset
+            return false // only an explicit rescan may adopt a different transfer
         }
 
         if (!seen.add(h.seq)) {
@@ -98,7 +108,7 @@ class DecimenDecoder {
         framesNew++
         if (completed) return true
 
-        val now = System.currentTimeMillis()
+        val now = System.nanoTime() / 1_000_000
         if (startTime == 0L) startTime = now
         if (lastFrameTime != 0L) readInterval = now - lastFrameTime
         lastFrameTime = now
@@ -146,7 +156,7 @@ class DecimenDecoder {
         framesDup = 0
         framesRedundant = 0
         sourceBytesRead = 0L
-        startTime = System.currentTimeMillis()
+        startTime = System.nanoTime() / 1_000_000
         endTime = 0L
         lastFrameTime = 0L
         readInterval = 0L
@@ -182,7 +192,7 @@ class DecimenDecoder {
             solvedCount++
             if (solvedCount >= k) {
                 completed = true
-                endTime = System.currentTimeMillis()
+                endTime = System.nanoTime() / 1_000_000
                 return
             }
             val waiting = byBlock.remove(b) ?: continue
@@ -214,6 +224,24 @@ class DecimenDecoder {
             }
         }
         return out
+    }
+
+    /** Verify the complete container (including name/type) before publishing bytes. */
+    fun verifiedResult(): UnpackedFile? {
+        verifiedFile?.let { return it }
+        if (!completed || failure != null) return null
+        return try {
+            val container = assemble() ?: return null
+            check(fnv1a(container) == header!!.payloadFnv) { "容器 FNV 校验失败" }
+            val file = unpackContainer(container)
+            check(verifySha256(container, file.bytes)) { "SHA-256 校验失败" }
+            verifiedFile = file
+            endTime = System.nanoTime() / 1_000_000
+            file
+        } catch (e: Exception) {
+            failure = "${e.message}，请重新扫描"
+            null
+        }
     }
 
     /** Unpack a DCF2 container back into the original file bytes. */
@@ -288,7 +316,7 @@ class DecimenDecoder {
     val speedBps: Long
         get() {
             if (speedWindow.size < 2) return 0L
-            val now = System.currentTimeMillis()
+            val now = System.nanoTime() / 1_000_000
             val last = speedWindow.last()
             if (now - last[0] > SPEED_WINDOW_MS) return 0L
             val first = speedWindow.first()
@@ -305,7 +333,7 @@ class DecimenDecoder {
         get() {
             val elapsed = elapsedMs
             if (elapsed <= 0L) return 0L
-            return (header?.totalLen ?: 0L) * 1000L / elapsed
+            return (verifiedFile?.bytes?.size?.toLong() ?: sourceBytesRead) * 1000L / elapsed
         }
 
     val peakBps: Long get() = peakSpeedBps
@@ -313,7 +341,7 @@ class DecimenDecoder {
     val elapsedMs: Long
         get() {
             if (endTime != 0L) return endTime - startTime
-            return if (startTime == 0L) 0L else System.currentTimeMillis() - startTime
+            return if (startTime == 0L) 0L else System.nanoTime() / 1_000_000 - startTime
         }
 
     val readIntervalMs: Long get() = readInterval
@@ -331,6 +359,8 @@ class DecimenDecoder {
         }
 
     fun reset() {
+        failure = null
+        verifiedFile = null
         header = null
         k = 0
         words = 0
