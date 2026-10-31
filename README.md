@@ -208,7 +208,9 @@ gradlew.bat :app:assembleDebug --no-daemon
 
 ## 版本
 
-当前版本：`v2.0.4`（见 Git tag）。Android 端 `versionCode=15` / `versionName=2.0.4`。
+当前版本：`v2.0.5`（见 Git tag）。Android 端 `versionCode=16` / `versionName=2.0.5`。
+
+v2.0.5 优化发送页双栏/窄窗口布局，序列化等待时显示播放区域虚框（包括整轮预生成），播放时展示实际呈现的编码负载速率、FPS 和累计发送量。统计口径及使用说明见 [发送界面说明](docs/sender-interface.md)。
 
 v2.0.4 将二维码准备方式改为「预生成全部二维码」开关：开启时先准备整轮，关闭（默认）时首批缓冲后边生成边播放；选择在下次序列化生效。
 

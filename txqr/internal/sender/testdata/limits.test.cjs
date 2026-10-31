@@ -2,14 +2,14 @@
 const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict'),path=require('node:path');
 const page=fs.readFileSync(path.join(__dirname,'..','index.html'),'utf8');
 function extract(name){const start=page.indexOf('function '+name+'(');assert(start>=0);let end=page.indexOf('{',start)+1,depth=1;for(;depth;end++){if(page[end]==='{')depth++;if(page[end]==='}')depth--;}return(page.slice(start-6,start)==='async '?'async ':'')+page.slice(start,end);}
-const config={version:'2.0.4',maxUploadBytes:64*1024*1024,maxSourceBlocks:8192,maxChunkBytes:2933,qrFrameBytes:2331,colorFrameBytes:1587,colorSplitBytes:1426,decimenBlockBytes:2933,workerMemoryBytes:512*1024*1024,pngCacheBytes:128*1024*1024,sessionCacheBytes:256*1024*1024,maxSessions:4,encodeTimeoutSeconds:300};
+const config={version:'2.0.5',maxUploadBytes:64*1024*1024,maxSourceBlocks:8192,maxChunkBytes:2933,qrFrameBytes:2331,colorFrameBytes:1587,colorSplitBytes:1426,decimenBlockBytes:2933,workerMemoryBytes:512*1024*1024,pngCacheBytes:128*1024*1024,sessionCacheBytes:256*1024*1024,maxSessions:4,encodeTimeoutSeconds:300};
 const elements={version:{},limits:{},'selection-error':{},'sender-log':{},'log-path':{}};
 let uploads=0;
 const context=vm.createContext({APP_CONFIG:config,splitInput:{value:'2048'},codecInput:{value:'raptorq'},colorModeInput:{checked:false},decimenModeInput:{checked:false},fileInput:{files:[]},document:{getElementById:id=>elements[id]},startBtn:{},statusEl:{},encoding:false,session:null,fileMD5:'',fetch(){uploads++;throw Error('unexpected upload')}});
 vm.runInContext(['bytesFmt','limitBytes','dataFrameBytes','usableSplitRange','transferPolicy','updateLimits','showFileInfo','encodeFile'].map(extract).join('\n'),context);
 const policy=size=>vm.runInContext(`transferPolicy({size:${size}})`,context);
 vm.runInContext('updateLimits()',context);
-assert(elements.version.textContent.includes('2.0.4'));assert(elements.limits.textContent.includes('16.00 MiB'));assert(elements.limits.textContent.includes('2331'));
+assert(elements.version.textContent.includes('2.0.5'));assert(elements.limits.textContent.includes('16.00 MiB'));assert(elements.limits.textContent.includes('2331'));
 assert.equal(policy(47104).error,'');
 const large=policy(25585664);assert(large.error.includes('源块'));assert(large.error.includes('无法仅靠增大分片'));assert.equal(large.range.maximum,0);
 context.splitInput.value='2900';const oversized=policy(47104);assert(oversized.error.includes('2331'));
@@ -26,7 +26,7 @@ context.fileInput.files=[{name:'large.bin',size:25585664,arrayBuffer(){throw Err
  vm.runInContext('showFileInfo()',context);
  assert.equal(uploads,0,'oversized selection was uploaded');assert.equal(context.startBtn.disabled,true);
  config.maxUploadBytes=8*1024*1024;assert(policy(9*1024*1024).error.includes('上传上限'));
- context.AbortController=AbortController;context.encodeGeneration=0;
+ context.AbortController=AbortController;context.encodeGeneration=0;context.showPreparation=()=>{};
  context.fpsInput={value:'30'};context.gridInput={value:'1'};context.fitModeInput={value:'fixed'};context.prepareInput={checked:true};
  vm.runInContext(extract('gridDims')+'\nfunction fitBudget(){return 800}',context);
  context.fileInput.files=[{name:'valid.bin',size:47104,arrayBuffer:async()=>new ArrayBuffer(47104)}];

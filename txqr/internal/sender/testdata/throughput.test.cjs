@@ -9,7 +9,7 @@ async function check(fps,carousel,codes) {
  let before=0;const warmed=120,total=480;
  for(tick=0;tick<total;tick++) {
   for(const request of p.requests) if(!request.settled&&!request.signal.aborted) {
-   request.settled=true;request.resolve({ok:true,blob:async()=>({})});
+   request.settled=true;request.resolve({ok:true,headers:{get:()=> '2048'},blob:async()=>({})});
   }
   for(let i=decodes.length-1;i>=0;i--) if(decodes[i].at<=tick) {decodes[i].resolve();decodes.splice(i,1);}
   await flush();
@@ -22,6 +22,10 @@ async function check(fps,carousel,codes) {
  const displayed=p.visible.length-before;
  assert(displayed>=expected*0.98,`${fps} FPS ${carousel?'carousel':'QR'}: ${displayed} < ${expected}`);
  assert(displayed<=expected+2,'presentation exceeds requested frame rate');
+ const rates=vm.runInContext(`playbackRates(${(total-1)*1000/60})`,p.context);
+ assert(Math.abs(rates.fps-fps)<1,'HUD frame rate differs from actual per-code presentation');
+ assert(Math.abs(rates.bytes-fps*codes*2048)<fps*codes*2048*0.03,'HUD speed differs from displayed payload bytes');
+ assert(vm.runInContext('sendMeter.samples.length',p.context)<=150,'speed sample window grew without bound');
  const beforeStall=p.visible.length;
  p.tick(total*1000/60+3000);assert(p.visible.length-beforeStall<=codes,'stall produced a burst');
  p.clear();await flush();assert.equal(p.liveURLs.size,0);

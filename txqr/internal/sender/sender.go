@@ -855,6 +855,18 @@ func (s *Server) handleFrame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.prefetch(id, idx)
+	// Count the encoded optical payload, rather than PNG or HTTP bytes. Frames
+	// are immutable; retain the slice while looking up the session under mu.
+	s.mu.Lock()
+	var raw []byte
+	var mode string
+	if source := s.sessions[id]; source != nil && idx < len(source.frames) {
+		raw, mode = source.frames[idx], source.mode
+	}
+	s.mu.Unlock()
+	if n, ok := framePayloadBytes(raw, mode); ok {
+		w.Header().Set("X-QRT-Payload-Bytes", strconv.Itoa(n))
+	}
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Cache-Control", "no-store")
 	_, writeErr := w.Write(pngBytes)
@@ -872,6 +884,26 @@ func (s *Server) handleFrame(w http.ResponseWriter, r *http.Request) {
 	if first {
 		s.note("info", "frame.first", map[string]any{"session": id, "frame": idx, "pngBytes": len(pngBytes), "sinceSessionMs": time.Since(sess.createdAt).Milliseconds()})
 	}
+}
+
+// Metadata frames carry a filename, not file data. Fountain payloads include
+// coding redundancy and padding, so this is not receiver-verified goodput.
+func framePayloadBytes(raw []byte, mode string) (int, bool) {
+	if mode == "decimen" {
+		f := decimen.ParseFrame(raw)
+		if f == nil {
+			return 0, false
+		}
+		return len(f.Payload), true
+	}
+	f, err := txqr.ParseFrame(string(raw))
+	if err != nil {
+		return 0, false
+	}
+	if f.Name {
+		return 0, true
+	}
+	return len(f.Payload), true
 }
 
 func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
