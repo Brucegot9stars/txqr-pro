@@ -66,9 +66,10 @@ class ReceivePipelineTest {
 
     @Test fun sessionVerifiesAndPublishesOnlyOneCompletedFile() {
         for(name in listOf("single.txt","rq-rank.txt","online-large.txt","nonmultiple.txt")) {
-            val all=fixture(name);val session=ReceiveSession()
+            val all=fixture(name);var now=1000L;val session=ReceiveSession {now}
             var result:ReceiveUpdate?=null
             for(frame in all.drop(1)) {val update=session.accept(listOf(frame));if(update?.data!=null) {result=update;break}}
+            if(result==null) {now+=ReceiveSession.FILE_NAME_WAIT_MS;result=session.accept(emptyList())}
             assertNotNull(name,result);assertNull(result!!.error);assertArrayEquals(all[0],result.data)
             assertEquals(all[0].size.toLong(),result.totalBytes);assertEquals(32,result.md5.length)
             assertNotNull(result.finishedAt);assertNull(session.accept(listOf(all[1])))
@@ -79,7 +80,9 @@ class ReceivePipelineTest {
         val rank=fixture("rq-rank.txt");val single=fixture("single.txt")
         val old=ReceiveSession();old.accept(listOf(rank[1]))
         assertNull(old.accept(rank.drop(2)) {false})
-        val fresh=ReceiveSession().accept(single.drop(1))
+        var now=1000L;val current=ReceiveSession {now};current.accept(single.drop(1))
+        now+=ReceiveSession.FILE_NAME_WAIT_MS
+        val fresh=current.accept(emptyList())
         assertArrayEquals(single[0],fresh!!.data)
     }
 }

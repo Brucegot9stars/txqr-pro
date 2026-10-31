@@ -220,6 +220,7 @@ private fun ScannerOverlay(
             ScanState.COMPLETED -> {
                 if(uiState.error!=null) Text(uiState.error,color=Color.Red)
                 CompletedPanel(
+                    warning = uiState.warning,
                     totalSize = uiState.totalSize,
                     totalTime = uiState.totalTime,
                     avgSpeed = uiState.avgSpeed,
@@ -391,6 +392,7 @@ private fun ProgressPanel(
 
 @Composable
 private fun CompletedPanel(
+    warning: String?,
     totalSize: String,
     totalTime: String,
     avgSpeed: String,
@@ -416,6 +418,9 @@ private fun CompletedPanel(
                 color = Color.Green,
                 fontSize = 20.sp
             )
+            if (warning != null) {
+                Text(warning, color = Color(0xFFFFCC80), fontSize = 13.sp)
+            }
             Spacer(modifier = Modifier.height(8.dp))
             Text(
                 text = "Size: $totalSize  Time: $totalTime",

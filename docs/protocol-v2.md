@@ -22,7 +22,9 @@ QRT2/session/sha256/code/chunk/total/codec/kind/crc32|payload
 
 CRC 输入为 `QRT2/.../kind` 的 ASCII 字节、一个 `|` 字节、完整 payload；不包含 `/crc32` 本身。所有字段、长度及 CRC 必须先验证，再更新会话、去重缓存和方程状态。CRC 用于检出帧错误，SHA-256 用于核对恢复的原始文件；它们不提供发送者身份认证。
 
-会话身份为 `(session, sha256, chunk, total, codec)`。不同身份的方程绝不混用。Go Decoder / Android TxqrDecoder 由显式 reset 更换身份；Windows 管理层在连续 15 帧来自同一新身份后，清空旧方程再切换。文件名是独立元数据，不增加数据块进度；如果没有拍到文件名帧，使用接收端生成的名称。
+会话身份为 `(session, sha256, chunk, total, codec)`。不同身份的方程绝不混用。Go Decoder / Android TxqrDecoder 由显式 reset 更换身份；Windows 管理层在连续 15 帧来自同一新身份后，清空旧方程再切换，已校验内容等待文件名时禁止切换。文件名是独立元数据，不增加数据块进度。v2.0.6 起每轮在数据序列起点、约三分之一、约三分之二处发送相同文件名帧，总计 3 次；短到只有 1–2 个数据帧时允许末尾补发。数据帧编号、内容和 CRC 格式不变。
+
+内容恢复后，核心解码器仍可接收通过 CRC 及同会话校验的文件名，保留第一个名称。Windows / Android 在缺少文件名时继续扫描约 3 秒，独立检查超时，不要求再收到二维码才能结束。正常已知文件名不增加等待。补收不重新计入编码字节或延长内容恢复耗时；界面显示正在补收，超时保存/建议接收端兜底名称并明确提示。有限次重复和等待不能保证连续丢帧情况下必定拿到文件名。
 
 令 `K=ceil(total/chunk)`。RaptorQ 的数据帧长度为 chunk，最后一个源符号补零；其他模式的非空数据帧长度为 `ceil(total/K)`，发送端将 gofountain 的虚拟尾部零填充显式写入帧。Binary 的空组合允许空 payload。小文件 `total<=chunk` 的 gofountain 模式使用显式 LT 单块帧；Raptor 原有小 K / 本地自检失败回退 LT 的规则保留，元数据使用实际生效的 codec。
 

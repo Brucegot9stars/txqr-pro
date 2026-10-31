@@ -199,7 +199,22 @@ func (e *Encoder) withNameFrame(frames []string, total int, ct CodecType) []stri
 	if e.fileName == "" {
 		return frames
 	}
-	return append([]string{e.nameFrame(total, ct)}, frames...)
+	// Exactly three metadata packets per cycle, spread across the data sweep.
+	// Tiny transfers also get repeats after their last data packet.
+	name := e.nameFrame(total, ct)
+	positions := []int{0, (len(frames) + 2) / 3, (2*len(frames) + 2) / 3}
+	out := make([]string, 0, len(frames)+len(positions))
+	next := 0
+	for i := 0; i <= len(frames); i++ {
+		for next < len(positions) && positions[next] == i {
+			out = append(out, name)
+			next++
+		}
+		if i < len(frames) {
+			out = append(out, frames[i])
+		}
+	}
+	return out
 }
 
 // MaxFrameSize estimates the longest packet without running a fountain solver.

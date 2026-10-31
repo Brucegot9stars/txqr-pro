@@ -593,6 +593,13 @@ func (m *Manager) runCapture(r *region, gen int, ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
+		// Check the bounded name grace period even when capture/QR recognition
+		// produces nothing. This uses the existing capture lifecycle, no timer leak.
+		if result, ok := m.finishPendingName(r, gen, time.Now()); ok {
+			m.submitSave(result)
+			m.notifyUpdate()
+			return
+		}
 		m.mu.Lock()
 		current := r.serial == gen && r.scanning
 		rect := r.rect
@@ -685,9 +692,25 @@ func (m *Manager) commitPayload(job decJob, payload []byte) (saveJob, bool) {
 	if !job.r.st.feedPayload(payload) || !job.r.doneOnce.CompareAndSwap(0, 1) {
 		return saveJob{}, false
 	}
-	job.r.done = true
-	m.stopRegionLocked(job.r)
-	data, name, ok := job.r.st.completedResult()
+	return m.completeRegionLocked(job.r)
+}
+
+func (m *Manager) finishPendingName(r *region, gen int, now time.Time) (saveJob, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r.serial != gen || !r.scanning || m.closing || r.st == nil {
+		return saveJob{}, false
+	}
+	if !r.st.finishNameWait(now) || !r.doneOnce.CompareAndSwap(0, 1) {
+		return saveJob{}, false
+	}
+	return m.completeRegionLocked(r)
+}
+
+func (m *Manager) completeRegionLocked(r *region) (saveJob, bool) {
+	r.done = true
+	m.stopRegionLocked(r)
+	data, name, ok := r.st.completedResult()
 	return saveJob{data: data, name: name, mode: "auto"}, ok && len(data) > 0
 }
 

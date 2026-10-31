@@ -143,6 +143,9 @@ func TestTxqrScanPipeline(t *testing.T) {
 		}
 	}
 	if !completed {
+		completed = st.finishNameWait(time.Now().Add(fileNameWait))
+	}
+	if !completed {
 		t.Fatal("txqr did not complete")
 	}
 	result, _, _ := st.completedResult()

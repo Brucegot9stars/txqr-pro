@@ -208,7 +208,9 @@ gradlew.bat :app:assembleDebug --no-daemon
 
 ## 版本
 
-当前版本：`v2.0.5`（见 Git tag）。Android 端 `versionCode=16` / `versionName=2.0.5`。
+当前版本：`v2.0.6`（见 Git tag）。Android 端 `versionCode=17` / `versionName=2.0.6`。
+
+v2.0.6 修复原始文件名偶发丢失：经典 QR / Color 每轮分散发送 3 次文件名帧，Windows 与 Android 在内容已校验但缺少文件名时继续补收约 3 秒；超时使用兜底名称并明确提示。建议同时升级发送端和接收端。
 
 v2.0.5 优化发送页双栏/窄窗口布局，序列化等待时显示播放区域虚框（包括整轮预生成），播放时展示实际呈现的编码负载速率、FPS 和累计发送量。统计口径及使用说明见 [发送界面说明](docs/sender-interface.md)。
 

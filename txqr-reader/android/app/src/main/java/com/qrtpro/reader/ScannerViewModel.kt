@@ -62,6 +62,7 @@ data class ScannerUiState(
     val suggestedFileName: String = "",
     val md5: String = "",
     val error: String? = null,
+    val warning: String? = null,
     val scanResult: ScanResult? = null
 )
 
@@ -114,6 +115,18 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         uiTicker = viewModelScope.launch {
             while (true) {
                 refreshUiState()
+                // Poll only while waiting for metadata. The session serializes
+                // this background check with frame work; it never drops a queued
+                // camera batch or acquires the decoder lock on the UI thread.
+                if (published?.waitingForName == true && _uiState.value.scanState == ScanState.SCANNING) {
+                    val generation = scanGeneration.get()
+                    val session = receiveSession
+                    val update = withContext(Dispatchers.Default) {
+                        session.accept(emptyList()) { generation == scanGeneration.get() }
+                    }
+                    if (update != null && generation == scanGeneration.get() &&
+                        _uiState.value.scanState == ScanState.SCANNING) applyUpdate(update)
+                }
                 delay(500)
             }
         }
@@ -148,7 +161,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             avgSpeed = update.avgSpeed(now), peakSpeed = update.peakSpeed,
             readInterval = update.readInterval, totalSize = TxqrDecoder.formatSize(update.totalBytes),
             bytesDetail = update.bytesDetail, totalTime = update.duration(now),
-            suggestedFileName = update.fileName, md5 = update.md5, error = update.error,
+            suggestedFileName = update.fileName, md5 = update.md5, error = update.error, warning = update.warning,
         ) }
     }
 

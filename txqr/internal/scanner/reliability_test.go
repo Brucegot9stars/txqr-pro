@@ -26,6 +26,13 @@ func TestStaleResultCannotMutateRestartedScan(t *testing.T) {
 		t.Fatal("stale payload entered current state")
 	}
 	job, ok := m.commitPayload(decJob{r: r, gen: 2}, []byte(frames[0]))
+	if ok {
+		t.Fatal("nameless transfer did not allow a metadata grace period")
+	}
+	if _, stale := m.finishPendingName(r, 1, time.Now().Add(fileNameWait)); stale {
+		t.Fatal("stale deadline published the current scan")
+	}
+	job, ok = m.finishPendingName(r, 2, time.Now().Add(fileNameWait))
 	if !ok || !bytes.Equal(job.data, []byte("ABC")) {
 		t.Fatal("current result rejected")
 	}

@@ -41,19 +41,21 @@ type decodeState struct {
 	txqrCandidate *txqr.Frame
 	failed        string
 
-	startTime  time.Time
-	endTime    time.Time // frozen when the transfer completes (avg speed stays stable)
-	lastTime   time.Time
-	frames     int
-	bytes      int64
-	captured   int // QR decode attempts
-	decodeFail int
-	savedDebug int
-	completed  bool
-	result     []byte
-	fileName   string
-	mode       string // "decimen" or "txqr"
-	SaveFails  SaveFailFlag
+	startTime    time.Time
+	endTime      time.Time // frozen when the transfer completes (avg speed stays stable)
+	lastTime     time.Time
+	frames       int
+	bytes        int64
+	captured     int // QR decode attempts
+	decodeFail   int
+	savedDebug   int
+	completed    bool
+	nameDeadline time.Time
+	nameMissing  bool
+	result       []byte
+	fileName     string
+	mode         string // "decimen" or "txqr"
+	SaveFails    SaveFailFlag
 
 	speedWnd []speedSample // sliding window of (time, effective bytes)
 
@@ -89,6 +91,8 @@ type decodeState struct {
 // One stray frame (a screen still showing the previous file for a moment) must
 // not reset a working transfer.
 const sessionSwitchAfter = 15
+
+const fileNameWait = 3 * time.Second
 
 // SaveFailFlag is written by the UI thread and read by every decode worker, so
 // it must not be a plain bool sharing a decodeState's other fields: racing that
@@ -159,6 +163,8 @@ func (s *decodeState) reset() {
 	s.txqrTotal, s.txqrChunk, s.txqrNeed, s.txqrGot = 0, 0, 0, 0
 	s.txqrSeen = nil
 	s.completed = false
+	s.nameDeadline = time.Time{}
+	s.nameMissing = false
 	s.result = nil
 	s.fileName = ""
 	s.mode = ""
@@ -452,6 +458,10 @@ func (s *decodeState) feedTxqrLocked(payload []byte) bool {
 		return false
 	}
 	if s.txqrManifest != nil && !s.txqrManifest.SameTransfer(f) {
+		// Verified content waiting for a name must never adopt another session.
+		if !s.nameDeadline.IsZero() {
+			return false
+		}
 		if s.txqrCandidate == nil || !s.txqrCandidate.SameTransfer(f) {
 			s.mismatch = 0
 		}
@@ -491,7 +501,16 @@ func (s *decodeState) feedTxqrLocked(payload []byte) bool {
 	s.fileName = s.txqrDec.FileName()
 	if f.Name {
 		s.noteAlways("frame.name", AuditInfo, "文件名帧："+s.fileName)
+		if !s.nameDeadline.IsZero() && s.fileName != "" {
+			s.nameDeadline = time.Time{}
+			s.completed = true
+			s.noteAlways("result.complete", AuditInfo, "文件名已补收，内容 SHA-256 已验证")
+			return true
+		}
 		return false
+	}
+	if !s.nameDeadline.IsZero() {
+		return false // Do not re-count equations or extend the metadata deadline.
 	}
 	if s.txqrSeen == nil {
 		s.txqrSeen = map[int]struct{}{}
@@ -510,12 +529,30 @@ func (s *decodeState) feedTxqrLocked(payload []byte) bool {
 	}
 	if s.txqrDec.IsCompleted() {
 		s.result = s.txqrDec.DataBytes()
-		s.completed = true
 		s.endTime = time.Now()
+		if s.fileName == "" {
+			s.nameDeadline = s.endTime.Add(fileNameWait)
+			s.noteAlways("frame.name-wait", AuditInfo, "内容 SHA-256 已验证，最多补收文件名 3 秒")
+			return false
+		}
+		s.completed = true
 		s.noteAlways("result.complete", AuditInfo, fmt.Sprintf("SHA-256 已验证：%d 字节，%d 帧", len(s.result), s.frames))
 		return true
 	}
 	return false
+}
+
+func (s *decodeState) finishNameWait(now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.completed || s.failed != "" || s.nameDeadline.IsZero() || now.Before(s.nameDeadline) {
+		return false
+	}
+	s.nameDeadline = time.Time{}
+	s.nameMissing = true
+	s.completed = true
+	s.noteAlways("frame.name-missing", AuditWarn, "未收到原始文件名，将使用默认名称；内容 SHA-256 已验证")
+	return true
 }
 
 // truncateForLog keeps a header readable inside one log line.
@@ -572,7 +609,14 @@ func (s *decodeState) snapshot(byBlocks bool) (progress int, status string, done
 		return 0, s.failed, false
 	}
 	if s.completed {
-		return 100, "平均 " + FmtBytes(s.avgSpeedBps()) + "/s", true
+		status := "平均 " + FmtBytes(s.avgSpeedBps()) + "/s"
+		if s.nameMissing {
+			status += "；未收到原始文件名，使用默认名称"
+		}
+		return 100, status, true
+	}
+	if !s.nameDeadline.IsZero() {
+		return 99, "内容已校验，正在补收文件名…", false
 	}
 	p := 0
 	if s.decimenDec != nil {
@@ -665,7 +709,7 @@ func (s *decodeState) avgSpeedBps() int64 {
 		return 0
 	}
 	n := s.bytes
-	if s.completed {
+	if s.completed || !s.nameDeadline.IsZero() {
 		n = int64(len(s.result))
 	}
 	return int64(float64(n) / elapsed.Seconds())

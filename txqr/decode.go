@@ -52,15 +52,17 @@ func (d *Decoder) Decode(packet string) error {
 	if d.failed != nil {
 		return d.failed
 	}
-	if d.completed {
-		return nil
-	}
 	if d.manifest == nil {
 		d.manifest = f
 		d.total, d.chunkLen, d.codecType = f.Total, f.ChunkLen, f.Codec
 	}
 	if f.Name {
-		d.fileName = string(f.Payload)
+		if d.fileName == "" {
+			d.fileName = string(f.Payload)
+		}
+		return nil
+	}
+	if d.completed {
 		return nil
 	}
 	if _, ok := d.seen[f.BlockCode]; ok {

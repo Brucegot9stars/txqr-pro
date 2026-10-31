@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/divan/txqr"
 	"github.com/divan/txqr/qr"
@@ -41,6 +42,7 @@ func TestPreferredRecognitionRecoversAndResets(t *testing.T) {
 			break
 		}
 	}
+	m.finishPendingName(r, 1, time.Now().Add(fileNameWait))
 	got, _, ok := r.st.completedResult()
 	if !ok || !bytes.Equal(got, data) {
 		t.Fatal("preferred scan did not recover the original file")

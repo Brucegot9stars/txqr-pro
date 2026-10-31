@@ -37,7 +37,7 @@ class TxqrDecoder {
     fun decodeFrame(frameBytes: ByteArray) {
         val frame = TransferFrame.parse(frameBytes) ?: return
         synchronized(lock) {
-            if (completed || lastError != null) return
+            if (lastError != null) return
             if (manifest?.sameTransfer(frame) == false) return
             if (manifest == null) {
                 manifest = frame
@@ -48,9 +48,10 @@ class TxqrDecoder {
                 neededBlocks = numChunks
             }
             if (frame.isName) {
-                storedFileName = String(frame.payload, Charsets.UTF_8)
+                if (storedFileName.isEmpty()) storedFileName = String(frame.payload, Charsets.UTF_8)
                 return
             }
+            if (completed) return
             if (frame.blockCode in seenBlockCodes) return
             if (lubyDecoder == null && binaryDecoder == null && raptorDecoder == null && raptorQDecoder == null && onlineDecoder == null) {
                 when (activeCodec) {
